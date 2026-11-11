@@ -29,10 +29,15 @@
       "openchamber": ">=2.7.0"
     },
     "contributes": {
+      "panel": {
+        "id": "gauge",
+        "name": "Gauge",
+        "icon": "gauge"
+      },
       "statusSection": {
         "entry": "status/index.html",
         "title": "Gauge",
-        "height": 118
+        "height": 132
       },
       "service": {
         "entry": "service/main.js",
