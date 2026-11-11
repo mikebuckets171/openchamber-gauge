@@ -85,6 +85,9 @@
     align-items: baseline;
     gap: .125rem .75rem;
   }
+  /* A fact that owns the whole width stacks: label above value, so a long
+     value such as a model name gets the room it needs. */
+  .fact.full { grid-column: 1 / -1; }
   .fact .k {
     font-size: .8125rem;
     letter-spacing: .03em;

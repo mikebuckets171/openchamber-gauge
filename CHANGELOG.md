@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- A `Loaded model` fact: the model the local engine holds in memory, read from
+  Splash's own status. It is not the model the chat picked — a route can be
+  warm, idle or swapped. A server with no model loaded shows a dash, and a
+  reading that grew old is labelled with its age. Nothing is started, stopped
+  or loaded to read it.
+
 ## 0.1.0
 
 - Initial Gauge Work Status section, built on Live TPS: running chat speed,

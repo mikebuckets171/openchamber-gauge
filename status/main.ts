@@ -72,6 +72,12 @@ type GaugeWire = {
     queued: number;
     step: { value: number; max: number; at: number } | null;
   } | null;
+  model: {
+    name: string;
+    quant: string | null;
+    id: string;
+    at: number;
+  } | null;
 };
 
 type RateResponse = {
@@ -132,6 +138,8 @@ const COPY = {
     cacheHit: '缓存命中',
     step: '单步',
     total: '累计',
+    loadedModel: '已载模型',
+    ago: '前',
   },
   en: {
     unit: 'tok/s',
@@ -159,6 +167,8 @@ const COPY = {
     cacheHit: 'Cache hit',
     step: 'step',
     total: 'total',
+    loadedModel: 'Loaded model',
+    ago: 'ago',
   },
 } as const;
 
@@ -240,9 +250,9 @@ type Fact = {
   meters: Meter[];
 };
 
-const makeFact = (meterCount: number, wide = false): Fact => {
+const makeFact = (meterCount: number, wide = false, full = false): Fact => {
   const root = document.createElement('div');
-  root.className = wide ? 'fact wide' : 'fact';
+  root.className = wide ? 'fact wide' : (full ? 'fact full' : 'fact');
   const label = document.createElement('span');
   label.className = 'k';
   const value = document.createElement('span');
@@ -269,9 +279,10 @@ facts.className = 'facts';
 const factLast = makeFact(0);
 const factTtft = makeFact(0);
 const factWork = makeFact(1, true);
+const factModel = makeFact(0, false, true);
 const factMemory = makeFact(1, true);
 const factCache = makeFact(2, true);
-facts.append(factLast.root, factTtft.root, factWork.root, factMemory.root, factCache.root);
+facts.append(factLast.root, factTtft.root, factWork.root, factModel.root, factMemory.root, factCache.root);
 
 let lastHeight = 0;
 
@@ -415,6 +426,30 @@ const paintWork = (gauge: GaugeWire | null | undefined): void => {
   factWork.root.className = 'fact wide';
 };
 
+/**
+ * The loaded model: what the local engine holds in memory right now, which is
+ * not always the model the chat is talking to. A reading that grew old is
+ * labelled with its age instead of being dropped.
+ */
+const paintModel = (gauge: GaugeWire | null | undefined): void => {
+  const loaded = gauge?.model ?? null;
+  factModel.label.textContent = copy.loadedModel;
+  if (!loaded) {
+    factModel.value.textContent = '—';
+    factModel.root.removeAttribute('title');
+    factModel.root.className = 'fact full';
+    return;
+  }
+  const parts = [loaded.name];
+  if (loaded.quant) parts.push(loaded.quant);
+  const age = Date.now() - loaded.at;
+  if (age > 10_000) parts.push(`${Math.round(age / 1000)}s ${copy.ago}`);
+  factModel.value.textContent = parts.join(' · ');
+  // The full identifier stays reachable when the name has to be cut short.
+  factModel.root.setAttribute('title', loaded.id);
+  factModel.root.className = 'fact full';
+};
+
 /** The memory fact: what the Mac is using, and the kernel's own pressure level. */
 const paintMemory = (gauge: GaugeWire | null | undefined): void => {
   const mac = gauge?.mac ?? null;
@@ -461,6 +496,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     factTtft.value.textContent = '—';
     paintCache(null);
     paintWork(null);
+    paintModel(null);
     paintMemory(null);
     dropSpark();
     fitHeight();
@@ -538,6 +574,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
 
   paintCache(rate.cache);
   paintWork(rate.gauge);
+  paintModel(rate.gauge);
   paintMemory(rate.gauge);
 
   if (notice) setState(notice);
