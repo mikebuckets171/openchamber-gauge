@@ -461,6 +461,34 @@ for (const surface of SURFACES) {
     JSON.stringify(renderingText),
   );
 
+  // A page with no chat of its own must never show the prompt a *watched* chat
+  // is reading. When the service answers for a session some other page watched,
+  // the gauge readings belong to that session and are blanked with the rest.
+  const noSession = runGuest(surface.bundle, surface.url, {
+    session: null,
+    locale: 'en',
+    rate: {
+      ...RATE,
+      gauge: {
+        mac: { pressure: 'normal', usedBytes: 34 * 1024 ** 3, totalBytes: 48 * 1024 ** 3, swapUsedBytes: 0, at: Date.now() },
+        prompt: { kind: 'primary', total: 1000, cache: 100, processed: 400, timeMs: 4000, observedAt: Date.now() },
+        render: null,
+      },
+    },
+  });
+  await settle();
+  const noSessionText = noSession.root();
+  check(
+    `${surface.name}: a page with no session never shows another chat's gauge readings`,
+    !noSessionText.includes('40%') && !noSessionText.includes('Prompt reading'),
+    JSON.stringify(noSessionText),
+  );
+  check(
+    `${surface.name}: a page with no session still draws its work fact as a dash`,
+    noSessionText.includes('Work') && noSessionText.includes('—'),
+    JSON.stringify(noSessionText),
+  );
+
   // The section is also mounted with no chat open: the watch must still go out,
   // naming no session, instead of being suppressed along with the origin.
   const bare = runGuest(surface.bundle, 'about:srcdoc', { session: null });
