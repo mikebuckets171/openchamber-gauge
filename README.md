@@ -58,10 +58,20 @@ level, never one inferred from occupancy, and Activity Monitor's "memory used"
 
 ## Install
 
-Open **Settings → Extensions**, paste the folder path of this checkout into
-**Folder, ZIP, or URL**, and choose **Add**. Approve the local service. The
-extension asks once to add its plugin to OpenCode, which is how the prompt
-reading works; without it, everything else still shows.
+Open **Settings → Extensions**, paste this repository's URL into **Folder, ZIP,
+or URL**, and choose **Add**:
+
+```
+https://github.com/mikebuckets171/openchamber-gauge
+```
+
+Approve the local service. The extension asks once to add its plugin to
+OpenCode, which is how the prompt reading works; without it, everything else
+still shows. The built JavaScript files are in the repository, so a Git install
+needs no dependency install and no build.
+
+Then turn **Gauge** on in the chat's **Work Status** panel, under **Choose
+sections**.
 
 ## Verify
 
