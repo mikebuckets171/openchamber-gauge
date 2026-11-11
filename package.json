@@ -75,7 +75,8 @@
     "@openchamber/sdk": "2.7.0"
   },
   "devDependencies": {
+    "@types/bun": "1.3.4",
     "@types/node": "^22.20.3",
-    "@types/bun": "1.3.4"
+    "typescript": "7.0.2"
   }
 }

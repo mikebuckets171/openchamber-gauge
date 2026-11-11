@@ -53,6 +53,7 @@ const protectedHost = await listen(async (req, res) => {
 });
 
 let desktopLoginAttempts = 0;
+let desktopAuthenticatedRequests = 0;
 const desktopHost = await listen((req, res) => {
   if (req.url === '/auth/session') {
     desktopLoginAttempts += 1;
@@ -63,6 +64,7 @@ const desktopHost = await listen((req, res) => {
     res.writeHead(401).end();
     return;
   }
+  if (req.url === '/api/global/event') desktopAuthenticatedRequests += 1;
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
   res.flushHeaders();
   streams.add(res);
@@ -99,15 +101,23 @@ await fs.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify({
   desktopLocalPort: desktopHost.port,
 }));
 
-try {
+/**
+ * Start the service on a free port with its own state file.
+ *
+ * Each host under test needs a service that has not yet found its server:
+ * once the service knows one, it keeps that origin on purpose, so a second
+ * surface does not tear the stream down, and the host it should have dialled
+ * is never reached.
+ */
+const startService = async (stateName) => {
   const reservation = await listen((req, res) => res.end());
   const port = reservation.port;
   await new Promise((resolve) => reservation.server.close(resolve));
-  service = spawn(process.execPath, ['service/main.js'], {
+  const child = spawn(process.execPath, ['service/main.js'], {
     env: {
       PATH: process.env.PATH, HOME: root, USERPROFILE: root,
       OPENCHAMBER_SERVICE_PORT: String(port), OPENCHAMBER_SERVICE_TOKEN: 'test-service-token',
-      OPENCHAMBER_GAUGE_STATE: path.join(root, 'state.json'),
+      OPENCHAMBER_GAUGE_STATE: path.join(root, stateName),
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
@@ -120,6 +130,25 @@ try {
     assert.equal(response.status, 200);
     return response.json();
   };
+  return { child, request };
+};
+
+const stopService = async (child) => {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, 'exit');
+  child.kill();
+  const timer = setTimeout(() => child.kill('SIGKILL'), 2_000);
+  try {
+    await exited;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+try {
+  const started = await startService('state.json');
+  service = started.child;
+  const { request } = started;
   const until = async (condition) => {
     for (let i = 0; i < 80; i += 1) {
       try { if (await condition()) return; } catch {}
@@ -161,29 +190,44 @@ try {
   await until(async () => cookieRequests > beforeRefresh && (await request('/rate')).connection === 'live');
   console.log('ok expired session credentials are refreshed on reconnect');
 
+  // A host that redirects the login, and a host that redirects the event
+  // stream, must never carry a credential to the place the redirect points.
+  // Each gets its own service, because a service that already found its
+  // server keeps that origin on purpose and would never dial this host.
   for (const [host, attempted] of [[redirectedLogin, () => loginRedirects], [redirectedStream, () => streamRedirects]]) {
-    await watch(host);
-    await until(async () => attempted() > 0);
-    await delay(200);
-    assert.equal(leakedRequests, 0);
+    const fresh = await startService(`state-${host.port}.json`);
+    try {
+      await until(async () => (await fresh.request('/health')).ok);
+      await fresh.request('/watch', { origin: host.origin, sessionId: 'session-a' });
+      await until(async () => attempted() > 0);
+      await delay(200);
+      assert.equal(leakedRequests, 0);
+    } finally {
+      await stopService(fresh.child);
+    }
   }
   console.log('ok login and authenticated event redirects cannot leak credentials');
 
+  // A previously connected service deliberately keeps its original origin.
+  // Use a fresh one and require an authenticated request at the desktop host;
+  // merely seeing the old stream still live would be a false pass.
+  await stopService(service);
+  service = undefined;
   await fs.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify({
     desktopLocalPort: desktopHost.port, desktopLocalClientToken: 'test-desktop-token',
   }));
-  await watch(desktopHost);
-  await until(async () => (await request('/rate')).connection === 'live');
-  assert.equal(desktopLoginAttempts, 0);
+  const desktop = await startService('desktop-state.json');
+  try {
+    await until(async () => (await desktop.request('/health')).ok);
+    await desktop.request('/watch', { origin: desktopHost.origin, sessionId: 'session-a' });
+    await until(async () => desktopAuthenticatedRequests > 0 && (await desktop.request('/rate')).connection === 'live');
+    assert.equal(desktopLoginAttempts, 0);
+  } finally {
+    await stopService(desktop.child);
+  }
   console.log('ok desktop local bearer authentication is tried before a password');
 } finally {
-  if (service && service.exitCode === null) {
-    const exited = once(service, 'exit');
-    service.kill();
-    const timer = setTimeout(() => service.kill('SIGKILL'), 2_000);
-    await exited;
-    clearTimeout(timer);
-  }
+  if (service) await stopService(service);
   for (const stream of streams) stream.destroy();
   for (const server of servers) server.closeAllConnections();
   await Promise.all(servers.filter((server) => server.listening).map((server) => new Promise((resolve) => server.close(resolve))));
