@@ -5,7 +5,7 @@ English | [简体中文](README.zh-CN.md)
 A `Live TPS` section for the Work Status panel: live generation speed for the open
 session, plus the last turn's average and time to first token.
 
-![The Work Status panel with the Live TPS section showing 25.1 tok/s above Turn stats](docs/work-status.png)
+![The Live TPS section in the Work Status panel: headline, 30 s curve, last-step and total cache-hit rates](docs/work-status.png)
 
 `tok/s` here is estimated from streamed characters with a heuristic — there is
 no tokenizer. See [Counting](#counting).
@@ -21,6 +21,10 @@ no tokenizer. See [Counting](#counting).
 | `step hit` | cache hit rate of the last settled step (an API call), with the change since the step before; drawn as a bar under the curve |
 | `total hit` | cache hit rate of the whole conversation, including its sub-sessions |
 | cache details | hit/miss tokens, output tokens, step and sub-session counts, cost |
+
+The floating panel shows the same numbers with the full breakdown:
+
+![The Live TPS panel: headline, 30 s curve, the two cache-hit bars, and the turn statistics](docs/panel.png)
 
 ## Requirements
 
