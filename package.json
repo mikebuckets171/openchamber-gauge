@@ -46,7 +46,8 @@
         "permissions": {
           "exec": [
             "/usr/bin/vm_stat",
-            "/usr/sbin/sysctl"
+            "/usr/sbin/sysctl",
+            "/usr/sbin/lsof"
           ],
           "sockets": []
         }
