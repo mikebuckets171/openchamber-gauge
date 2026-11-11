@@ -56,6 +56,23 @@ queued without a `client_id`.
 level, never one inferred from occupancy, and Activity Monitor's "memory used"
 (app memory + wired + compressed).
 
+## Connection and local data
+
+Gauge's service reads OpenChamber's local desktop client token from its settings
+to connect to the event stream. It sends the token only to the desktop's known
+loopback address; on a headless host without a desktop address, a literal
+loopback listener must belong to the parent process. An unverified address gets
+no token. Hosts using a hostname, a tunnel or an unverifiable listener may need
+a different connection. Redirects are not followed.
+
+For a password-protected headless host, the inherited fallback can read a UI
+password from OpenChamber's local instance file and use it for that loopback
+host. The service runs with your user account's access; it is not sandboxed.
+Like Live TPS, it saves bounded session IDs, model identifiers, token counts,
+cache totals and speed history in its local state file. It does not save the
+content of prompts or replies. The prompt-progress plugin's separate cache
+contains hashed identifiers rather than raw session and model IDs.
+
 ## Install
 
 Open **Settings → Extensions**, paste this repository's URL into **Folder, ZIP,

@@ -939,7 +939,10 @@ await new Promise((r) => authSse.listen(0, '127.0.0.1', r));
 const authOrigin = `http://127.0.0.1:${authSse.address().port}`;
 const fakeDataDir = path.join(os.tmpdir(), `gauge-auth-${process.pid}`);
 fs.mkdirSync(fakeDataDir, { recursive: true });
-fs.writeFileSync(path.join(fakeDataDir, 'settings.json'), JSON.stringify({ desktopLocalClientToken: 'oc_client_smoke' }));
+fs.writeFileSync(path.join(fakeDataDir, 'settings.json'), JSON.stringify({
+  desktopLocalPort: authSse.address().port,
+  desktopLocalClientToken: 'oc_client_smoke',
+}));
 const svc3 = spawn(process.execPath, ['service/main.js'], {
   env: {
     ...process.env,
@@ -961,7 +964,9 @@ for (let i = 0; i < 50 && !ready3; i += 1) {
   if (!ready3) await sleep(100);
 }
 await svc3Fetch('/watch', { method: 'POST', body: JSON.stringify({ origin: authOrigin, sessionId: SESSION }) });
-await sleep(600);
+for (let i = 0; i < 80 && !seenAuth.some((v) => v === 'Bearer oc_client_smoke'); i += 1) {
+  await sleep(100);
+}
 check(
   'the local client token is sent to the event stream',
   seenAuth.some((v) => v === 'Bearer oc_client_smoke'),

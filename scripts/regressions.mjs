@@ -54,6 +54,7 @@ const protectedHost = await listen(async (req, res) => {
 
 let desktopLoginAttempts = 0;
 let desktopAuthenticatedRequests = 0;
+let holdDesktopResponse = false;
 const desktopHost = await listen((req, res) => {
   if (req.url === '/auth/session') {
     desktopLoginAttempts += 1;
@@ -65,6 +66,9 @@ const desktopHost = await listen((req, res) => {
     return;
   }
   if (req.url === '/api/global/event') desktopAuthenticatedRequests += 1;
+  // Keep the initial desktop request open until the other origin is tried, so
+  // the service cannot establish a sticky desktop connection before /watch.
+  if (holdDesktopResponse) return;
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
   res.flushHeaders();
   streams.add(res);
@@ -86,6 +90,13 @@ const redirectedStream = await listen((req, res) => {
     streamRedirects += 1;
     res.writeHead(302, { Location: `${sink.origin}/events` }).end();
   } else res.writeHead(401).end();
+});
+
+const untrustedAuthHeaders = [];
+const untrustedHost = await listen((req, res) => {
+  untrustedAuthHeaders.push(req.headers.authorization ?? null);
+  holdDesktopResponse = false;
+  res.writeHead(401).end();
 });
 
 for (const host of [protectedHost, redirectedLogin, redirectedStream]) {
@@ -216,15 +227,21 @@ try {
   await fs.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify({
     desktopLocalPort: desktopHost.port, desktopLocalClientToken: 'test-desktop-token',
   }));
+  untrustedAuthHeaders.length = 0;
+  holdDesktopResponse = true;
   const desktop = await startService('desktop-state.json');
   try {
     await until(async () => (await desktop.request('/health')).ok);
-    await desktop.request('/watch', { origin: desktopHost.origin, sessionId: 'session-a' });
-    await until(async () => desktopAuthenticatedRequests > 0 && (await desktop.request('/rate')).connection === 'live');
+    await desktop.request('/watch', { origin: untrustedHost.origin, sessionId: 'session-a' });
+    await until(async () => untrustedAuthHeaders.length > 0
+      && desktopAuthenticatedRequests > 0 && (await desktop.request('/rate')).connection === 'live');
+    assert.ok(untrustedAuthHeaders.every((header) => header === null));
     assert.equal(desktopLoginAttempts, 0);
   } finally {
+    holdDesktopResponse = false;
     await stopService(desktop.child);
   }
+  console.log('ok an untrusted origin never receives the desktop bearer');
   console.log('ok desktop local bearer authentication is tried before a password');
 } finally {
   if (service) await stopService(service);

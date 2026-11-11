@@ -12,6 +12,8 @@
   job without its step count.
 - A fixed set of facts, with a dash when a reading is unavailable. No floating
   panel or full page.
+- The OpenChamber desktop token is sent only to a verified local server, not
+  to an arbitrary address supplied by a page.
 
 Live Splash prompt progress and a real ComfyUI render still need a desktop
 check. See the README for installation, measurement details and attribution.

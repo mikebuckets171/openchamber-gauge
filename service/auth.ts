@@ -8,6 +8,37 @@ const isLoopbackHost = (hostname: string): boolean =>
   || hostname === '::1'
   || hostname === '[::1]';
 
+/**
+ * The desktop bearer may go only to a known local server, not to an arbitrary
+ * page-provided origin. When the desktop port is known, use that exact origin.
+ * A headless host has no desktop port; allow a literal loopback listener owned
+ * by the parent OpenChamber process instead. Never resolve a hostname here.
+ */
+export const trustedClientOrigin = (
+  origin: string,
+  desktopOrigin: string | null,
+  parentEndpoints: ReadonlyArray<{ host: string; port: number }>,
+): boolean => {
+  let target: URL;
+  try {
+    target = new URL(origin);
+  } catch {
+    return false;
+  }
+  if ((target.protocol !== 'http:' && target.protocol !== 'https:')
+    || (target.hostname !== '127.0.0.1' && target.hostname !== '[::1]')
+    || target.username || target.password) return false;
+  if (desktopOrigin !== null) {
+    try { return target.origin === new URL(desktopOrigin).origin; } catch { return false; }
+  }
+  const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+  return parentEndpoints.some((endpoint) => endpoint.port === port && (
+    target.hostname === '127.0.0.1'
+      ? endpoint.host === '127.0.0.1' || endpoint.host === '0.0.0.0'
+      : endpoint.host === '::1' || endpoint.host === '::'
+  ));
+};
+
 const readRecord = async (file: string): Promise<Record<string, unknown>> => {
   try {
     const value: unknown = JSON.parse(await fs.readFile(file, 'utf8'));

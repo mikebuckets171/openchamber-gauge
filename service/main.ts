@@ -25,7 +25,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tokensFromChars } from '../shared/tokens';
-import { passwordAuthHeaders } from './auth';
+import { passwordAuthHeaders, trustedClientOrigin } from './auth';
 import { gaugeWire, noteDemand } from './gauge';
 
 const execFileAsync = promisify(execFile);
@@ -70,8 +70,14 @@ const readClientToken = (): string => {
   return '';
 };
 
-/** Headers for a dial to the OpenChamber server: the local client token when there is one. */
-const serverHeaders = (): Record<string, string> => {
+/** Never send the local bearer to an unverified page-provided address. */
+const serverHeaders = async (origin: string): Promise<Record<string, string>> => {
+  const own = desktopOrigin();
+  let endpoints: ListenEndpoint[] = [];
+  if (!own) {
+    try { endpoints = await parentListenEndpoints(); } catch { return {}; }
+  }
+  if (!trustedClientOrigin(origin, own, endpoints)) return {};
   const token = readClientToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 };
@@ -1630,7 +1636,7 @@ const fetchSessionParent = async (sessionId: string): Promise<string | null> => 
     let response: Response;
     try {
       response = await fetch(new URL(`/api/session/${encodeURIComponent(sessionId)}`, base), {
-        headers: { Accept: 'application/json', ...serverHeaders() },
+        headers: { Accept: 'application/json', ...await serverHeaders(base) },
         signal: AbortSignal.timeout(3_000),
         redirect: 'manual',
       });
@@ -2215,7 +2221,7 @@ const parentListenEndpoints = async (): Promise<ListenEndpoint[]> => {
 const probeEventStream = async (origin: string, signal: AbortSignal): Promise<'stream' | 'refused' | null> => {
   try {
     const response = await fetch(new URL('/api/global/event', origin), {
-      headers: { Accept: 'text/event-stream', ...serverHeaders() },
+      headers: { Accept: 'text/event-stream', ...await serverHeaders(origin) },
       signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
       redirect: 'manual',
     });
@@ -2310,7 +2316,7 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
       // only the server's default directory, which is why an open project would
       // never see its own session events there.
       response = await fetch(new URL('/api/global/event', origin), {
-        headers: { Accept: 'text/event-stream', ...serverHeaders() },
+        headers: { Accept: 'text/event-stream', ...await serverHeaders(origin) },
         signal: local.signal,
         redirect: 'manual',
       });

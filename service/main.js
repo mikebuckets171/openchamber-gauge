@@ -19,6 +19,25 @@ var tokensFromChars = (chars, algorithm = "heuristic") => {
 import fs from "node:fs/promises";
 import path from "node:path";
 var isLoopbackHost = (hostname) => hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
+var trustedClientOrigin = (origin, desktopOrigin, parentEndpoints) => {
+  let target;
+  try {
+    target = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (target.protocol !== "http:" && target.protocol !== "https:" || target.hostname !== "127.0.0.1" && target.hostname !== "[::1]" || target.username || target.password)
+    return false;
+  if (desktopOrigin !== null) {
+    try {
+      return target.origin === new URL(desktopOrigin).origin;
+    } catch {
+      return false;
+    }
+  }
+  const port = Number(target.port || (target.protocol === "https:" ? 443 : 80));
+  return parentEndpoints.some((endpoint) => endpoint.port === port && (target.hostname === "127.0.0.1" ? endpoint.host === "127.0.0.1" || endpoint.host === "0.0.0.0" : endpoint.host === "::1" || endpoint.host === "::"));
+};
 var readRecord = async (file) => {
   try {
     const value = JSON.parse(await fs.readFile(file, "utf8"));
@@ -404,7 +423,18 @@ var readClientToken = () => {
   } catch {}
   return "";
 };
-var serverHeaders = () => {
+var serverHeaders = async (origin) => {
+  const own = desktopOrigin();
+  let endpoints = [];
+  if (!own) {
+    try {
+      endpoints = await parentListenEndpoints();
+    } catch {
+      return {};
+    }
+  }
+  if (!trustedClientOrigin(origin, own, endpoints))
+    return {};
   const token = readClientToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 };
@@ -1354,7 +1384,7 @@ var fetchSessionParent = async (sessionId) => {
     let response;
     try {
       response = await fetch(new URL(`/api/session/${encodeURIComponent(sessionId)}`, base), {
-        headers: { Accept: "application/json", ...serverHeaders() },
+        headers: { Accept: "application/json", ...await serverHeaders(base) },
         signal: AbortSignal.timeout(3000),
         redirect: "manual"
       });
@@ -1884,7 +1914,7 @@ var parentListenEndpoints = async () => {
 var probeEventStream = async (origin, signal) => {
   try {
     const response = await fetch(new URL("/api/global/event", origin), {
-      headers: { Accept: "text/event-stream", ...serverHeaders() },
+      headers: { Accept: "text/event-stream", ...await serverHeaders(origin) },
       signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
       redirect: "manual"
     });
@@ -1968,7 +1998,7 @@ var startStream = async (tried = new Set) => {
     let response;
     try {
       response = await fetch(new URL("/api/global/event", origin), {
-        headers: { Accept: "text/event-stream", ...serverHeaders() },
+        headers: { Accept: "text/event-stream", ...await serverHeaders(origin) },
         signal: local.signal,
         redirect: "manual"
       });
