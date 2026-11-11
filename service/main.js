@@ -381,10 +381,155 @@ var pollComfy = async (now) => {
     comfyBusy = false;
   }
 };
+var SPLASH_RUNTIME_DIR = process.env.GAUGE_SPLASH_RUNTIME_DIR || path2.join(os.homedir(), "Library", "Application Support", "Splash", "runtime");
+var MODEL_EVERY_MS = 3000;
+var MODEL_GIVE_UP_MS = 30000;
+var MODEL_FILE_BYTES = 64 * 1024;
+var parseServeRecord = (file, body) => {
+  const name = /^serve-(\d{1,5})\.json$/.exec(file);
+  if (!name)
+    return null;
+  const port = Number(name[1]);
+  if (!Number.isSafeInteger(port) || port <= 0 || port > 65535)
+    return null;
+  const record = body;
+  if (!record || record.phase !== "ready")
+    return null;
+  const pid = record.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0)
+    return null;
+  return { port, pid };
+};
+var parseSplashStatus = (body) => {
+  const doc = body;
+  if (!doc || doc.ready !== true)
+    return null;
+  const transport = doc.transport ?? {};
+  if (transport.stopped === true || transport.recovering === true || transport.status_stale === true)
+    return null;
+  const weights = doc.weights ?? {};
+  if (weights.released === true)
+    return null;
+  const instance = doc.instance ?? {};
+  const model = instance.model;
+  if (typeof model !== "string" || !model.trim())
+    return null;
+  const pid = instance.pid;
+  const port = instance.port;
+  if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(port))
+    return null;
+  const started = Number(instance.started_at);
+  const requests = doc.active_requests;
+  return {
+    pid,
+    port,
+    model: model.trim(),
+    startedAt: Number.isFinite(started) ? Math.round(started * 1000) : 0,
+    serving: Array.isArray(requests) && requests.length > 0
+  };
+};
+var splitModelName = (model) => {
+  const trimmed = model.trim();
+  const colon = trimmed.lastIndexOf(":");
+  const quant = colon > 0 ? trimmed.slice(colon + 1) : "";
+  const base = (colon > 0 ? trimmed.slice(0, colon) : trimmed).replace(/-GGUF$/i, "");
+  const slash = base.indexOf("/");
+  const name = slash > 0 && !base.slice(slash + 1).includes("/") ? base.slice(slash + 1) : base;
+  return { name, quant: /^[A-Za-z0-9_.-]{1,32}$/.test(quant) ? quant : null };
+};
+var readJsonFile = (file) => {
+  try {
+    const info = fs2.lstatSync(file);
+    if (!info.isFile() || info.size > MODEL_FILE_BYTES)
+      return null;
+    return JSON.parse(fs2.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+};
+var processAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+};
+var fetchSplashStatus = async (port) => {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/status`, {
+      signal: AbortSignal.timeout(1500),
+      redirect: "manual",
+      headers: { Accept: "application/json" }
+    });
+    if (!response.ok) {
+      response.body?.cancel().catch(() => {
+        return;
+      });
+      return null;
+    }
+    return parseSplashStatus(await response.json());
+  } catch {
+    return null;
+  }
+};
+var discoverSplash = async (dir = SPLASH_RUNTIME_DIR, read = fetchSplashStatus) => {
+  let names;
+  try {
+    names = fs2.readdirSync(dir).filter((name) => name.startsWith("serve-") && name.endsWith(".json")).slice(0, 16);
+  } catch {
+    return [];
+  }
+  const found = [];
+  for (const name of names) {
+    const record = parseServeRecord(name, readJsonFile(path2.join(dir, name)));
+    if (!record)
+      continue;
+    if (!processAlive(record.pid))
+      continue;
+    const status = await read(record.port);
+    if (!status)
+      continue;
+    if (status.pid !== record.pid || status.port !== record.port)
+      continue;
+    found.push(status);
+  }
+  return found;
+};
+var pickSplash = (list) => {
+  if (list.length === 0)
+    return null;
+  const serving = list.filter((status) => status.serving);
+  const pool = serving.length > 0 ? serving : list;
+  return pool.reduce((best, status) => status.startedAt > best.startedAt ? status : best, pool[0]);
+};
+var model = null;
+var modelNextAt = 0;
+var modelBusy = false;
+var sampleModel = async () => {
+  if (modelBusy)
+    return;
+  modelBusy = true;
+  try {
+    const picked = pickSplash(await discoverSplash());
+    if (picked) {
+      const { name, quant } = splitModelName(picked.model);
+      model = { name, quant, id: picked.model, at: Date.now() };
+    } else if (model && Date.now() - model.at > MODEL_GIVE_UP_MS) {
+      model = null;
+    }
+  } finally {
+    modelBusy = false;
+  }
+};
 var noteDemand = (now) => {
   demandAt = now;
   if (!mac || now - mac.at >= MAC_EVERY_MS)
     sampleMac();
+  if (!model || now - modelNextAt >= MODEL_EVERY_MS) {
+    modelNextAt = now;
+    sampleModel();
+  }
   pollComfy(now);
 };
 var gaugeWire = (sessionIds, now) => {
@@ -393,7 +538,7 @@ var gaugeWire = (sessionIds, now) => {
     const step = steps.get(runningId);
     job.step = step && now - step.at < STEP_FRESH_MS ? step : null;
   }
-  return { mac, prompt: promptFor(sessionIds, now), render: job };
+  return { mac, prompt: promptFor(sessionIds, now), render: job, model };
 };
 var idleTimer = setInterval(() => {
   if (!wanted(Date.now())) {

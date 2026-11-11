@@ -1,6 +1,6 @@
 {
   "name": "openchamber-gauge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -37,7 +37,7 @@
       "statusSection": {
         "entry": "status/index.html",
         "title": "Gauge",
-        "height": 225
+        "height": 275
       },
       "service": {
         "entry": "service/main.js",

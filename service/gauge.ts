@@ -356,18 +356,217 @@ const pollComfy = async (now: number): Promise<void> => {
   }
 };
 
+// --- Loaded model -------------------------------------------------------------
+
+/**
+ * The model the local engine actually has in memory, read from Splash's own
+ * status rather than from the chat's selected model: the two differ whenever a
+ * route is warm, idle or swapped.
+ *
+ * Splash's launcher writes `serve-PORT.json` beside its lock for every server
+ * it starts, so the records name the port and the process that answers on it.
+ * A record outlives its server, so each one is checked twice: the process must
+ * still be alive, and the server on that port must answer with the same
+ * process and port. A server that is stopped, recovering or that has released
+ * its weights says so, and then there is no loaded model to show.
+ */
+export type ServeRecord = { port: number; pid: number };
+
+export type SplashStatus = {
+  pid: number;
+  port: number;
+  /** The engine's model name, with its quantization. */
+  model: string;
+  /** Epoch ms when this server started. */
+  startedAt: number;
+  /** Whether it is generating right now. */
+  serving: boolean;
+};
+
+export type ModelReading = {
+  /** The model's name without its organization prefix. */
+  name: string;
+  /** The quantization the engine loaded, when it reports one. */
+  quant: string | null;
+  /** The identifier the engine reported, in full. */
+  id: string;
+  at: number;
+};
+
+const SPLASH_RUNTIME_DIR = process.env.GAUGE_SPLASH_RUNTIME_DIR
+  || path.join(os.homedir(), 'Library', 'Application Support', 'Splash', 'runtime');
+const MODEL_EVERY_MS = 3_000;
+/** A reading this old is dropped rather than shown as if it were current. */
+const MODEL_GIVE_UP_MS = 30_000;
+const MODEL_FILE_BYTES = 64 * 1024;
+
+/** A runtime record: the port it names, and the process that serves it. */
+export const parseServeRecord = (file: string, body: unknown): ServeRecord | null => {
+  const name = /^serve-(\d{1,5})\.json$/.exec(file);
+  if (!name) return null;
+  const port = Number(name[1]);
+  if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) return null;
+  const record = body as { phase?: unknown; pid?: unknown } | null;
+  if (!record || record.phase !== 'ready') return null;
+  const pid = record.pid;
+  if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return null;
+  return { port, pid: pid as number };
+};
+
+/** A Splash status body: the model it has loaded, or null when it has none. */
+export const parseSplashStatus = (body: unknown): SplashStatus | null => {
+  const doc = body as Record<string, unknown> | null;
+  if (!doc || doc.ready !== true) return null;
+  const transport = (doc.transport ?? {}) as Record<string, unknown>;
+  if (transport.stopped === true || transport.recovering === true || transport.status_stale === true) return null;
+  const weights = (doc.weights ?? {}) as Record<string, unknown>;
+  // Released weights are a server that kept running after the model went back
+  // to disk: it is up, but nothing is loaded.
+  if (weights.released === true) return null;
+  const instance = (doc.instance ?? {}) as Record<string, unknown>;
+  const model = instance.model;
+  if (typeof model !== 'string' || !model.trim()) return null;
+  const pid = instance.pid;
+  const port = instance.port;
+  if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(port)) return null;
+  const started = Number(instance.started_at);
+  const requests = doc.active_requests;
+  return {
+    pid: pid as number,
+    port: port as number,
+    model: model.trim(),
+    startedAt: Number.isFinite(started) ? Math.round(started * 1000) : 0,
+    serving: Array.isArray(requests) && requests.length > 0,
+  };
+};
+
+/**
+ * The name to show: without the organization prefix and without the file
+ * format the quantization already names, plus the quantization on its own.
+ */
+export const splitModelName = (model: string): { name: string; quant: string | null } => {
+  const trimmed = model.trim();
+  const colon = trimmed.lastIndexOf(':');
+  const quant = colon > 0 ? trimmed.slice(colon + 1) : '';
+  const base = (colon > 0 ? trimmed.slice(0, colon) : trimmed).replace(/-GGUF$/i, '');
+  const slash = base.indexOf('/');
+  const name = slash > 0 && !base.slice(slash + 1).includes('/') ? base.slice(slash + 1) : base;
+  return { name, quant: /^[A-Za-z0-9_.-]{1,32}$/.test(quant) ? quant : null };
+};
+
+const readJsonFile = (file: string): unknown => {
+  try {
+    const info = fs.lstatSync(file);
+    if (!info.isFile() || info.size > MODEL_FILE_BYTES) return null;
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+};
+
+const processAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // The process exists but belongs to somebody else.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+};
+
+const fetchSplashStatus = async (port: number): Promise<SplashStatus | null> => {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/status`, {
+      signal: AbortSignal.timeout(1_500),
+      redirect: 'manual',
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => undefined);
+      return null;
+    }
+    return parseSplashStatus(await response.json());
+  } catch {
+    return null;
+  }
+};
+
+/** Every local Splash server that is up and has a model loaded. */
+export const discoverSplash = async (
+  dir: string = SPLASH_RUNTIME_DIR,
+  read: (port: number) => Promise<SplashStatus | null> = fetchSplashStatus,
+): Promise<SplashStatus[]> => {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir)
+      .filter((name) => name.startsWith('serve-') && name.endsWith('.json'))
+      .slice(0, 16);
+  } catch {
+    return [];
+  }
+  const found: SplashStatus[] = [];
+  for (const name of names) {
+    const record = parseServeRecord(name, readJsonFile(path.join(dir, name)));
+    if (!record) continue;
+    if (!processAlive(record.pid)) continue;
+    const status = await read(record.port);
+    if (!status) continue;
+    // The port may have been taken by something else since the record was written.
+    if (status.pid !== record.pid || status.port !== record.port) continue;
+    found.push(status);
+  }
+  return found;
+};
+
+/**
+ * The server to report: one that is generating right now, else the one that
+ * started last. A swap group keeps one route loaded, so this is the model the
+ * Mac is holding.
+ */
+export const pickSplash = (list: SplashStatus[]): SplashStatus | null => {
+  if (list.length === 0) return null;
+  const serving = list.filter((status) => status.serving);
+  const pool = serving.length > 0 ? serving : list;
+  return pool.reduce((best, status) => (status.startedAt > best.startedAt ? status : best), pool[0]);
+};
+
+let model: ModelReading | null = null;
+let modelNextAt = 0;
+let modelBusy = false;
+
+const sampleModel = async (): Promise<void> => {
+  if (modelBusy) return;
+  modelBusy = true;
+  try {
+    const picked = pickSplash(await discoverSplash());
+    if (picked) {
+      const { name, quant } = splitModelName(picked.model);
+      model = { name, quant, id: picked.model, at: Date.now() };
+    } else if (model && Date.now() - model.at > MODEL_GIVE_UP_MS) {
+      model = null;
+    }
+  } finally {
+    modelBusy = false;
+  }
+};
+
 // --- the wire -----------------------------------------------------------------
 
 export type GaugeWire = {
   mac: MacReading | null;
   prompt: PromptReading | null;
   render: RenderReading | null;
+  model: ModelReading | null;
 };
 
 /** A page is looking: keep the three readers warm. Never awaits; answers from the last reading. */
 export const noteDemand = (now: number): void => {
   demandAt = now;
   if (!mac || now - mac.at >= MAC_EVERY_MS) void sampleMac();
+  if (!model || now - modelNextAt >= MODEL_EVERY_MS) {
+    modelNextAt = now;
+    void sampleModel();
+  }
   void pollComfy(now);
 };
 
@@ -377,7 +576,7 @@ export const gaugeWire = (sessionIds: string[], now: number): GaugeWire => {
     const step = steps.get(runningId);
     job.step = step && now - step.at < STEP_FRESH_MS ? step : null;
   }
-  return { mac, prompt: promptFor(sessionIds, now), render: job };
+  return { mac, prompt: promptFor(sessionIds, now), render: job, model };
 };
 
 /** Drop what nobody is watching: the ComfyUI socket closes when no page has asked for a while. */

@@ -397,7 +397,7 @@ for (const surface of SURFACES) {
     JSON.stringify(noCache.root()),
   );
 
-  // Gauge's own two rows are always there, the same height whether they show a
+  // Gauge's own rows are always there, the same height whether they show a
   // reading or a dash. A missing reading is a dash, never a missing row.
   const facts = (node, out = []) => {
     if (String(node.className ?? '').split(/\s+/).includes('fact')) out.push(node);
@@ -409,12 +409,12 @@ for (const surface of SURFACES) {
   const plainFacts = facts(plain.rootEl);
   check(
     `${surface.name}: every fact is always drawn`,
-    plainFacts.length === 5,
+    plainFacts.length === 6,
     `facts=${plainFacts.length}`,
   );
   check(
     `${surface.name}: a missing reading is a dash, not an empty fact`,
-    plainFacts.length === 5 && plainFacts.every((fact) => fact.textContent.includes('—')),
+    plainFacts.length === 6 && plainFacts.every((fact) => fact.textContent.includes('—')),
     JSON.stringify(plainFacts.map((fact) => fact.textContent)),
   );
 
@@ -426,6 +426,7 @@ for (const surface of SURFACES) {
         mac: { pressure: 'warning', usedBytes: 34 * 1024 ** 3, totalBytes: 48 * 1024 ** 3, swapUsedBytes: 5 * 1024 ** 3, at: Date.now() },
         prompt: { kind: 'primary', total: 1000, cache: 100, processed: 400, timeMs: 4000, observedAt: Date.now() },
         render: null,
+        model: { name: 'Qwen3.8-Flash-Next-GSQ-RCO', quant: 'IQ3_XXS', id: 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_XXS', at: Date.now() },
       },
     },
   });
@@ -440,6 +441,22 @@ for (const surface of SURFACES) {
     `${surface.name}: the memory fact shows the Mac's memory and swap`,
     busyText.includes('34.0 / 48.0 GB') && busyText.includes('swap 5.0'),
     JSON.stringify(busyText),
+  );
+  check(
+    `${surface.name}: the loaded model is named with its quantization`,
+    busyText.includes('Loaded model') && busyText.includes('Qwen3.8-Flash-Next-GSQ-RCO') && busyText.includes('IQ3_XXS'),
+    JSON.stringify(busyText),
+  );
+  const modelFact = findFact(busy.rootEl, 'Loaded model');
+  check(
+    `${surface.name}: the loaded model row owns the whole width`,
+    modelFact !== null && String(modelFact.className ?? '').split(/\s+/).includes('full'),
+    JSON.stringify(modelFact && modelFact.className),
+  );
+  check(
+    `${surface.name}: the full model identifier stays reachable`,
+    modelFact !== null && modelFact.getAttribute('title') === 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_XXS',
+    JSON.stringify(modelFact && modelFact.getAttribute('title')),
   );
 
   const rendering = runGuest(surface.bundle, surface.url, {

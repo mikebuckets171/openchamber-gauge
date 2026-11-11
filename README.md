@@ -17,6 +17,7 @@ a grid of facts under a hairline.
 | `Last reply` | the finished turn's average — `measured` when the provider reported token counts, `estimated` otherwise |
 | `First token` | time to first token |
 | `Prompt reading` | the prompt a local Splash chat is reading (`40% · 6s left`), or the ComfyUI render running now (`8 / 20 · 30s · 1 queued`) |
+| `Loaded model` | the model the local engine holds in memory (`Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS`), which is not always the model the chat picked |
 | `Memory` | the Mac's memory in use, the total, and the swap in use; the meter turns amber at a kernel warning and red at a critical level |
 | `Cache hit` | the last settled step's hit rate with the change since the one before, and the whole conversation's, sub-sessions included |
 
@@ -51,6 +52,14 @@ reply, header, key or raw session id is written: the session is a hash.
 **The render** is read from ComfyUI's own job list (`/api/jobs`). The step
 counter appears when ComfyUI broadcasts its progress, which it does for a job
 queued without a `client_id`.
+
+**The loaded model** comes from Splash's own status (`/status`). Splash's
+launcher writes a `serve-PORT.json` record for every server it starts, so the
+service knows which port to ask and which process should answer on it. A record
+outlives its server, so each one is checked twice: the process must still be
+alive, and the server on that port must report the same process and port. A
+server that is stopped, recovering, or that has released its weights says so,
+and then the row is a dash. Nothing is started, stopped or loaded to read it.
 
 **The memory** is read from `vm_stat` and `sysctl`: the kernel's own pressure
 level, never one inferred from occupancy, and Activity Monitor's "memory used"
