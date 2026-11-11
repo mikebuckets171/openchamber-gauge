@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Live TPS</title>
+<title>Gauge</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -78,6 +78,38 @@
     font-variant-numeric: tabular-nums;
   }
   .cache-label { flex: none; }
+  .gauge {
+    display: grid;
+    grid-template-columns: 3rem minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.357rem;
+    height: 1.143rem;
+    font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
+    font-size: 0.786rem;
+    color: var(--oc-muted, #888);
+    font-variant-numeric: tabular-nums;
+  }
+  .gauge-label { flex: none; }
+  .gauge-value { color: var(--oc-fg, inherit); white-space: nowrap; }
+  .gauge .gaugebar {
+    display: block;
+    height: 0.286rem;
+    border-radius: 0.143rem;
+    background: var(--oc-subtle, #3a3a3a);
+    overflow: hidden;
+  }
+  .gauge .gaugebar .fill {
+    display: block;
+    height: 100%;
+    width: 0%;
+    background: var(--oc-muted, #888);
+  }
+  .gauge.active .gauge-value { color: var(--oc-fg, inherit); }
+  .gauge.active .gaugebar .fill { background: var(--oc-primary, #6af); }
+  .gauge.warning .gaugebar .fill { background: var(--oc-warning, #fb0); }
+  .gauge.critical .gaugebar .fill { background: var(--oc-error, #f66); }
+  .gauge.warning .gauge-value { color: var(--oc-warning, #fb0); }
+  .gauge.critical .gauge-value { color: var(--oc-error, #f66); }
   .hitbar {
     display: block;
     height: 0.286rem;

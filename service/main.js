@@ -1,10 +1,10 @@
 // service/main.ts
 import http from "node:http";
-import fs2 from "node:fs";
-import os from "node:os";
-import path2 from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import fs3 from "node:fs";
+import os2 from "node:os";
+import path3 from "node:path";
+import { execFile as execFile2 } from "node:child_process";
+import { promisify as promisify2 } from "node:util";
 
 // shared/tokens.ts
 var CHARS_DIV_4 = 4;
@@ -42,7 +42,7 @@ var passwordAuthHeaders = async (origin, dataDir, parentPorts, signal) => {
   const instance = await readRecord(path.join(dataDir, "run", `openchamber-${port}.json`));
   if (!parentPorts.has(port) && Object.keys(instance).length === 0)
     return {};
-  let password = process.env.OPENCHAMBER_LIVE_TPS_UI_PASSWORD?.trim() ?? "";
+  let password = process.env.OPENCHAMBER_GAUGE_UI_PASSWORD?.trim() ?? "";
   if (!password) {
     const value = instance.uiPassword;
     if (typeof value === "string")
@@ -66,20 +66,338 @@ var passwordAuthHeaders = async (origin, dataDir, parentPorts, signal) => {
   return {};
 };
 
-// service/main.ts
+// service/gauge.ts
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import fs2 from "node:fs";
+import os from "node:os";
+import path2 from "node:path";
+import { promisify } from "node:util";
 var execFileAsync = promisify(execFile);
+var DEMAND_MS = 1e4;
+var demandAt = 0;
+var wanted = (now) => now - demandAt < DEMAND_MS;
+var MAC_EVERY_MS = 2000;
+var UNIT = { K: 2 ** 10, M: 2 ** 20, G: 2 ** 30, T: 2 ** 40 };
+var parseVmStat = (text) => {
+  const pageSize = Number(/^Mach Virtual Memory Statistics: \(page size of (\d{1,6}) bytes\)$/m.exec(text)?.[1]);
+  if (!(Number.isSafeInteger(pageSize) && pageSize >= 1024 && pageSize <= 65536))
+    return null;
+  const pages = (label) => {
+    const match = new RegExp(`^${label}:[ ]+(\\d{1,16})\\.$`, "m").exec(text);
+    return match ? Number(match[1]) : null;
+  };
+  const anonymous = pages("Anonymous pages");
+  const purgeable = pages("Pages purgeable") ?? 0;
+  const wired = pages("Pages wired down");
+  const compressed = pages("Pages occupied by compressor");
+  if (anonymous === null || wired === null || compressed === null)
+    return null;
+  return (Math.max(0, anonymous - purgeable) + wired + compressed) * pageSize;
+};
+var parseSysctl = (text) => {
+  const value = (key) => new RegExp(`^${key.replaceAll(".", "\\.")}: (.+)$`, "m").exec(text)?.[1]?.trim();
+  const level = value("kern.memorystatus_vm_pressure_level");
+  const pressure = level === "1" ? "normal" : level === "2" ? "warning" : level === "4" ? "critical" : null;
+  const mem = Number(value("hw.memsize"));
+  const swap = /(?:^|\s)used = (\d{1,12}(?:\.\d{1,2})?)([KMGT])(?=\s|$)/.exec(value("vm.swapusage") ?? "");
+  return {
+    pressure,
+    totalBytes: Number.isSafeInteger(mem) && mem > 0 ? mem : null,
+    swapUsedBytes: swap ? Math.round(Number(swap[1]) * UNIT[swap[2]]) : null
+  };
+};
+var mac = null;
+var macBusy = false;
+var sampleMac = async () => {
+  if (macBusy || process.platform !== "darwin")
+    return;
+  macBusy = true;
+  try {
+    const run = async (file, args) => {
+      try {
+        const { stdout } = await execFileAsync(file, args, { encoding: "utf8", timeout: 2000, maxBuffer: 256 * 1024 });
+        return String(stdout);
+      } catch {
+        return "";
+      }
+    };
+    const [vm, ctl] = await Promise.all([
+      run("/usr/bin/vm_stat", []),
+      run("/usr/sbin/sysctl", ["-i", "vm.swapusage", "kern.memorystatus_vm_pressure_level", "hw.memsize"])
+    ]);
+    const parsed = parseSysctl(ctl);
+    mac = { ...parsed, totalBytes: parsed.totalBytes ?? os.totalmem(), usedBytes: parseVmStat(vm), at: Date.now() };
+  } finally {
+    macBusy = false;
+  }
+};
+var PROGRESS_DIR = process.env.GAUGE_PROGRESS_DIR || path2.join(os.homedir(), ".cache", "gauge", "prompt-progress");
+var MAX_WRITERS = 16;
+var MAX_ENTRIES = 16;
+var MAX_FILE_BYTES = 64 * 1024;
+var PROGRESS_EVERY_MS = 400;
+var sessionKey = (sessionId) => createHash("sha256").update(`gauge-session-v1\x00${sessionId}`).digest("hex");
+var count = (value) => Number.isSafeInteger(value) && value >= 0;
+var readProgressEntries = (dir, now) => {
+  const out = [];
+  let names;
+  try {
+    names = fs2.readdirSync(dir).filter((name) => !name.startsWith(".") && name.endsWith(".json")).slice(0, MAX_WRITERS);
+  } catch {
+    return out;
+  }
+  for (const name of names) {
+    const file = path2.join(dir, name);
+    let doc;
+    try {
+      const info = fs2.lstatSync(file);
+      if (!info.isFile() || info.size > MAX_FILE_BYTES)
+        continue;
+      doc = JSON.parse(fs2.readFileSync(file, "utf8"));
+    } catch {
+      continue;
+    }
+    const record = doc;
+    if (!record || record.schemaVersion !== 1 || !Array.isArray(record.entries))
+      continue;
+    if (typeof record.expiresAtMs !== "number" || record.expiresAtMs <= now)
+      continue;
+    for (const raw of record.entries.slice(0, MAX_ENTRIES)) {
+      const e = raw;
+      if (!e || typeof e.sessionKey !== "string")
+        continue;
+      if (e.kind !== "primary" && e.kind !== "compaction")
+        continue;
+      if (!count(e.total) || e.total === 0 || !count(e.cache) || !count(e.processed))
+        continue;
+      if (e.cache > e.processed || e.processed > e.total)
+        continue;
+      if (typeof e.observedAtMs !== "number" || e.observedAtMs > now + 1000)
+        continue;
+      if (typeof e.expiresAtMs !== "number" || e.expiresAtMs <= now)
+        continue;
+      const timeMs = typeof e.timeMs === "number" && Number.isFinite(e.timeMs) && e.timeMs >= 0 ? e.timeMs : 0;
+      out.push({
+        sessionKey: e.sessionKey,
+        kind: e.kind,
+        total: e.total,
+        cache: e.cache,
+        processed: e.processed,
+        timeMs,
+        observedAt: e.observedAtMs
+      });
+    }
+  }
+  return out;
+};
+var progressCache = null;
+var promptFor = (sessionIds, now) => {
+  if (sessionIds.length === 0)
+    return null;
+  if (!progressCache || now - progressCache.at >= PROGRESS_EVERY_MS) {
+    progressCache = { at: now, entries: readProgressEntries(PROGRESS_DIR, now) };
+  }
+  const keys = new Set(sessionIds.map(sessionKey));
+  let best = null;
+  for (const entry of progressCache.entries) {
+    if (!keys.has(entry.sessionKey))
+      continue;
+    if (!best || entry.observedAt > best.observedAt) {
+      const { sessionKey: _ignored, ...reading } = entry;
+      best = reading;
+    }
+  }
+  return best;
+};
+var COMFY_ORIGINS = (process.env.GAUGE_COMFY_URL || "http://127.0.0.1:18188,http://127.0.0.1:8188,http://127.0.0.1:8000").split(",").map((value) => value.trim()).filter(Boolean);
+var COMFY_RUNNING_MS = 2000;
+var COMFY_IDLE_MS = 1e4;
+var COMFY_OFFLINE_MS = 30000;
+var STEP_FRESH_MS = 60000;
+var comfyOrigin = null;
+var comfyNextAt = 0;
+var comfyBusy = false;
+var render = null;
+var runningId = null;
+var seenQueued = new Set;
+var steps = new Map;
+var socket = null;
+var socketOrigin = null;
+var parseJobs = (body) => {
+  const jobs = body?.jobs;
+  if (!Array.isArray(jobs))
+    return null;
+  const out = [];
+  for (const raw of jobs) {
+    const job = raw;
+    if (!job || typeof job.id !== "string" || typeof job.status !== "string")
+      continue;
+    out.push({
+      id: job.id,
+      status: job.status,
+      ...typeof job.create_time === "number" && Number.isFinite(job.create_time) ? { create_time: job.create_time } : {}
+    });
+  }
+  return out;
+};
+var fetchJobs = async (origin) => {
+  try {
+    const url = new URL("/api/jobs", origin);
+    url.searchParams.set("status", "in_progress,pending");
+    url.searchParams.set("limit", "32");
+    const response = await fetch(url, { signal: AbortSignal.timeout(1500), redirect: "manual" });
+    if (!response.ok) {
+      response.body?.cancel().catch(() => {
+        return;
+      });
+      return null;
+    }
+    return parseJobs(await response.json());
+  } catch {
+    return null;
+  }
+};
+var openSocket = (origin) => {
+  if (socket && socketOrigin === origin)
+    return;
+  closeSocket();
+  const WS = globalThis.WebSocket;
+  if (!WS)
+    return;
+  try {
+    const url = new URL(`/ws?clientId=gauge-${randomUUID()}`, origin);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WS(url);
+    socket = ws;
+    socketOrigin = origin;
+    ws.addEventListener("message", (event) => {
+      if (typeof event.data !== "string" || event.data.length > 64 * 1024)
+        return;
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type !== "progress" || !message.data)
+          return;
+        const { value, max, prompt_id: id } = message.data;
+        if (typeof id !== "string" || !count(value) || !count(max) || max === 0 || value > max)
+          return;
+        steps.set(id, { value, max, at: Date.now() });
+        if (steps.size > 64)
+          steps.delete(steps.keys().next().value);
+      } catch {}
+    });
+    const drop = () => {
+      if (socket === ws) {
+        socket = null;
+        socketOrigin = null;
+      }
+    };
+    ws.addEventListener("close", drop);
+    ws.addEventListener("error", drop);
+  } catch {
+    socket = null;
+    socketOrigin = null;
+  }
+};
+var closeSocket = () => {
+  const ws = socket;
+  socket = null;
+  socketOrigin = null;
+  try {
+    ws?.close();
+  } catch {}
+};
+var pollComfy = async (now) => {
+  if (comfyBusy || now < comfyNextAt)
+    return;
+  comfyBusy = true;
+  try {
+    let jobs = null;
+    let found = null;
+    for (const origin of comfyOrigin ? [comfyOrigin, ...COMFY_ORIGINS.filter((o) => o !== comfyOrigin)] : COMFY_ORIGINS) {
+      jobs = await fetchJobs(origin);
+      if (jobs) {
+        found = origin;
+        break;
+      }
+    }
+    comfyOrigin = found;
+    if (!jobs || !found) {
+      render = null;
+      runningId = null;
+      closeSocket();
+      comfyNextAt = Date.now() + COMFY_OFFLINE_MS;
+      return;
+    }
+    const running = jobs.find((job) => job.status === "in_progress") ?? null;
+    const pending = jobs.filter((job) => job.status === "pending");
+    for (const job of pending)
+      seenQueued.add(job.id);
+    if (running) {
+      if (runningId !== running.id) {
+        runningId = running.id;
+        startedAt = seenQueued.has(running.id) ? Date.now() : running.create_time ?? null;
+        seenQueued.delete(running.id);
+      }
+      openSocket(found);
+      const step = steps.get(running.id) ?? null;
+      render = {
+        state: "running",
+        startedAt,
+        queued: pending.length,
+        step: step && Date.now() - step.at < STEP_FRESH_MS ? step : null
+      };
+      comfyNextAt = Date.now() + COMFY_RUNNING_MS;
+    } else {
+      runningId = null;
+      render = pending.length > 0 ? { state: "queued", startedAt: null, queued: pending.length, step: null } : null;
+      if (pending.length === 0)
+        closeSocket();
+      comfyNextAt = Date.now() + (pending.length > 0 ? COMFY_RUNNING_MS : COMFY_IDLE_MS);
+    }
+    if (seenQueued.size > 256)
+      seenQueued.clear();
+  } finally {
+    comfyBusy = false;
+  }
+};
+var startedAt = null;
+var noteDemand = (now) => {
+  demandAt = now;
+  if (!mac || now - mac.at >= MAC_EVERY_MS)
+    sampleMac();
+  pollComfy(now);
+};
+var gaugeWire = (sessionIds, now) => ({
+  mac,
+  prompt: promptFor(sessionIds, now),
+  render: render && render.state === "running" && render.step === null && runningId ? { ...render, step: (() => {
+    const step = steps.get(runningId);
+    return step && now - step.at < STEP_FRESH_MS ? step : null;
+  })() } : render
+});
+var idleTimer = setInterval(() => {
+  if (!wanted(Date.now())) {
+    closeSocket();
+    comfyNextAt = 0;
+  }
+}, DEMAND_MS);
+idleTimer.unref?.();
+
+// service/main.ts
+var execFileAsync2 = promisify2(execFile2);
 var dataDir = () => {
   const override = process.env.OPENCHAMBER_DATA_DIR;
   if (override && override.trim())
-    return path2.resolve(override.trim());
-  return path2.join(os.homedir(), ".config", "openchamber");
+    return path3.resolve(override.trim());
+  return path3.join(os2.homedir(), ".config", "openchamber");
 };
 var readClientToken = () => {
-  const override = process.env.OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN;
+  const override = process.env.OPENCHAMBER_GAUGE_CLIENT_TOKEN;
   if (override && override.trim())
     return override.trim();
   try {
-    const raw = JSON.parse(fs2.readFileSync(path2.join(dataDir(), "settings.json"), "utf8"));
+    const raw = JSON.parse(fs3.readFileSync(path3.join(dataDir(), "settings.json"), "utf8"));
     const value = raw?.desktopLocalClientToken;
     if (typeof value === "string" && value.trim())
       return value.trim();
@@ -92,7 +410,7 @@ var serverHeaders = () => {
 };
 var desktopOrigin = () => {
   try {
-    const raw = JSON.parse(fs2.readFileSync(path2.join(dataDir(), "settings.json"), "utf8"));
+    const raw = JSON.parse(fs3.readFileSync(path3.join(dataDir(), "settings.json"), "utf8"));
     const port = Number(raw?.desktopLocalPort);
     if (!Number.isInteger(port) || port <= 0 || port > 65535)
       return null;
@@ -236,6 +554,24 @@ var watchedRootsFor = (sessionId) => {
   }
   return roots;
 };
+var sessionIdsFor = (requested) => {
+  if (!requested)
+    return [];
+  const ids = new Set([requested]);
+  for (const [child, parent] of sessionParents) {
+    let cursor = parent;
+    const seen = new Set;
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      if (cursor === requested) {
+        ids.add(child);
+        break;
+      }
+      cursor = sessionParents.get(cursor);
+    }
+  }
+  return [...ids];
+};
 var cacheWire = (agg) => agg.steps === 0 ? null : {
   startedAt: agg.startedAt,
   steps: agg.steps,
@@ -329,7 +665,7 @@ var waitStartAt = null;
 var activeToolIds = new Set;
 var turnToolMs = 0;
 var toolStartAt = null;
-var steps = new Map;
+var steps2 = new Map;
 var turnStepOrder = [];
 var pendingToolStep = new Map;
 var fbChars = -1;
@@ -353,7 +689,7 @@ var clearTurn = () => {
   fbChars = -1;
   fbTps = NaN;
   for (const id of turnStepOrder)
-    steps.delete(id);
+    steps2.delete(id);
   turnStepOrder = [];
 };
 var turns = [];
@@ -454,7 +790,7 @@ var loadState = (state) => {
   activeToolIds = state.activeToolIds;
   turnToolMs = state.turnToolMs;
   toolStartAt = state.toolStartAt;
-  steps = state.steps;
+  steps2 = state.steps;
   turnStepOrder = state.turnStepOrder;
   pendingToolStep = state.pendingToolStep;
   fbChars = state.fbChars;
@@ -493,7 +829,7 @@ var leaveSession = () => {
   state.activeToolIds = activeToolIds;
   state.turnToolMs = turnToolMs;
   state.toolStartAt = toolStartAt;
-  state.steps = steps;
+  state.steps = steps2;
   state.turnStepOrder = turnStepOrder;
   state.pendingToolStep = pendingToolStep;
   state.fbChars = fbChars;
@@ -508,12 +844,12 @@ var leaveSession = () => {
 };
 var blankSession = createSessionState("");
 var statePaths = () => {
-  const override = process.env.OPENCHAMBER_LIVE_TPS_STATE;
+  const override = process.env.OPENCHAMBER_GAUGE_STATE;
   if (override)
     return [override];
   const entry = process.argv[1];
-  const beside = entry ? path2.dirname(entry) : process.cwd();
-  return [path2.join(beside, ".live-tps-state.json"), path2.join(os.tmpdir(), "openchamber-live-tps-state.json")];
+  const beside = entry ? path3.dirname(entry) : process.cwd();
+  return [path3.join(beside, ".gauge-state.json"), path3.join(os2.tmpdir(), "openchamber-gauge-state.json")];
 };
 var memoryOf = (state) => ({
   lastTurn: state.lastTurn,
@@ -522,7 +858,7 @@ var memoryOf = (state) => ({
 });
 var readSessions = (file) => {
   try {
-    const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs3.readFileSync(file, "utf8"));
     if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions)
       return {};
     const out = {};
@@ -537,7 +873,7 @@ var readSessions = (file) => {
 };
 var readModels = (file) => {
   try {
-    const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs3.readFileSync(file, "utf8"));
     const out = {};
     const models = parsed && typeof parsed.models === "object" ? parsed.models : null;
     if (models) {
@@ -590,8 +926,8 @@ var writePersisted = () => {
         models: { ...readModels(file), ...Object.fromEntries(calibration) }
       });
       const tmp = `${file}.${process.pid}.tmp`;
-      fs2.writeFileSync(tmp, payload, "utf8");
-      fs2.renameSync(tmp, file);
+      fs3.writeFileSync(tmp, payload, "utf8");
+      fs3.renameSync(tmp, file);
       return;
     } catch {}
   }
@@ -633,7 +969,7 @@ var turnTtftMs = () => turnExecAt !== null && turnStartedAt !== null ? Math.max(
 var liveTtftMs = () => {
   const ttfts = [];
   for (const id of turnStepOrder) {
-    const step = steps.get(id);
+    const step = steps2.get(id);
     if (step && step.startObserved && step.firstCharAt !== null) {
       ttfts.push(Math.max(0, step.firstCharAt - step.startAt));
     }
@@ -662,7 +998,7 @@ var noteTools = (now) => {
   }
 };
 var stepFor = (messageID, now) => {
-  let step = steps.get(messageID);
+  let step = steps2.get(messageID);
   if (!step) {
     step = {
       id: messageID,
@@ -680,19 +1016,19 @@ var stepFor = (messageID, now) => {
       toolOpen: 0,
       toolSince: null
     };
-    steps.set(messageID, step);
+    steps2.set(messageID, step);
     turnStepOrder.push(messageID);
-    if (steps.size > 500) {
-      const oldest = steps.keys().next();
+    if (steps2.size > 500) {
+      const oldest = steps2.keys().next();
       if (!oldest.done)
-        steps.delete(oldest.value);
+        steps2.delete(oldest.value);
     }
   }
   return step;
 };
 var latestOpenStepId = () => {
   for (let i = turnStepOrder.length - 1;i >= 0; i -= 1) {
-    if (steps.get(turnStepOrder[i])?.endAt === null)
+    if (steps2.get(turnStepOrder[i])?.endAt === null)
       return turnStepOrder[i];
   }
   return null;
@@ -763,7 +1099,7 @@ var sumSteps = () => {
   let real = false;
   const ttfts = [];
   for (const id of turnStepOrder) {
-    const step = steps.get(id);
+    const step = steps2.get(id);
     if (!step)
       continue;
     const part = contributeStep(step);
@@ -835,7 +1171,7 @@ var finalizeTurn = (now) => {
       activeMs: Math.round(sum.netMs),
       wallMs,
       ttftMs: sum.ttftMs,
-      hasReasoning: turnReasoningChars > 0 || [...steps.values()].some((s) => s.reasoning > 0),
+      hasReasoning: turnReasoningChars > 0 || [...steps2.values()].some((s) => s.reasoning > 0),
       endedAt: now,
       cache: turnCache
     };
@@ -1145,7 +1481,7 @@ var dispatchEvent = (event, now) => {
       if (toolStartAt === null && turnExecAt !== null)
         toolStartAt = now;
       const mid = readString(payload.assistantMessageID);
-      const target = mid ? stepFor(mid, now) : latestOpenStepId() ? steps.get(latestOpenStepId()) ?? null : null;
+      const target = mid ? stepFor(mid, now) : latestOpenStepId() ? steps2.get(latestOpenStepId()) ?? null : null;
       pendingToolStep.set(`tool:${id}`, target ? target.id : "");
       if (target) {
         target.toolOpen += 1;
@@ -1166,7 +1502,7 @@ var dispatchEvent = (event, now) => {
     if (id) {
       const stepId = pendingToolStep.get(`tool:${id}`);
       pendingToolStep.delete(`tool:${id}`);
-      const target = stepId ? steps.get(stepId) : undefined;
+      const target = stepId ? steps2.get(stepId) : undefined;
       if (target) {
         target.toolOpen = Math.max(0, target.toolOpen - 1);
         if (target.toolOpen === 0)
@@ -1186,7 +1522,7 @@ var dispatchEvent = (event, now) => {
     if (toolStartAt === null && turnExecAt !== null)
       toolStartAt = now;
     const openId = latestOpenStepId();
-    const target = openId ? steps.get(openId) ?? null : null;
+    const target = openId ? steps2.get(openId) ?? null : null;
     pendingToolStep.set(key, target ? target.id : "");
     if (target) {
       target.toolOpen += 1;
@@ -1205,7 +1541,7 @@ var dispatchEvent = (event, now) => {
       activeToolIds.delete(key);
       const stepId = pendingToolStep.get(key);
       pendingToolStep.delete(key);
-      const target = stepId ? steps.get(stepId) : undefined;
+      const target = stepId ? steps2.get(stepId) : undefined;
       if (target) {
         target.toolOpen = Math.max(0, target.toolOpen - 1);
         if (target.toolOpen === 0)
@@ -1233,9 +1569,9 @@ var dispatchEvent = (event, now) => {
     const model = readString(payload.modelID) || readString(readRecord2(payload.model)?.id);
     if (model)
       currentModel = model;
-    const existing = steps.get(messageID);
+    const existing = steps2.get(messageID);
     if (existing && (existing.settled || existing.endAt !== null)) {
-      steps.delete(messageID);
+      steps2.delete(messageID);
       turnStepOrder = turnStepOrder.filter((id) => id !== messageID);
     }
     const serverCreated = readNumber(event.created) || now;
@@ -1408,7 +1744,7 @@ var toOrigin = (scheme, host, port) => {
   return `${scheme}://${dial.includes(":") ? `[${dial}]` : dial}:${port}`;
 };
 var runFile = async (file, args) => {
-  const { stdout } = await execFileAsync(file, args, {
+  const { stdout } = await execFileAsync2(file, args, {
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
     windowsHide: true
@@ -1461,7 +1797,7 @@ var lsofListenEndpoints = async (pid) => {
   }
   return found;
 };
-var LITTLE_ENDIAN = os.endianness() === "LE";
+var LITTLE_ENDIAN = os2.endianness() === "LE";
 var procEndpoint = (value, ipv6) => {
   const [address, portHex] = value.split(":");
   if (!address || !portHex)
@@ -1485,9 +1821,9 @@ var procEndpoint = (value, ipv6) => {
 var procListenEndpoints = async (pid) => {
   const fdDir = `/proc/${pid}/fd`;
   const inodes = new Set;
-  for (const entry of await fs2.promises.readdir(fdDir)) {
+  for (const entry of await fs3.promises.readdir(fdDir)) {
     try {
-      const target = await fs2.promises.readlink(path2.join(fdDir, entry));
+      const target = await fs3.promises.readlink(path3.join(fdDir, entry));
       const match = /^socket:\[(\d+)\]$/.exec(target);
       if (match)
         inodes.add(match[1]);
@@ -1502,7 +1838,7 @@ var procListenEndpoints = async (pid) => {
   ]) {
     let text;
     try {
-      text = await fs2.promises.readFile(file, "utf8");
+      text = await fs3.promises.readFile(file, "utf8");
     } catch {
       continue;
     }
@@ -1585,7 +1921,7 @@ var discoverServerOrigin = async (signal) => {
       const origin = toOrigin(scheme, host, candidate);
       const probe = await probeEventStream(origin, signal);
       if (probe === "stream") {
-        console.log(`[live-tps] event stream origin is ${origin}; the page's origin was unreachable here`);
+        console.log(`[gauge] event stream origin is ${origin}; the page's origin was unreachable here`);
         return origin;
       }
       if (probe === "refused" && refused === null)
@@ -1962,6 +2298,7 @@ var server = http.createServer((req, res) => {
   }
   if (url.pathname === "/rate") {
     const now = Date.now();
+    noteDemand(now);
     const requested = readString(url.searchParams.get("sessionId")) || watch?.sessionId || null;
     if (requested !== null)
       enterSession(requested);
@@ -1990,6 +2327,7 @@ var server = http.createServer((req, res) => {
         },
         lastTurn,
         cache: cacheWire(cache),
+        gauge: gaugeWire(sessionIdsFor(requested), now),
         eventsSeen
       };
     } finally {

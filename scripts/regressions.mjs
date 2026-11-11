@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 
-const root = await fs.mkdtemp(path.join(os.tmpdir(), 'live-tps-regressions-'));
+const root = await fs.mkdtemp(path.join(os.tmpdir(), 'gauge-regressions-'));
 const dataDir = path.join(root, '.config', 'openchamber');
 await fs.mkdir(path.join(dataDir, 'run'), { recursive: true });
 const servers = [];
@@ -107,7 +107,7 @@ try {
     env: {
       PATH: process.env.PATH, HOME: root, USERPROFILE: root,
       OPENCHAMBER_SERVICE_PORT: String(port), OPENCHAMBER_SERVICE_TOKEN: 'test-service-token',
-      OPENCHAMBER_LIVE_TPS_STATE: path.join(root, 'state.json'),
+      OPENCHAMBER_GAUGE_STATE: path.join(root, 'state.json'),
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   });

@@ -21,9 +21,9 @@ const CHILD = 'ses_cache_child';
 const GRAND = 'ses_cache_grand';
 const OTHER = 'ses_cache_other';
 const SERVICE_TOKEN = 'cache-test-token';
-const STATE_FILE = path.join(os.tmpdir(), `live-tps-cache-state-${process.pid}.json`);
+const STATE_FILE = path.join(os.tmpdir(), `gauge-cache-state-${process.pid}.json`);
 fs.rmSync(STATE_FILE, { force: true });
-const DATA_DIR = path.join(os.tmpdir(), `live-tps-cache-data-${process.pid}`);
+const DATA_DIR = path.join(os.tmpdir(), `gauge-cache-data-${process.pid}`);
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.writeFileSync(path.join(DATA_DIR, 'settings.json'), '{}');
 
@@ -118,7 +118,7 @@ const startService = async () => {
       ...process.env,
       OPENCHAMBER_SERVICE_PORT: String(servicePort),
       OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-      OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+      OPENCHAMBER_GAUGE_STATE: STATE_FILE,
       OPENCHAMBER_DATA_DIR: DATA_DIR,
     },
     stdio: ['ignore', 'pipe', 'pipe'],

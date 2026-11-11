@@ -1,4 +1,4 @@
-// Live TPS service for the `live-tps` OpenChamber extension.
+// Gauge service for the `gauge` OpenChamber extension.
 //
 // Runs as the extension's local process (manifest `contributes.service`) on
 // 127.0.0.1, reachable only through the host proxy. It subscribes to the
@@ -26,6 +26,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tokensFromChars } from '../shared/tokens';
 import { passwordAuthHeaders } from './auth';
+import { gaugeWire, noteDemand } from './gauge';
 
 const execFileAsync = promisify(execFile);
 
@@ -44,8 +45,8 @@ const execFileAsync = promisify(execFile);
  * the UI password, and it only means anything to an OpenChamber running on
  * this machine. A headless install has no desktop token, so a 401 also falls
  * back to the instance file's UI password in `passwordAuthHeaders()`.
- * OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN overrides the token lookup, and
- * OPENCHAMBER_LIVE_TPS_UI_PASSWORD overrides the instance-file password.
+ * OPENCHAMBER_GAUGE_CLIENT_TOKEN overrides the token lookup, and
+ * OPENCHAMBER_GAUGE_UI_PASSWORD overrides the instance-file password.
  */
 const dataDir = (): string => {
   const override = process.env.OPENCHAMBER_DATA_DIR;
@@ -54,7 +55,7 @@ const dataDir = (): string => {
 };
 
 const readClientToken = (): string => {
-  const override = process.env.OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN;
+  const override = process.env.OPENCHAMBER_GAUGE_CLIENT_TOKEN;
   if (override && override.trim()) return override.trim();
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(dataDir(), 'settings.json'), 'utf8')) as {
@@ -425,6 +426,26 @@ const watchedRootsFor = (sessionId: string): string[] => {
   return roots;
 };
 
+/**
+ * The sessions whose prompt progress belongs to one chat: the chat itself and
+ * the subagent sessions below it. A subagent's prompt is part of the same
+ * conversation, so it is counted the same way.
+ */
+const sessionIdsFor = (requested: string | null): string[] => {
+  if (!requested) return [];
+  const ids = new Set<string>([requested]);
+  for (const [child, parent] of sessionParents) {
+    let cursor: string | undefined = parent;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      if (cursor === requested) { ids.add(child); break; }
+      cursor = sessionParents.get(cursor);
+    }
+  }
+  return [...ids];
+};
+
 type CacheWire = {
   startedAt: number | null;
   steps: number;
@@ -716,7 +737,7 @@ const sessionParents = new Map<string, string>();
  * Conversations counted in the background, without a page watching them.
  *
  * `contributes.sessionEvents` wakes the service at the start of every turn,
- * even when Live TPS is closed, so the numbers are already there when the
+ * even when Gauge is closed, so the numbers are already there when the
  * panel opens. The most recent roots are kept; older ones fall out, which
  * bounds the work a long-running app does for chats nobody is looking at.
  */
@@ -902,16 +923,16 @@ const blankSession = createSessionState('');
  *
  * Beside the service itself so a git-installed extension keeps them across a
  * restart without writing into anything tracked (the file is gitignored), with
- * `OPENCHAMBER_LIVE_TPS_STATE` overriding it — the smoke test points that at a
+ * `OPENCHAMBER_GAUGE_STATE` overriding it — the smoke test points that at a
  * scratch path so runs cannot leak into each other. A directory the process
  * cannot write falls back to the temp dir instead of failing startup.
  */
 const statePaths = (): string[] => {
-  const override = process.env.OPENCHAMBER_LIVE_TPS_STATE;
+  const override = process.env.OPENCHAMBER_GAUGE_STATE;
   if (override) return [override];
   const entry = process.argv[1];
   const beside = entry ? path.dirname(entry) : process.cwd();
-  return [path.join(beside, '.live-tps-state.json'), path.join(os.tmpdir(), 'openchamber-live-tps-state.json')];
+  return [path.join(beside, '.gauge-state.json'), path.join(os.tmpdir(), 'openchamber-gauge-state.json')];
 };
 
 const memoryOf = (state: SessionState): SessionMemory => ({
@@ -2230,7 +2251,7 @@ const discoverServerOrigin = async (signal: AbortSignal): Promise<string | null>
       const origin = toOrigin(scheme, host, candidate);
       const probe = await probeEventStream(origin, signal);
       if (probe === 'stream') {
-        console.log(`[live-tps] event stream origin is ${origin}; the page's origin was unreachable here`);
+        console.log(`[gauge] event stream origin is ${origin}; the page's origin was unreachable here`);
         return origin;
       }
       if (probe === 'refused' && refused === null) refused = origin;
@@ -2712,6 +2733,9 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/rate') {
     const now = Date.now();
+    // A page is looking: the Mac, prompt and render readers run only while
+    // something asks for them. The speed measurement keeps counting anyway.
+    noteDemand(now);
     // A page names its own session so two pages watching different sessions
     // each read their own record. Without the parameter the most recent watch
     // answers, which is what a one-page install has always seen; with no watch
@@ -2752,6 +2776,9 @@ const server = http.createServer((req, res) => {
         // Conversation-wide cache accounting of the watched session and its
         // sub-sessions; null until a step settles.
         cache: cacheWire(cache),
+        // Gauge's own readings: Mac memory, the prompt this chat is reading and
+        // a ComfyUI render. Each is null when there is nothing to show.
+        gauge: gaugeWire(sessionIdsFor(requested), now),
         eventsSeen,
       };
     } finally {

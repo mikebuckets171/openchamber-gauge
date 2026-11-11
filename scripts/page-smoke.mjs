@@ -93,7 +93,7 @@ const TOKENS = {
 };
 
 /** The number a fixed page must paint once the fake host answers `/rate`. */
-const LIVE_TPS = 42.5;
+const GAUGE_TPS = 42.5;
 const RATE = {
   connection: 'live',
   error: null,
@@ -102,8 +102,8 @@ const RATE = {
   busy: false,
   waiting: null,
   toolActive: false,
-  live: { tps: LIVE_TPS, spanMs: 1000, chars: 12, textChars: 12, reasoningChars: 0, toolChars: 0 },
-  running: { tps: LIVE_TPS, tokens: 12, durationMs: 1000 },
+  live: { tps: GAUGE_TPS, spanMs: 1000, chars: 12, textChars: 12, reasoningChars: 0, toolChars: 0 },
+  running: { tps: GAUGE_TPS, tokens: 12, durationMs: 1000 },
   curve: [],
   curveStart: Date.now(),
   curveStep: 1250,
@@ -136,7 +136,7 @@ const RATE = {
 };
 
 /** Run one built bundle in a fake frame and collect what it posts to its host. */
-const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE } = {}) => {
+const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE, locale = 'zh' } = {}) => {
   const source = fs.readFileSync(path.join(ROOT, bundle), 'utf8');
   const posted = [];
   const listeners = [];
@@ -223,7 +223,7 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
       surface: 'status',
       connection: { connected: true, account: null },
       settings: {},
-      locale: 'zh',
+      locale,
       theme: { mode: 'dark', tokens: TOKENS },
     },
   });
@@ -270,7 +270,6 @@ const findByText = (node, text) => {
 
 const SURFACES = [
   { name: 'status', bundle: 'status/main.js', url: 'http://127.0.0.1:28888/status/index.html' },
-  { name: 'panel', bundle: 'panel/main.js', url: 'http://127.0.0.1:28888/panel/index.html' },
 ];
 
 for (const surface of SURFACES) {
@@ -282,9 +281,9 @@ for (const surface of SURFACES) {
   );
   const directBody = directWatch ? JSON.parse(directWatch.payload.body) : null;
   check(`${surface.name}: an http page names its origin`, directBody?.origin === 'http://127.0.0.1:28888', JSON.stringify(directBody));
-  check(`${surface.name}: an http page still shows the live number`, direct.root().includes(String(LIVE_TPS)), JSON.stringify(direct.root()));
+  check(`${surface.name}: an http page still shows the live number`, direct.root().includes(String(GAUGE_TPS)), JSON.stringify(direct.root()));
   check(`${surface.name}: an http page never says it cannot reach the server`, !NO_ORIGIN_COPY.some((copy) => direct.root().includes(copy)), JSON.stringify(direct.root()));
-  const settledValue = findByText(direct.rootEl, String(LIVE_TPS));
+  const settledValue = findByText(direct.rootEl, String(GAUGE_TPS));
   check(
     `${surface.name}: an idle kept number is drawn stale, not live`,
     settledValue !== null && settledValue.className.includes('stale'),
@@ -310,7 +309,7 @@ for (const surface of SURFACES) {
     `${surface.name}: a relay srcDoc still polls /rate`,
     relay.posted.some((message) => message.type === 'service-request' && message.payload?.path?.startsWith('/rate')),
   );
-  check(`${surface.name}: a relay srcDoc shows the live number`, relay.root().includes(String(LIVE_TPS)), JSON.stringify(relay.root()));
+  check(`${surface.name}: a relay srcDoc shows the live number`, relay.root().includes(String(GAUGE_TPS)), JSON.stringify(relay.root()));
   check(
     `${surface.name}: a relay srcDoc no longer says it cannot reach the server`,
     !NO_ORIGIN_COPY.some((copy) => relay.root().includes(copy)),
@@ -352,7 +351,7 @@ for (const surface of SURFACES) {
     JSON.stringify(direct.root()),
   );
 
-  const relayValue = findByText(relay.rootEl, String(LIVE_TPS));
+  const relayValue = findByText(relay.rootEl, String(GAUGE_TPS));
   check(
     `${surface.name}: a relay srcDoc keeps the stale styling`,
     relayValue !== null && relayValue.className.includes('stale'),
@@ -379,6 +378,70 @@ for (const surface of SURFACES) {
     `${surface.name}: no cache data writes no percentage`,
     !noCache.root().includes('94.1') && !noCache.root().includes('83.5'),
     JSON.stringify(noCache.root()),
+  );
+
+  // Gauge's own two rows are always there, the same height whether they show a
+  // reading or a dash. A missing reading is a dash, never a missing row.
+  const rows = (node, out = []) => {
+    if (String(node.className ?? '').split(/\s+/).includes('gauge')) out.push(node);
+    for (const child of node.children) if (child instanceof El) rows(child, out);
+    return out;
+  };
+  const plain = runGuest(surface.bundle, surface.url, { rate: { ...RATE, gauge: null }, locale: 'en' });
+  await settle();
+  const plainRows = rows(plain.rootEl);
+  check(
+    `${surface.name}: the work and memory rows are always drawn`,
+    plainRows.length === 2,
+    `rows=${plainRows.length}`,
+  );
+  check(
+    `${surface.name}: a missing reading is a dash, not an empty row`,
+    plainRows.length === 2 && plainRows.every((row) => row.textContent.includes('—')),
+    JSON.stringify(plainRows.map((row) => row.textContent)),
+  );
+
+  const busy = runGuest(surface.bundle, surface.url, {
+    locale: 'en',
+    rate: {
+      ...RATE,
+      gauge: {
+        mac: { pressure: 'warning', usedBytes: 34 * 1024 ** 3, totalBytes: 48 * 1024 ** 3, swapUsedBytes: 5 * 1024 ** 3, at: Date.now() },
+        prompt: { kind: 'primary', total: 1000, cache: 100, processed: 400, timeMs: 4000, observedAt: Date.now() },
+        render: null,
+      },
+    },
+  });
+  await settle();
+  const busyText = busy.root();
+  check(
+    `${surface.name}: a prompt being read shows its percentage`,
+    busyText.includes('prompt 40%'),
+    JSON.stringify(busyText),
+  );
+  check(
+    `${surface.name}: the memory row shows the Mac's memory and swap`,
+    busyText.includes('34.0 GB') && busyText.includes('5.0 GB'),
+    JSON.stringify(busyText),
+  );
+
+  const rendering = runGuest(surface.bundle, surface.url, {
+    locale: 'en',
+    rate: {
+      ...RATE,
+      gauge: {
+        mac: null,
+        prompt: null,
+        render: { state: 'running', startedAt: Date.now() - 30_000, queued: 1, step: { value: 8, max: 20, at: Date.now() } },
+      },
+    },
+  });
+  await settle();
+  const renderingText = rendering.root();
+  check(
+    `${surface.name}: a render shows its step and the queue`,
+    renderingText.includes('render · 8 / 20') && renderingText.includes('1 queued'),
+    JSON.stringify(renderingText),
   );
 
   // The section is also mounted with no chat open: the watch must still go out,

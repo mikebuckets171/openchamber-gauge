@@ -16,11 +16,11 @@ const OTHER = 'ses_other';
 // The service writes last turn and curve beside itself so a restarted process
 // still shows numbers. Point it at a scratch file so runs cannot leak into each
 // other, and so nothing lands in the repo.
-const STATE_FILE = path.join(os.tmpdir(), `live-tps-smoke-state-${process.pid}.json`);
+const STATE_FILE = path.join(os.tmpdir(), `gauge-smoke-state-${process.pid}.json`);
 fs.rmSync(STATE_FILE, { force: true });
 // A data dir without a desktop port keeps discovery on the scanning path and
 // away from any real OpenChamber running on this machine.
-const SMOKE_DATA_DIR = path.join(os.tmpdir(), `live-tps-data-${process.pid}`);
+const SMOKE_DATA_DIR = path.join(os.tmpdir(), `gauge-data-${process.pid}`);
 fs.mkdirSync(SMOKE_DATA_DIR, { recursive: true });
 fs.writeFileSync(path.join(SMOKE_DATA_DIR, 'settings.json'), '{}');
 
@@ -85,7 +85,7 @@ const svc = spawn(process.execPath, ['service/main.js'], {
     ...process.env,
     OPENCHAMBER_SERVICE_PORT: String(svcPort),
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+    OPENCHAMBER_GAUGE_STATE: STATE_FILE,
     OPENCHAMBER_DATA_DIR: SMOKE_DATA_DIR,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -821,8 +821,8 @@ if (process.platform === 'linux' && fs.existsSync('/proc/net/tcp') && fs.existsS
       PATH: '',
       OPENCHAMBER_SERVICE_PORT: String(procPort),
       OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-      OPENCHAMBER_LIVE_TPS_STATE: `${STATE_FILE}.proc`,
-      OPENCHAMBER_DATA_DIR: path.join(os.tmpdir(), `live-tps-proc-${process.pid}`),
+      OPENCHAMBER_GAUGE_STATE: `${STATE_FILE}.proc`,
+      OPENCHAMBER_DATA_DIR: path.join(os.tmpdir(), `gauge-proc-${process.pid}`),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -853,7 +853,7 @@ if (process.platform === 'linux' && fs.existsSync('/proc/net/tcp') && fs.existsS
   procSvc.kill();
   await once(procSvc, 'exit');
   fs.rmSync(`${STATE_FILE}.proc`, { force: true });
-  fs.rmSync(path.join(os.tmpdir(), `live-tps-proc-${process.pid}`), { recursive: true, force: true });
+  fs.rmSync(path.join(os.tmpdir(), `gauge-proc-${process.pid}`), { recursive: true, force: true });
 }
 
 // --- persistence: a restarted service still answers --------------------------
@@ -880,7 +880,7 @@ const svc2 = spawn(process.execPath, ['service/main.js'], {
     ...process.env,
     OPENCHAMBER_SERVICE_PORT: String(svcPort),
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+    OPENCHAMBER_GAUGE_STATE: STATE_FILE,
     OPENCHAMBER_DATA_DIR: SMOKE_DATA_DIR,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -937,7 +937,7 @@ const authSse = http.createServer((req, res) => {
 });
 await new Promise((r) => authSse.listen(0, '127.0.0.1', r));
 const authOrigin = `http://127.0.0.1:${authSse.address().port}`;
-const fakeDataDir = path.join(os.tmpdir(), `live-tps-auth-${process.pid}`);
+const fakeDataDir = path.join(os.tmpdir(), `gauge-auth-${process.pid}`);
 fs.mkdirSync(fakeDataDir, { recursive: true });
 fs.writeFileSync(path.join(fakeDataDir, 'settings.json'), JSON.stringify({ desktopLocalClientToken: 'oc_client_smoke' }));
 const svc3 = spawn(process.execPath, ['service/main.js'], {
@@ -945,7 +945,7 @@ const svc3 = spawn(process.execPath, ['service/main.js'], {
     ...process.env,
     OPENCHAMBER_SERVICE_PORT: String(svcPort),
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+    OPENCHAMBER_GAUGE_STATE: STATE_FILE,
     OPENCHAMBER_DATA_DIR: fakeDataDir,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -978,9 +978,9 @@ const svc4 = spawn(process.execPath, ['service/main.js'], {
     ...process.env,
     OPENCHAMBER_SERVICE_PORT: String(svcPort),
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
-    OPENCHAMBER_DATA_DIR: path.join(os.tmpdir(), `live-tps-nope-${process.pid}`),
-    OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN: 'oc_client_override',
+    OPENCHAMBER_GAUGE_STATE: STATE_FILE,
+    OPENCHAMBER_DATA_DIR: path.join(os.tmpdir(), `gauge-nope-${process.pid}`),
+    OPENCHAMBER_GAUGE_CLIENT_TOKEN: 'oc_client_override',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -1006,7 +1006,7 @@ await once(svc4, 'exit');
 // The desktop writes its own listener's port into settings.json. Pointing a
 // scratch data dir at the mock keeps the run hermetic: without it a fixed
 // service would dial the real OpenChamber running on this machine.
-const relayDataDir = path.join(os.tmpdir(), `live-tps-relay-${process.pid}`);
+const relayDataDir = path.join(os.tmpdir(), `gauge-relay-${process.pid}`);
 fs.mkdirSync(relayDataDir, { recursive: true });
 fs.writeFileSync(
   path.join(relayDataDir, 'settings.json'),
@@ -1017,7 +1017,7 @@ const svc5 = spawn(process.execPath, ['service/main.js'], {
     ...process.env,
     OPENCHAMBER_SERVICE_PORT: String(svcPort),
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+    OPENCHAMBER_GAUGE_STATE: STATE_FILE,
     OPENCHAMBER_DATA_DIR: relayDataDir,
   },
   stdio: ['ignore', 'pipe', 'pipe'],

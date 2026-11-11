@@ -29,7 +29,7 @@ const readRecord = async (file: string): Promise<Record<string, unknown>> => {
  * data directory, and only sent back to that same origin; redirects are refused
  * so neither credential can travel anywhere else. The file is the evidence that
  * matters on Windows, where `netstat` can leave a socket's PID unnamed and the
- * port set comes back empty. `OPENCHAMBER_LIVE_TPS_UI_PASSWORD` supplies the
+ * port set comes back empty. `OPENCHAMBER_GAUGE_UI_PASSWORD` supplies the
  * password explicitly when the host's data directory is not visible.
  */
 export const passwordAuthHeaders = async (
@@ -53,7 +53,7 @@ export const passwordAuthHeaders = async (
   const instance = await readRecord(path.join(dataDir, 'run', `openchamber-${port}.json`));
   if (!parentPorts.has(port) && Object.keys(instance).length === 0) return {};
 
-  let password = process.env.OPENCHAMBER_LIVE_TPS_UI_PASSWORD?.trim() ?? '';
+  let password = process.env.OPENCHAMBER_GAUGE_UI_PASSWORD?.trim() ?? '';
   if (!password) {
     const value = instance.uiPassword;
     if (typeof value === 'string') password = value;

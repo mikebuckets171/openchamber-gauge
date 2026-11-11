@@ -1,222 +1,79 @@
-English | [简体中文](README.zh-CN.md)
+# Gauge
 
-# OpenChamber Live TPS
+A `Gauge` section for OpenChamber's Work Status panel: how fast your chat is
+being delivered, what the engine is doing right now, and what the Mac is using.
 
-A `Live TPS` section for the Work Status panel: live generation speed for the open
-session, plus the last turn's average and time to first token.
-
-![The Live TPS section in the Work Status panel: headline, 30 s curve, last-step and total cache-hit rates](docs/work-status.png)
-
-`tok/s` here is estimated from streamed characters with a heuristic — there is
-no tokenizer. See [Counting](#counting).
+Gauge reads; it never sends inference, starts a render or changes a setting.
 
 ## What it shows
 
 | | |
 |---|---|
-| `Live TPS` | the running turn's average speed, frozen while the model thinks and locked while a tool runs |
+| headline | the running turn's average speed, greyed when nothing is arriving |
 | `last … (measured)` | the finished turn's average — `measured` when the provider reported token counts, `estimated` otherwise |
 | `ttft` | time to first token |
-| Sparkline | the last 30 s of generation rate, one point per 1.25 s |
-| `step hit` | cache hit rate of the last settled step (an API call), with the change since the step before; drawn as a bar under the curve |
-| `total hit` | cache hit rate of the whole conversation, including its sub-sessions |
-| cache details | hit/miss tokens, output tokens, step and sub-session counts, cost |
+| curve | the last 30 s of generation rate, one point per 1.25 s |
+| `work` | the heavy job running now: the prompt a local chat is reading (`prompt 40% · 6s left`), or a ComfyUI render (`render · 8 / 20 · 30s · 1 queued`) |
+| `memory` | the Mac's memory in use, the total, and the swap in use; the bar turns amber at a kernel warning and red at a critical level |
+| `step hit` / `total hit` | cache hit rate of the last settled step (with the change since the one before) and of the whole conversation, sub-sessions included |
 
-The floating panel shows the same numbers with the full breakdown:
+Every row is always drawn, at the same height. A reading that is missing is a
+dash, never a row that appears and disappears.
 
-![The Live TPS panel: headline, 30 s curve, the two cache-hit bars, and the turn statistics](docs/panel.png)
+## What it needs
 
-## Requirements
+- OpenChamber 2.7.0 or newer (the Splash prompt reading uses the plugin
+  OpenChamber adds to the OpenCode it runs)
+- OpenCode 2.0.25 or newer for the prompt reading; other versions keep the rest
+- Node.js 22 or newer
+- macOS for the memory row; ComfyUI (any of 127.0.0.1:18188, :8188 or :8000) for
+  the render row
 
-- OpenChamber ≥ 2.0.4 (background counting needs a host that supports `sessionEvents`; verified on 2.7.0)
-- OpenCode v1.2.19+
-- Node.js v22+ on `PATH`
+## How it measures
+
+**Speed** is measured from OpenChamber's own event stream: the characters of a
+reply as they arrive, divided by the span they cover. There is no tokenizer, so
+the live number starts at `characters ÷ 4` and is corrected toward the
+provider's own token count as each step settles (`measured` once it has).
+Tool-call JSON past 200 characters and any pause longer than a second are left
+out of the average.
+
+**The prompt reading** comes from Splash's own `return_progress` frames. A
+small plugin inside OpenCode adds Splash's documented `return_progress: true`
+option to a streaming Splash request, watches the same response for
+`prompt_progress` frames, and writes the counters to
+`~/.cache/gauge/prompt-progress`. The service reads that file. No prompt,
+reply, header, key or raw session id is written: the session is a hash.
+
+**The render** is read from ComfyUI's own job list (`/api/jobs`). The step
+counter appears when ComfyUI broadcasts its progress, which it does for a job
+queued without a `client_id`.
+
+**The memory** is read from `vm_stat` and `sysctl`: the kernel's own pressure
+level, never one inferred from occupancy, and Activity Monitor's "memory used"
+(app memory + wired + compressed).
 
 ## Install
 
-Open **Settings → Extensions**, paste this URL into **Folder, ZIP, or URL**, and
-choose **Add**:
-
-```text
-https://github.com/wwwzzzxxx/openchamber-live-tps
-```
-
-Approve the local service. The repository includes the built JavaScript files,
-so a Git install needs no dependency install or build. OpenChamber offers an
-update when the repository publishes a newer package version. Every surface
-(desktop, browser, mobile) asks for the service separately, and asking again
-after the service restarts is normal.
-
-For development, clone the repository, run `bun install` and `bun run build`,
-then add the checkout's absolute path in **Settings → Extensions**.
-
-A Gitee mirror is at `https://gitee.com/pzwzx/openchamber-live-tps` if GitHub is
-slow.
+Open **Settings → Extensions**, paste the folder path of this checkout into
+**Folder, ZIP, or URL**, and choose **Add**. Approve the local service. The
+extension asks once to add its plugin to OpenCode, which is how the prompt
+reading works; without it, everything else still shows.
 
 ## Verify
 
-Open any session, then open the Work Status panel (`Choose sections`) and place
-`Live TPS` where you want it. Once the model generates, you should see the
-running number above.
-
-```bash
-npm test   # smoke plus authentication/calibration regressions
+```
+npm test          # smoke, regressions, page smoke, cache and the OpenCode plugin
+bun test service  # the parsers behind the memory and prompt readings
 ```
 
-## Counting
+## Credits and licence
 
-No tokenizer runs here. A real one would ship a vocabulary per model family into
-a bundle that has to load inside a sandboxed guest — and it would not help
-anyway, because the live number has to exist before the tokens do. The honest
-source would be the `usage` block each provider returns, but that arrives with
-the message end, too late to be live.
+Gauge's speed measurement, its curve, its calibration and its cache accounting
+come from [Live TPS](https://github.com/wwwzzzxxx/openchamber-live-tps) by
+wzx, MIT licensed, with changes: the floating panel is gone, and the Mac,
+prompt and render readings are new. The Splash prompt-progress plugin is ported
+from [MLX Scope](https://github.com/mikebuckets171/mlx-scope-openchamber)'s
+OpenCode helper, MIT licensed, with its chat-delivery observer removed.
 
-So the estimate is the heuristic from
-[`opencode-tps-meter`](https://github.com/ChiR24/opencode-tps-meter), ported
-verbatim into `shared/tokens.ts`: **`Math.ceil(characters / 4)`**, the figure
-for general text (that project measures it at ~75% accurate). It also ships
-`chars/3` for code and `words/0.75` for English prose, should the default ever
-prove wrong for some model.
-
-`last` prefers the real thing: provider-reported token counts replace the
-estimate when they arrive, and the value is then labelled `measured`. The
-heuristic is only the fallback, labelled `estimated`.
-
-The live number also takes the **calibrated live rate** from that project's v2:
-each finished step compares the provider's reported token count against the
-heuristic and nudges a per-model correction factor toward the truth (exponential
-average, clamped to 0.25–4×). A model that departs from `chars/4` converges on
-its own ratio within a step or two, and the factor is persisted alongside the
-turn history, so a restart starts from what the service already learned.
-
-It matters what those characters are. The stream carries `text` parts, `reasoning`
-parts, and tool-call JSON:
-
-- **Text and reasoning characters count.** They are real model output, and they
-  are what a speed number should cover.
-- **Tool-call JSON does not.** Its size reflects an argument schema, not
-  generation work — one tool with a large `input` can outweigh the entire reply.
-  Per step, anything past the first 200 characters of each tool part is excluded.
-
-`ttft` is measured directly from event timestamps, and is exact. For `last`,
-provider-reported token counts are preferred when they arrive (these will show as
-`measured`), falling back to the character estimate above (`estimated`).
-
-## Cache hits
-
-Both rates come from provider-reported usage, never from the character
-heuristic:
-
-```
-hit rate = cache.read / (input + cache.read + cache.write) × 100
-```
-
-`input` is the prompt tokens billed without a cache hit, `cache.read` the ones
-served from cache, and `cache.write` the ones written to it (a write is not a
-hit). This is the same formula OpenChamber's own Turn stats use, so the two
-numbers agree. A provider that reports no `cache` block only adds to the step
-count; it does not draw a misleading 0%.
-
-The conversation total covers the watched session and every child session the
-stream places below it (`session.created` names the parent), so a subagent's
-calls count toward the same numbers. A session the service attached late to is
-asked about through `/api/session/{id}` once, and the step that triggered the
-lookup is replayed after the answer. Both the aggregate and the per-turn
-history are written beside the service, so OpenChamber can be closed and
-reopened without losing them. Counting starts when the service first sees the
-session; conversations from before the install are not backfilled.
-
-**Background counting**: the service declares `keepRunning: true`, so OpenChamber starts it
-with the app, not with a panel. It subscribes to the global event stream on startup and
-treats top-level conversations (and an existing conversation's first execution) as targets,
-so the numbers keep accumulating. The eight most recently active top-level conversations
-are counted (sub-sessions follow their parent). `contributes.sessionEvents` is declared too,
-so the host can push turn boundaries straight to the service. Opening the panel shows what
-is already there; the host supervises the process and totals come back from disk.
-
-## Architecture
-
-One local service owns all measurement state; the panel and the Work Status
-section are thin views of it.
-
-```
-        global event stream
-OpenChamber server ─────────────▶ service/  (runs in the host, owns all state)
-        │
-        │ hosts and proxies
-        ├────────────▶ panel/    (floating panel, polls /rate)
-        └────────────▶ status/   (Work Status section, polls /rate)
-```
-
-- **`service/`** — the only place with state. Reads OpenChamber's global event
-  stream, computes live/last-turn/TTFT and the sparkline curve, serves `/rate`
-  and `/watch`. Keeps a per-session state map keyed by session id and persists
-  the finished-turn history to disk, so the numbers survive an OpenChamber
-  restart and two surfaces on different sessions stop fighting over one
-  measurement.
-- **`panel/`** — the floating panel. Polls `/rate`, draws everything.
-- **`status/`** — the `Live TPS` section in the Work Status panel.
-
-Both guests self-heal: if the service was restarted they notice `sessionId: null`
-in a `/rate` answer and re-assert `/watch`, which lets the host bring the service
-back.
-
-The service finds the event stream on the machine that hosts it, never from the
-page alone:
-
-- the desktop's own port (`desktopLocalPort` in `settings.json`) first — this is
-  what a Private Relay client needs, because it mounts the page as a self-
-  contained `srcDoc` whose location is `about:srcdoc`: no http(s) origin exists
-  to report;
-- the page's origin when it has one (a browser on this machine or the LAN);
-- a probe of the parent process's loopback ports for `/api/global/event`, which
-  covers SSH tunnels and headless installs.
-
-A page with no origin therefore still asks `/watch`; a missing origin is not an
-error.
-
-### Reading the event stream behind a UI password
-
-The SDK deliberately keeps host secrets out of a service's environment — "API
-keys, the UI password, and other host secrets never reach it" — so a service has
-no credentialed channel to the server API. `/api/global/event` is open until the
-user sets a UI password, after which every `/api/*` route answers 401 and this
-extension goes dark.
-
-The service therefore reads `desktopLocalClientToken` out of
-`$OPENCHAMBER_DATA_DIR/settings.json` (default `~/.config/openchamber`) and sends
-it as `Authorization: Bearer ...`, which is how the OpenChamber CLI authenticates
-its own desktop-local API calls. It is a loopback-only credential, meaningless to
-anything but an OpenChamber on this machine. Set
-`OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN` to pass a token in explicitly instead.
-
-A headless install has no desktop token. When the stream still answers 401, the
-service reads `uiPassword` from
-`$OPENCHAMBER_DATA_DIR/run/openchamber-<port>.json` (the instance file the host
-writes with mode 0600), signs in at `/auth/session`, and sends the resulting
-cookie only to that loopback origin. Login and stream requests do not follow
-redirects, and `OPENCHAMBER_LIVE_TPS_UI_PASSWORD` can supply the password when
-the data directory is not visible to the service; `OPENCHAMBER_DATA_DIR` points
-at a non-default one.
-
-The scoped desktop token is always tried first. The password path is the
-fallback for a host that cannot issue one, and it does read a secret the SDK
-normally keeps out of the service environment — limited to the parent process's
-loopback listener.
-
-## Limitations
-
-- Per-provider `usage` fields are normalised where the mapping is known (OpenAI,
-  Anthropic, Gemini, Mistral, OpenRouter). An unknown `usage` shape counts as no
-  tokens and the turn reports `estimated`.
-- A step that produced no measurable output contributes no time and no tokens —
-  the average only covers spans where something was actually produced. A
-  `reasoning` delta is only a share of output while the step has produced no text.
-- The live number is the `chars/4` heuristic corrected by a learned per-model
-  factor, so the first step or two of a model it has not seen before can sit away
-  from the final `measured` average. A provider that never reports token counts
-  stays on the raw heuristic, labelled `estimated`.
-
-## License
-
-MIT
+Gauge is MIT licensed too. See [LICENSE](LICENSE).
