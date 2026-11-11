@@ -26,9 +26,15 @@ describe('desktop bearer destination', () => {
     expect(trustedClientOrigin('http://127.0.0.1:18101', null, parent)).toBe(false);
     expect(trustedClientOrigin('http://127.0.0.1:18100', null, [{ host: '0.0.0.0', port: 18100 }])).toBe(true);
     expect(trustedClientOrigin('http://[::1]:18100', null, [{ host: '::', port: 18100 }])).toBe(true);
+    // The wildcard spellings the discovery helpers actually report, dialled over
+    // 127.0.0.1 by `toOrigin`, are the parent's own listener.
+    expect(trustedClientOrigin(desktop, null, [{ host: '*', port: 18100 }])).toBe(true);
+    expect(trustedClientOrigin(desktop, null, [{ host: '', port: 18100 }])).toBe(true);
+    expect(trustedClientOrigin('http://127.0.0.1:18100', null, [{ host: '*', port: 18101 }])).toBe(false);
     // An IPv6-only wildcard does not prove that the IPv4 listener belongs to the parent, or vice versa.
     expect(trustedClientOrigin(desktop, null, [{ host: '::', port: 18100 }])).toBe(false);
     expect(trustedClientOrigin('http://[::1]:18100', null, [{ host: '0.0.0.0', port: 18100 }])).toBe(false);
-    expect(trustedClientOrigin(desktop, null, [{ host: '*', port: 18100 }])).toBe(false);
+    // `lsof` prints `*` for a wildcard of either family, so it proves nothing about `[::1]`.
+    expect(trustedClientOrigin('http://[::1]:18100', null, [{ host: '*', port: 18100 }])).toBe(false);
   });
 });

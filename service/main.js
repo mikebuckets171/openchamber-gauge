@@ -36,7 +36,8 @@ var trustedClientOrigin = (origin, desktopOrigin, parentEndpoints) => {
     }
   }
   const port = Number(target.port || (target.protocol === "https:" ? 443 : 80));
-  return parentEndpoints.some((endpoint) => endpoint.port === port && (target.hostname === "127.0.0.1" ? endpoint.host === "127.0.0.1" || endpoint.host === "0.0.0.0" : endpoint.host === "::1" || endpoint.host === "::"));
+  const wildcard = (host) => host === "0.0.0.0" || host === "*" || host === "";
+  return parentEndpoints.some((endpoint) => endpoint.port === port && (target.hostname === "127.0.0.1" ? endpoint.host === "127.0.0.1" || wildcard(endpoint.host) : endpoint.host === "::1" || endpoint.host === "::"));
 };
 var readRecord = async (file) => {
   try {

@@ -32,9 +32,15 @@ export const trustedClientOrigin = (
     try { return target.origin === new URL(desktopOrigin).origin; } catch { return false; }
   }
   const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
+  // A wildcard bind answers a loopback dial, and each helper spells it
+  // differently: `ss` says `0.0.0.0`, `lsof` says `*`, `/proc/net/tcp` leaves the
+  // host empty. `toOrigin` dials every one of them over `127.0.0.1`, so for an
+  // IPv4 dial all three are the parent's own listener. An IPv6 wildcard is
+  // credited only to the `[::1]` dial.
+  const wildcard = (host: string): boolean => host === '0.0.0.0' || host === '*' || host === '';
   return parentEndpoints.some((endpoint) => endpoint.port === port && (
     target.hostname === '127.0.0.1'
-      ? endpoint.host === '127.0.0.1' || endpoint.host === '0.0.0.0'
+      ? endpoint.host === '127.0.0.1' || wildcard(endpoint.host)
       : endpoint.host === '::1' || endpoint.host === '::'
   ));
 };
