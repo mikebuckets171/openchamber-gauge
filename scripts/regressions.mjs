@@ -120,7 +120,7 @@ await fs.writeFile(path.join(dataDir, 'settings.json'), JSON.stringify({
  * surface does not tear the stream down, and the host it should have dialled
  * is never reached.
  */
-const startService = async (stateName) => {
+const startService = async (stateName, serviceDataDir = dataDir) => {
   const reservation = await listen((req, res) => res.end());
   const port = reservation.port;
   await new Promise((resolve) => reservation.server.close(resolve));
@@ -129,6 +129,7 @@ const startService = async (stateName) => {
       PATH: process.env.PATH, HOME: root, USERPROFILE: root,
       OPENCHAMBER_SERVICE_PORT: String(port), OPENCHAMBER_SERVICE_TOKEN: 'test-service-token',
       OPENCHAMBER_GAUGE_STATE: path.join(root, stateName),
+      OPENCHAMBER_DATA_DIR: serviceDataDir,
     },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
@@ -206,7 +207,12 @@ try {
   // Each gets its own service, because a service that already found its
   // server keeps that origin on purpose and would never dial this host.
   for (const [host, attempted] of [[redirectedLogin, () => loginRedirects], [redirectedStream, () => streamRedirects]]) {
-    const fresh = await startService(`state-${host.port}.json`);
+    // Give each process only this host's instance file. Otherwise Linux origin
+    // discovery can authenticate to another mock before /watch reaches it.
+    const caseDataDir = path.join(root, `host-${host.port}`);
+    await fs.mkdir(path.join(caseDataDir, 'run'), { recursive: true });
+    await fs.writeFile(path.join(caseDataDir, 'run', `openchamber-${host.port}.json`), JSON.stringify({ uiPassword: password }));
+    const fresh = await startService(`state-${host.port}.json`, caseDataDir);
     try {
       await until(async () => (await fresh.request('/health')).ok);
       await fresh.request('/watch', { origin: host.origin, sessionId: 'session-a' });
