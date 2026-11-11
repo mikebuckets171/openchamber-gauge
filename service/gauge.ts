@@ -563,7 +563,9 @@ export type GaugeWire = {
 export const noteDemand = (now: number): void => {
   demandAt = now;
   if (!mac || now - mac.at >= MAC_EVERY_MS) void sampleMac();
-  if (!model || now - modelNextAt >= MODEL_EVERY_MS) {
+  // The model is read on its own clock, whether or not there is one to show:
+  // a missing model must not turn every poll into a disk read.
+  if (now - modelNextAt >= MODEL_EVERY_MS) {
     modelNextAt = now;
     void sampleModel();
   }

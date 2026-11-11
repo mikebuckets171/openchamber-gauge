@@ -526,7 +526,7 @@ var noteDemand = (now) => {
   demandAt = now;
   if (!mac || now - mac.at >= MAC_EVERY_MS)
     sampleMac();
-  if (!model || now - modelNextAt >= MODEL_EVERY_MS) {
+  if (now - modelNextAt >= MODEL_EVERY_MS) {
     modelNextAt = now;
     sampleModel();
   }
