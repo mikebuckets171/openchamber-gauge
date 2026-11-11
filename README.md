@@ -7,18 +7,21 @@ Gauge reads; it never sends inference, starts a render or changes a setting.
 
 ## What it shows
 
+One card in the Work Status panel: a headline, the last 30 seconds of speed, and
+a grid of facts under a hairline.
+
 | | |
 |---|---|
-| headline | the running turn's average speed, greyed when nothing is arriving |
-| `last … (measured)` | the finished turn's average — `measured` when the provider reported token counts, `estimated` otherwise |
-| `ttft` | time to first token |
+| headline | the running turn's average speed, greyed when nothing is arriving; the state (`running tool`, `waiting for permission`) sits on the right |
 | curve | the last 30 s of generation rate, one point per 1.25 s |
-| `work` | the heavy job running now: the prompt a local chat is reading (`prompt 40% · 6s left`), or a ComfyUI render (`render · 8 / 20 · 30s · 1 queued`) |
-| `memory` | the Mac's memory in use, the total, and the swap in use; the bar turns amber at a kernel warning and red at a critical level |
-| `step hit` / `total hit` | cache hit rate of the last settled step (with the change since the one before) and of the whole conversation, sub-sessions included |
+| `Last reply` | the finished turn's average — `measured` when the provider reported token counts, `estimated` otherwise |
+| `First token` | time to first token |
+| `Prompt reading` | the prompt a local Splash chat is reading (`40% · 6s left`), or the ComfyUI render running now (`8 / 20 · 30s · 1 queued`) |
+| `Memory` | the Mac's memory in use, the total, and the swap in use; the meter turns amber at a kernel warning and red at a critical level |
+| `Cache hit` | the last settled step's hit rate with the change since the one before, and the whole conversation's, sub-sessions included |
 
-Every row is always drawn, at the same height. A reading that is missing is a
-dash, never a row that appears and disappears.
+Every fact is always drawn, at the same height. A reading that is missing is a
+dash, never a fact that appears or disappears.
 
 ## What it needs
 

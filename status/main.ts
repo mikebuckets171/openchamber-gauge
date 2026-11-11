@@ -116,14 +116,12 @@ const COPY = {
     noService: '需在 设置 → 扩展 里允许本地服务',
     unreachable: '连不上服务端事件流',
     noData: '对话开始后显示',
-    lastTurn: '上轮',
-    ttft: '首字',
     measured: '实测',
     estimated: '估计',
     noReasoning: '无推理数据',
-    stepHit: '单步',
-    totalHit: '累计',
     inProgress: '进行中',
+    lastReply: '上轮',
+    firstToken: '首字',
     work: '工作',
     prompt: '读取提示',
     render: '渲染',
@@ -131,6 +129,9 @@ const COPY = {
     memory: '内存',
     swap: '交换',
     left: '剩余',
+    cacheHit: '缓存命中',
+    step: '单步',
+    total: '累计',
   },
   en: {
     unit: 'tok/s',
@@ -142,21 +143,22 @@ const COPY = {
     noService: 'Allow the local service in Settings → Extensions',
     unreachable: 'cannot reach the server stream',
     noData: 'shows once a turn runs',
-    lastTurn: 'last',
-    ttft: 'ttft',
     measured: 'measured',
     estimated: 'estimated',
     noReasoning: 'no reasoning data',
-    stepHit: 'step',
-    totalHit: 'total',
     inProgress: 'in progress',
-    work: 'work',
-    prompt: 'prompt',
-    render: 'render',
+    lastReply: 'Last reply',
+    firstToken: 'First token',
+    work: 'Work',
+    prompt: 'Prompt reading',
+    render: 'Render',
     queued: 'queued',
-    memory: 'memory',
+    memory: 'Memory',
     swap: 'swap',
     left: 'left',
+    cacheHit: 'Cache hit',
+    step: 'step',
+    total: 'total',
   },
 } as const;
 
@@ -197,8 +199,9 @@ let sparkMoving = false;
 /** A curve that just emptied still needs one static draw to flatten out. */
 let sparkNeedsStatic = false;
 
-const row1 = document.createElement('div');
-row1.className = 'row';
+// The headline: the speed, its unit, and the state word on the far right.
+const hero = document.createElement('div');
+hero.className = 'hero';
 const dot = document.createElement('span');
 dot.className = 'dot';
 const valueEl = document.createElement('span');
@@ -206,6 +209,10 @@ valueEl.className = 'value';
 valueEl.textContent = '—';
 const unitEl = document.createElement('span');
 unitEl.className = 'unit';
+const stateEl = document.createElement('span');
+stateEl.className = 'state';
+hero.append(dot, valueEl, unitEl, stateEl);
+
 const sparkEl = document.createElement('div');
 sparkEl.className = 'row sparkrow';
 const sparkParts = makeSparkSvg(SPARK_W, SPARK_H);
@@ -217,88 +224,56 @@ for (const path of [sparkParts.line, sparkParts.area]) {
   path.setAttribute('vector-effect', 'non-scaling-stroke');
 }
 sparkEl.append(sparkParts.svg);
-row1.append(dot, valueEl, unitEl);
-let lastHeight = 0;
-
-const row2 = document.createElement('div');
-row2.className = 'row meta';
-const stateEl = document.createElement('span');
-const lastEl = document.createElement('span');
-row2.append(stateEl, lastEl);
-
-type CacheRow = {
-  root: HTMLElement;
-  label: HTMLElement;
-  bar: HTMLElement;
-  fill: HTMLElement;
-  pct: HTMLElement;
-  delta: HTMLElement;
-};
 
 /**
- * A fixed row: label, bar, value. Always the same height whether it shows a
- * reading or a dash, so the section never changes size under the reader.
+ * One measured fact: a small label, its value, and the meters under it.
+ *
+ * Every fact is always drawn, at the same height. A reading that is missing
+ * is a dash and an empty track, never a fact that appears or disappears, so
+ * the section never changes size under the reader.
  */
-type GaugeRow = {
+type Meter = { root: HTMLElement; fill: HTMLElement };
+type Fact = {
   root: HTMLElement;
   label: HTMLElement;
-  bar: HTMLElement;
-  fill: HTMLElement;
   value: HTMLElement;
+  meters: Meter[];
 };
 
-const makeGaugeRow = (labelText: string): GaugeRow => {
+const makeFact = (meterCount: number, wide = false): Fact => {
   const root = document.createElement('div');
-  root.className = 'row gauge';
+  root.className = wide ? 'fact wide' : 'fact';
   const label = document.createElement('span');
-  label.className = 'gauge-label';
-  label.textContent = labelText;
-  const bar = document.createElement('span');
-  bar.className = 'gaugebar';
-  const fill = document.createElement('span');
-  fill.className = 'fill';
-  bar.append(fill);
+  label.className = 'k';
   const value = document.createElement('span');
-  value.className = 'gauge-value';
+  value.className = 'v';
   value.textContent = '—';
-  root.append(label, bar, value);
-  return { root, label, bar, fill, value };
-};
-
-const workRow = makeGaugeRow('');
-const macRow = makeGaugeRow('');
-
-const makeCacheRow = (): CacheRow => {
-  const root = document.createElement('div');
-  root.className = 'row cache';
-  const label = document.createElement('span');
-  label.className = 'cache-label';
-  const bar = document.createElement('span');
-  bar.className = 'hitbar';
-  const fill = document.createElement('span');
-  fill.className = 'fill';
-  bar.append(fill);
-  const pct = document.createElement('span');
-  pct.className = 'cache-pct';
-  pct.textContent = '—';
-  const delta = document.createElement('span');
-  delta.className = 'cache-delta';
-  root.append(label, bar, pct, delta);
-  return { root, label, bar, fill, pct, delta };
-};
-
-const stepCache = makeCacheRow();
-const totalCache = makeCacheRow();
-
-const resolveOrigin = (): string | null => {
-  try {
-    const url = new URL(window.location.href);
-    if (url.protocol === 'http:' || url.protocol === 'https:') return url.origin;
-  } catch {
-    // about:srcdoc, an opaque sandbox origin, or no window: nothing usable.
+  const meters: Meter[] = [];
+  const track = document.createElement('span');
+  track.className = 'meters';
+  for (let i = 0; i < meterCount; i += 1) {
+    const bar = document.createElement('span');
+    bar.className = 'meter';
+    const fill = document.createElement('i');
+    fill.className = 'fill';
+    bar.append(fill);
+    track.append(bar);
+    meters.push({ root: bar, fill });
   }
-  return null;
+  root.append(label, value, track);
+  return { root, label, value, meters };
 };
+
+const facts = document.createElement('div');
+facts.className = 'facts';
+const factLast = makeFact(0);
+const factTtft = makeFact(0);
+const factWork = makeFact(1, true);
+const factMemory = makeFact(1, true);
+const factCache = makeFact(2, true);
+facts.append(factLast.root, factTtft.root, factWork.root, factMemory.root, factCache.root);
+
+let lastHeight = 0;
 
 const formatTps = (tps: number): string => {
   if (!Number.isFinite(tps)) return '—';
@@ -309,6 +284,35 @@ const formatSecs = (ms: number | null): string => {
   if (ms === null || !Number.isFinite(ms)) return '—';
   const s = ms / 1000;
   return s >= 10 ? `${s.toFixed(0)}s` : `${s.toFixed(1)}s`;
+};
+
+const formatGb = (bytes: number | null | undefined): string => {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '—';
+  return `${(bytes / 1024 ** 3).toFixed(1)}`;
+};
+
+const barWidth = (value: number | null | undefined): string => (
+  `${Math.max(0, Math.min(100, typeof value === 'number' && Number.isFinite(value) ? value : 0))}%`
+);
+
+const formatPct = (value: number | null | undefined): string => (
+  typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}%` : '—'
+);
+
+/**
+ * The origin the page was served from, or null when it has none: a relay
+ * client mounts a guest as a `srcDoc`, whose location is `about:srcdoc` with
+ * no http(s) origin to report. The service then finds the server on this
+ * machine instead of dialing the client's address.
+ */
+const resolveOrigin = (): string | null => {
+  try {
+    const url = new URL(window.location.href);
+    if (url.protocol === 'http:' || url.protocol === 'https:') return url.origin;
+  } catch {
+    // about:srcdoc, an opaque sandbox origin, or no window: nothing usable.
+  }
+  return null;
 };
 
 /**
@@ -368,87 +372,30 @@ const fitHeight = (): void => {
 };
 
 const setState = (text: string): void => {
-  // An empty state must not leave a flex gap behind in the meta row.
+  // An empty state must not leave a gap behind in the headline.
   stateEl.textContent = text;
   stateEl.hidden = text.length === 0;
 };
 
-const formatPct = (value: number | null | undefined): string => (
-  typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}%` : '—'
-);
-
-const barWidth = (value: number | null | undefined): string => (
-  `${Math.max(0, Math.min(100, typeof value === 'number' && Number.isFinite(value) ? value : 0))}%`
-);
-
-/**
- * The two cache rates: the last settled step (which may belong to a
- * sub-session) and the conversation total. Both are hidden when no step has
- * reported a cache block, rather than drawn as a misleading 0%.
- */
-const paintCache = (info: CacheInfo | null | undefined): void => {
-  const present = !!info && info.steps > 0 && info.hit + info.miss > 0;
-  stepCache.root.hidden = !present;
-  totalCache.root.hidden = !present;
-  if (!present || !info) {
-    stepCache.pct.textContent = '—';
-    totalCache.pct.textContent = '—';
-    stepCache.delta.textContent = '';
-    stepCache.bar.hidden = true;
-    totalCache.bar.hidden = true;
-    return;
-  }
-  stepCache.label.textContent = copy.stepHit;
-  totalCache.label.textContent = copy.totalHit;
-  stepCache.bar.hidden = false;
-  totalCache.bar.hidden = false;
-  const last = info.last;
-  stepCache.fill.style.width = barWidth(last?.hitRate);
-  stepCache.pct.textContent = formatPct(last?.hitRate);
-  const delta = last?.delta;
-  if (typeof delta === 'number' && Number.isFinite(delta) && Math.abs(delta) >= 0.05) {
-    stepCache.delta.textContent = `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}`;
-    stepCache.delta.className = delta >= 0 ? 'cache-delta up' : 'cache-delta down';
-  } else {
-    stepCache.delta.textContent = '';
-    stepCache.delta.className = 'cache-delta';
-  }
-  totalCache.fill.style.width = barWidth(info.hitRate);
-  totalCache.pct.textContent = formatPct(info.hitRate);
-  totalCache.delta.textContent = '';
-};
-
-const formatGb = (bytes: number | null | undefined): string => {
-  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '—';
-  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
-};
-
-/**
- * Gauge's own two rows.
- *
- * The work row shows whichever heavy job is running: the prompt a local chat is
- * reading, or a ComfyUI render. The memory row shows what the Mac is using.
- * Both rows are always present and the same height; a missing reading is a
- * dash, never a row that appears and disappears.
- */
-const paintGauge = (gauge: GaugeWire | null | undefined): void => {
+/** The work fact: the heavy job running now, or a dash when there is none. */
+const paintWork = (gauge: GaugeWire | null | undefined): void => {
   const prompt = gauge?.prompt ?? null;
   const job = gauge?.render ?? null;
-  const mac = gauge?.mac ?? null;
-
-  workRow.label.textContent = copy.work;
   if (prompt && prompt.total > 0) {
     const percent = (prompt.processed / prompt.total) * 100;
     // Time left from the rate Splash itself reported: processed tokens over the
     // prefill time so far. No rate, no estimate.
     const perMs = prompt.timeMs > 0 ? prompt.processed / prompt.timeMs : 0;
     const leftMs = perMs > 0 ? (prompt.total - prompt.processed) / perMs : null;
-    workRow.value.textContent = leftMs !== null
-      ? `${copy.prompt} ${percent.toFixed(0)}% · ${formatSecs(leftMs)} ${copy.left}`
-      : `${copy.prompt} ${percent.toFixed(0)}%`;
-    workRow.fill.style.width = barWidth(percent);
-    workRow.root.className = 'row gauge active';
-  } else if (job) {
+    factWork.label.textContent = copy.prompt;
+    factWork.value.textContent = leftMs !== null
+      ? `${percent.toFixed(0)}% · ${formatSecs(leftMs)} ${copy.left}`
+      : `${percent.toFixed(0)}%`;
+    factWork.meters[0].fill.style.width = barWidth(percent);
+    factWork.root.className = 'fact wide active';
+    return;
+  }
+  if (job) {
     const step = job.step;
     const parts = [copy.render];
     if (step) parts.push(`${step.value} / ${step.max}`);
@@ -456,37 +403,65 @@ const paintGauge = (gauge: GaugeWire | null | undefined): void => {
     else if (job.startedAt) parts.push(formatSecs(Date.now() - job.startedAt));
     // Jobs waiting behind the running one: how much is still to come.
     if (job.state !== 'queued' && job.queued > 0) parts.push(`${job.queued} ${copy.queued}`);
-    workRow.value.textContent = parts.join(' · ');
-    workRow.fill.style.width = barWidth(step && step.max > 0 ? (step.value / step.max) * 100 : null);
-    workRow.root.className = 'row gauge active';
-  } else {
-    workRow.value.textContent = '—';
-    workRow.fill.style.width = '0%';
-    workRow.root.className = 'row gauge';
+    factWork.label.textContent = copy.render;
+    factWork.value.textContent = parts.join(' · ');
+    factWork.meters[0].fill.style.width = barWidth(step && step.max > 0 ? (step.value / step.max) * 100 : null);
+    factWork.root.className = 'fact wide active';
+    return;
   }
+  factWork.label.textContent = copy.work;
+  factWork.value.textContent = '—';
+  factWork.meters[0].fill.style.width = '0%';
+  factWork.root.className = 'fact wide';
+};
 
-  macRow.label.textContent = copy.memory;
+/** The memory fact: what the Mac is using, and the kernel's own pressure level. */
+const paintMemory = (gauge: GaugeWire | null | undefined): void => {
+  const mac = gauge?.mac ?? null;
+  factMemory.label.textContent = copy.memory;
   if (mac && mac.usedBytes !== null && mac.totalBytes) {
     const percent = (mac.usedBytes / mac.totalBytes) * 100;
     const swap = mac.swapUsedBytes && mac.swapUsedBytes > 0 ? ` · ${copy.swap} ${formatGb(mac.swapUsedBytes)}` : '';
-    macRow.value.textContent = `${formatGb(mac.usedBytes)} / ${formatGb(mac.totalBytes)}${swap}`;
-    macRow.fill.style.width = barWidth(percent);
-    macRow.root.className = `row gauge ${mac.pressure ?? 'normal'}`;
-  } else {
-    macRow.value.textContent = '—';
-    macRow.fill.style.width = '0%';
-    macRow.root.className = 'row gauge';
+    factMemory.value.textContent = `${formatGb(mac.usedBytes)} / ${formatGb(mac.totalBytes)} GB${swap}`;
+    factMemory.meters[0].fill.style.width = barWidth(percent);
+    factMemory.root.className = `fact wide ${mac.pressure ?? 'normal'}`;
+    return;
   }
+  factMemory.value.textContent = '—';
+  factMemory.meters[0].fill.style.width = '0%';
+  factMemory.root.className = 'fact wide';
+};
+
+/** The cache fact: the last settled step's hit rate and the conversation's. */
+const paintCache = (info: CacheInfo | null | undefined): void => {
+  factCache.label.textContent = copy.cacheHit;
+  const present = !!info && info.steps > 0 && info.hit + info.miss > 0;
+  if (!present || !info) {
+    factCache.value.textContent = '—';
+    factCache.meters[0].fill.style.width = '0%';
+    factCache.meters[1].fill.style.width = '0%';
+    return;
+  }
+  const last = info.last;
+  const delta = last?.delta;
+  const moved = typeof delta === 'number' && Number.isFinite(delta) && Math.abs(delta) >= 0.05;
+  const arrow = moved ? `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}` : '';
+  factCache.value.textContent = `${formatPct(last?.hitRate)}${arrow} ${copy.step} · ${formatPct(info.hitRate)} ${copy.total}`;
+  factCache.meters[0].fill.style.width = barWidth(last?.hitRate);
+  factCache.meters[1].fill.style.width = barWidth(info.hitRate);
 };
 
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
   if (!rate) {
     dot.className = 'dot';
     valueEl.textContent = '—';
+    valueEl.className = 'value';
     setState(notice ?? copy.connecting);
-    lastEl.textContent = '';
+    factLast.value.textContent = '—';
+    factTtft.value.textContent = '—';
     paintCache(null);
-    paintGauge(null);
+    paintWork(null);
+    paintMemory(null);
     dropSpark();
     fitHeight();
     return;
@@ -547,24 +522,23 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     sparkMoving = moving;
   }
 
-  // Second row: last-turn average + TTFT. Prefer the finished turn; while a
-  // turn runs, show its TTFT so far.
+  // The two facts under the curve: the finished turn and the first token.
   const lt = rate.lastTurn;
-  const parts: string[] = [];
-  if (lt) {
-    parts.push(`${copy.lastTurn} ${formatTps(lt.tokensPerSecond)} (${lt.source === 'tokens' ? copy.measured : copy.estimated})`);
-  }
+  factLast.label.textContent = copy.lastReply;
+  factLast.value.textContent = lt
+    ? `${formatTps(lt.tokensPerSecond)} ${copy.unit} · ${lt.source === 'tokens' ? copy.measured : copy.estimated}`
+    : '—';
   const ttft = rate.turn.active ? rate.turn.ttftMs : lt?.ttftMs ?? null;
-  if (ttft !== null || lt) {
-    parts.push(`${copy.ttft} ${formatSecs(ttft)}`);
-  }
+  factTtft.label.textContent = copy.firstToken;
+  factTtft.value.textContent = ttft !== null ? formatSecs(ttft) : '—';
   if (lt && !lt.hasReasoning && lt.tokens > 0) {
-    parts.push(copy.noReasoning);
+    factLast.value.textContent += ` · ${copy.noReasoning}`;
   }
-  lastEl.textContent = parts.length > 0 ? parts.join(' · ') : (turnActive ? copy.inProgress : copy.noData);
+  if (!lt && turnActive) factLast.value.textContent = copy.inProgress;
 
   paintCache(rate.cache);
-  paintGauge(rate.gauge);
+  paintWork(rate.gauge);
+  paintMemory(rate.gauge);
 
   if (notice) setState(notice);
   fitHeight();
@@ -582,7 +556,7 @@ const describeError = (error: unknown): string => {
 
 /**
  * The same answer with everything session-scoped blanked; connection fields
- * stay. A page with no session must not read another session's live numbers,
+ * stay. A page with no session must not show another session's live numbers,
  * and `sessionId` in the answer names the record the service actually read.
  */
 const withoutSession = (rate: RateResponse): RateResponse => ({
@@ -596,6 +570,7 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
   turn: { active: false, ttftMs: null },
   lastTurn: null,
   cache: null,
+  gauge: undefined,
 });
 
 const poll = async (): Promise<void> => {
@@ -660,7 +635,7 @@ const configure = async (sessionId: string | null): Promise<void> => {
 };
 
 const mount = (): void => {
-  root.append(row1, sparkEl, row2, workRow.root, macRow.root, stepCache.root, totalCache.root);
+  root.append(hero, sparkEl, facts);
   unitEl.textContent = copy.unit;
   if (!heightReported) {
     heightReported = true;

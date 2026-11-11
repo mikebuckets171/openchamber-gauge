@@ -5,7 +5,19 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "bun-types",
+      "node"
+    ],
+    "lib": [
+      "ES2022",
+      "DOM"
+    ]
   },
-  "include": ["status", "panel", "service", "shared"]
+  "include": [
+    "status",
+    "panel",
+    "service",
+    "shared"
+  ]
 }

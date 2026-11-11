@@ -258,6 +258,17 @@ const findByClass = (node, className) => {
 
 const widthOf = (node) => String(node?.style?.props?.width ?? node?.style?.width ?? '');
 
+/** The fact whose label is `text`: the fact root, not its label. */
+const findFact = (node, text) => {
+  if (String(node.className ?? '').split(/\s+/).includes('fact') && node.textContent.includes(text)) return node;
+  for (const child of node.children) {
+    if (!(child instanceof El)) continue;
+    const hit = findFact(child, text);
+    if (hit) return hit;
+  }
+  return null;
+};
+
 const findByText = (node, text) => {
   if (node.textContent === text) return node;
   for (const child of node.children) {
@@ -327,19 +338,20 @@ for (const surface of SURFACES) {
     direct.root().includes('83.5'),
     JSON.stringify(direct.root()),
   );
-  const lastBar = findByClass(direct.rootEl, 'hitbar');
-  const totalBars = [];
-  const collectBars = (node) => {
-    if (String(node.className ?? '').includes('hitbar')) totalBars.push(node);
-    for (const child of node.children) if (child instanceof El) collectBars(child);
+  // The cache fact carries the two hit rates as meters under its value.
+  const cacheFact = findFact(direct.rootEl, '缓存命中');
+  const cacheMeters = [];
+  const collectMeters = (node) => {
+    if (String(node.className ?? '').split(/\s+/).includes('meter')) cacheMeters.push(node);
+    for (const child of node.children) if (child instanceof El) collectMeters(child);
   };
-  collectBars(direct.rootEl);
+  collectMeters(cacheFact ?? direct.rootEl);
   check(
     `${surface.name}: both hit rates carry a progress bar`,
-    lastBar !== null && totalBars.length === 2,
-    `bars=${totalBars.length}`,
+    cacheFact !== null && cacheMeters.length === 2,
+    `bars=${cacheMeters.length}`,
   );
-  const widths = totalBars.map((bar) => widthOf(findByClass(bar, 'fill')));
+  const widths = cacheMeters.map((bar) => widthOf(findByClass(bar, 'fill')));
   check(
     `${surface.name}: the bars fill to their percentages`,
     widths.some((w) => w.startsWith('94.1')) && widths.some((w) => w.startsWith('83.5')),
@@ -362,17 +374,22 @@ for (const surface of SURFACES) {
   // The empty tracks used to render as stray ``— [bar] —`` rows.
   const noCache = runGuest(surface.bundle, surface.url, { rate: { ...RATE, cache: null } });
   await settle();
-  const barHidden = [];
-  const collect = (node, hidden) => {
-    const nextHidden = hidden || node.hidden === true;
-    if (String(node.className ?? '').split(/\s+/).includes('hitbar')) barHidden.push(nextHidden);
-    for (const child of node.children) if (child instanceof El) collect(child, nextHidden);
+  const cacheFactEmpty = findFact(noCache.rootEl, '缓存命中');
+  const emptyMeters = [];
+  const collect = (node) => {
+    if (String(node.className ?? '').split(/\s+/).includes('meter')) emptyMeters.push(node);
+    for (const child of node.children) if (child instanceof El) collect(child);
   };
-  collect(noCache.rootEl, false);
+  collect(cacheFactEmpty ?? noCache.rootEl);
   check(
-    `${surface.name}: no cache data draws no bars`,
-    barHidden.length > 0 && barHidden.every(Boolean),
-    `bars=${barHidden.length} hidden=${JSON.stringify(barHidden)}`,
+    `${surface.name}: no cache data leaves the cache meters empty`,
+    emptyMeters.length === 2 && emptyMeters.every((bar) => widthOf(findByClass(bar, 'fill')) === '0%'),
+    `meters=${emptyMeters.length} widths=${JSON.stringify(emptyMeters.map((bar) => widthOf(findByClass(bar, 'fill'))))}`,
+  );
+  check(
+    `${surface.name}: no cache data writes a dash in the cache fact`,
+    cacheFactEmpty !== null && cacheFactEmpty.textContent.includes('—'),
+    JSON.stringify(noCache.root()),
   );
   check(
     `${surface.name}: no cache data writes no percentage`,
@@ -382,23 +399,23 @@ for (const surface of SURFACES) {
 
   // Gauge's own two rows are always there, the same height whether they show a
   // reading or a dash. A missing reading is a dash, never a missing row.
-  const rows = (node, out = []) => {
-    if (String(node.className ?? '').split(/\s+/).includes('gauge')) out.push(node);
-    for (const child of node.children) if (child instanceof El) rows(child, out);
+  const facts = (node, out = []) => {
+    if (String(node.className ?? '').split(/\s+/).includes('fact')) out.push(node);
+    for (const child of node.children) if (child instanceof El) facts(child, out);
     return out;
   };
-  const plain = runGuest(surface.bundle, surface.url, { rate: { ...RATE, gauge: null }, locale: 'en' });
+  const plain = runGuest(surface.bundle, surface.url, { rate: { ...RATE, gauge: null, cache: null, lastTurn: null }, locale: 'en' });
   await settle();
-  const plainRows = rows(plain.rootEl);
+  const plainFacts = facts(plain.rootEl);
   check(
-    `${surface.name}: the work and memory rows are always drawn`,
-    plainRows.length === 2,
-    `rows=${plainRows.length}`,
+    `${surface.name}: every fact is always drawn`,
+    plainFacts.length === 5,
+    `facts=${plainFacts.length}`,
   );
   check(
-    `${surface.name}: a missing reading is a dash, not an empty row`,
-    plainRows.length === 2 && plainRows.every((row) => row.textContent.includes('—')),
-    JSON.stringify(plainRows.map((row) => row.textContent)),
+    `${surface.name}: a missing reading is a dash, not an empty fact`,
+    plainFacts.length === 5 && plainFacts.every((fact) => fact.textContent.includes('—')),
+    JSON.stringify(plainFacts.map((fact) => fact.textContent)),
   );
 
   const busy = runGuest(surface.bundle, surface.url, {
@@ -416,12 +433,12 @@ for (const surface of SURFACES) {
   const busyText = busy.root();
   check(
     `${surface.name}: a prompt being read shows its percentage`,
-    busyText.includes('prompt 40%'),
+    busyText.includes('Prompt reading') && busyText.includes('40%'),
     JSON.stringify(busyText),
   );
   check(
-    `${surface.name}: the memory row shows the Mac's memory and swap`,
-    busyText.includes('34.0 GB') && busyText.includes('5.0 GB'),
+    `${surface.name}: the memory fact shows the Mac's memory and swap`,
+    busyText.includes('34.0 / 48.0 GB') && busyText.includes('swap 5.0'),
     JSON.stringify(busyText),
   );
 
@@ -440,7 +457,7 @@ for (const surface of SURFACES) {
   const renderingText = rendering.root();
   check(
     `${surface.name}: a render shows its step and the queue`,
-    renderingText.includes('render · 8 / 20') && renderingText.includes('1 queued'),
+    renderingText.includes('Render') && renderingText.includes('8 / 20') && renderingText.includes('1 queued'),
     JSON.stringify(renderingText),
   );
 

@@ -37,7 +37,7 @@
       "statusSection": {
         "entry": "status/index.html",
         "title": "Gauge",
-        "height": 132
+        "height": 225
       },
       "service": {
         "entry": "service/main.js",
@@ -74,6 +74,7 @@
     "@openchamber/sdk": "2.7.0"
   },
   "devDependencies": {
-    "@types/node": "^22.20.3"
+    "@types/node": "^22.20.3",
+    "@types/bun": "1.3.4"
   }
 }
