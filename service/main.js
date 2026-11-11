@@ -220,6 +220,7 @@ var comfyNextAt = 0;
 var comfyBusy = false;
 var render = null;
 var runningId = null;
+var startedAt = null;
 var seenQueued = new Set;
 var steps = new Map;
 var socket = null;
@@ -361,21 +362,20 @@ var pollComfy = async (now) => {
     comfyBusy = false;
   }
 };
-var startedAt = null;
 var noteDemand = (now) => {
   demandAt = now;
   if (!mac || now - mac.at >= MAC_EVERY_MS)
     sampleMac();
   pollComfy(now);
 };
-var gaugeWire = (sessionIds, now) => ({
-  mac,
-  prompt: promptFor(sessionIds, now),
-  render: render && render.state === "running" && render.step === null && runningId ? { ...render, step: (() => {
+var gaugeWire = (sessionIds, now) => {
+  const job = render ? { ...render } : null;
+  if (job && job.state === "running" && runningId) {
     const step = steps.get(runningId);
-    return step && now - step.at < STEP_FRESH_MS ? step : null;
-  })() } : render
-});
+    job.step = step && now - step.at < STEP_FRESH_MS ? step : null;
+  }
+  return { mac, prompt: promptFor(sessionIds, now), render: job };
+};
 var idleTimer = setInterval(() => {
   if (!wanted(Date.now())) {
     closeSocket();
