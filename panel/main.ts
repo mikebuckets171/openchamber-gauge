@@ -27,6 +27,34 @@ type TurnResult = {
   endedAt: number;
 };
 
+type CachePoint = {
+  at: number;
+  sessionId: string;
+  messageID: string;
+  hit: number;
+  miss: number;
+  hitRate: number | null;
+  delta: number | null;
+  output: number;
+  reasoning: number;
+};
+
+type CacheInfo = {
+  startedAt: number | null;
+  steps: number;
+  sessions: number;
+  hit: number;
+  miss: number;
+  hitRate: number | null;
+  write: number;
+  input: number;
+  output: number;
+  reasoning: number;
+  cost: number;
+  last: CachePoint | null;
+  prevHitRate: number | null;
+};
+
 type RateResponse = {
   connection: 'idle' | 'connecting' | 'live' | 'error';
   error: string | null;
@@ -45,6 +73,8 @@ type RateResponse = {
   curveAt?: number;
   turn: { active: boolean; ttftMs: number | null };
   lastTurn: TurnResult | null;
+  /** Conversation-wide cache accounting; null until a step settles. */
+  cache?: CacheInfo | null;
   eventsSeen: number;
 };
 
@@ -60,6 +90,13 @@ const COPY = {
     reasoning: '推理占比', connection: '连接', events: '事件',
     measured: '实测', estimated: '估计',
     noReasoning: '本轮无推理数据（模型未上报推理）',
+    stepHit: '单步命中',
+    totalHit: '累计命中',
+    hitMiss: '命中 / 未命中',
+    output: '输出',
+    steps: '步数',
+    subs: '子对话',
+    cost: '费用',
     noData: '打开一个对话并让模型生成后显示',
     inProgress: '本轮进行中…',
     estimateNote: '实时值按字符数启发式换算（字符/4，按模型校准）；上轮均值优先用提供商上报的真实 token。',
@@ -75,6 +112,13 @@ const COPY = {
     reasoning: 'reasoning share', connection: 'connection', events: 'events',
     measured: 'measured', estimated: 'estimated',
     noReasoning: 'No reasoning reported for this turn',
+    stepHit: 'last-step hit',
+    totalHit: 'total hit',
+    hitMiss: 'hit / miss',
+    output: 'output',
+    steps: 'steps',
+    subs: 'sub-sessions',
+    cost: 'cost',
     noData: 'Open a chat and let the model generate',
     inProgress: 'Turn in progress…',
     estimateNote: 'Live values estimate tokens from characters (chars/4), corrected per model; last-turn averages prefer provider-reported tokens.',
@@ -99,6 +143,13 @@ let sparkFrame: SparkFrame | null = null;
 let sparkFrameAt = 0;
 let sparkScale = 1;
 let sparkPaintedAt = 0;
+/**
+ * Whether the curve still holds a nonzero point. A decaying tail keeps sliding
+ * (it is still moving data); only a curve that is zero everywhere stops.
+ */
+let sparkMoving = false;
+/** A curve that just emptied still needs one static draw to flatten out. */
+let sparkNeedsStatic = false;
 const titleEl = document.createElement('h1');
 const stateLine = document.createElement('div');
 const dot = document.createElement('span');
@@ -113,6 +164,14 @@ unitLine.className = 'unit muted';
 const sparkEl = document.createElement('div');
 sparkEl.className = 'spark';
 const sparkParts = makeSparkSvg(SPARK_W, SPARK_H);
+// The drawing keeps its 248-unit coordinate system; the element spans the
+// panel and stretches the curve horizontally, so its width never needs
+// measuring (or a resize observer) on a page that redraws every frame.
+sparkParts.svg.setAttribute('width', '100%');
+sparkParts.svg.setAttribute('preserveAspectRatio', 'none');
+for (const path of [sparkParts.line, sparkParts.area]) {
+  path.setAttribute('vector-effect', 'non-scaling-stroke');
+}
 sparkEl.append(sparkParts.svg);
 const list = document.createElement('dl');
 const row = (label: string): HTMLElement => {
@@ -126,6 +185,42 @@ const row = (label: string): HTMLElement => {
 const lastEl = row('');
 const ttftEl = row('');
 const reasoningEl = row('');
+/** The two hit rates sit under the curve, not inside the value list. */
+type CacheLine = {
+  root: HTMLElement;
+  label: HTMLElement;
+  bar: HTMLElement;
+  fill: HTMLElement;
+  pct: HTMLElement;
+  delta: HTMLElement;
+};
+const makeCacheLine = (): CacheLine => {
+  const line = document.createElement('div');
+  line.className = 'cacheline';
+  const label = document.createElement('span');
+  label.className = 'cache-name';
+  const bar = document.createElement('span');
+  bar.className = 'hitbar';
+  const fill = document.createElement('span');
+  fill.className = 'fill';
+  bar.append(fill);
+  const pct = document.createElement('span');
+  pct.className = 'pct';
+  pct.textContent = '—';
+  const delta = document.createElement('span');
+  delta.className = 'delta';
+  line.append(label, bar, pct, delta);
+  return { root: line, label, bar, fill, pct, delta };
+};
+const cacheBlock = document.createElement('div');
+cacheBlock.className = 'cacheblock';
+const stepLine = makeCacheLine();
+const totalLine = makeCacheLine();
+cacheBlock.append(stepLine.root, totalLine.root);
+const hitMissEl = row('');
+const outputEl = row('');
+const stepsEl = row('');
+const costEl = row('');
 const connEl = row('');
 const eventsEl = row('');
 const noteEl = document.createElement('div');
@@ -172,19 +267,77 @@ const paintSpark = (): void => {
   const at = performance.now();
   // ~30 fps is enough for a 2 px/slide and keeps a decorative curve from
   // repainting the whole panel sixty times a second on an idle session.
-  if (frame && frame.values.length > 0 && at - sparkPaintedAt >= 30) {
-    sparkPaintedAt = at;
-    const elapsed = Math.min(2_000, at - sparkFrameAt);
-    sparkScale = nextScale(sparkScale, frame.values);
-    drawSpark(sparkParts, frame, frame.at + elapsed, SPARK_W, SPARK_H, sparkScale);
+  if (frame && frame.values.length > 0) {
+    if (sparkMoving) {
+      if (at - sparkPaintedAt >= 30) {
+        sparkPaintedAt = at;
+        const elapsed = Math.min(2_000, at - sparkFrameAt);
+        sparkScale = nextScale(sparkScale, frame.values);
+        drawSpark(sparkParts, frame, frame.at + elapsed, SPARK_W, SPARK_H, sparkScale);
+      }
+    } else if (sparkNeedsStatic) {
+      // Drop the frozen slide's projection and draw the frame where it ended.
+      sparkNeedsStatic = false;
+      sparkScale = nextScale(sparkScale, frame.values);
+      drawSpark(sparkParts, frame, frame.at, SPARK_W, SPARK_H, sparkScale);
+    }
   }
   requestAnimationFrame(paintSpark);
+};
+
+const formatPct = (value: number | null | undefined): string => (
+  typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}%` : '—'
+);
+
+const barWidth = (value: number | null | undefined): string => (
+  `${Math.max(0, Math.min(100, typeof value === 'number' && Number.isFinite(value) ? value : 0))}%`
+);
+
+const formatTokens = (value: number): string => {
+  if (!Number.isFinite(value) || value <= 0) return '0';
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(Math.round(value));
+};
+
+const paintCache = (info: CacheInfo | null | undefined): void => {
+  const hasSteps = !!info && info.steps > 0;
+  const hasRate = hasSteps && info !== null && info !== undefined && info.hit + info.miss > 0;
+  cacheBlock.hidden = !hasRate;
+  stepLine.label.textContent = copy.stepHit;
+  totalLine.label.textContent = copy.totalHit;
+  stepLine.pct.textContent = hasRate && info ? formatPct(info.last?.hitRate) : '—';
+  totalLine.pct.textContent = hasRate && info ? formatPct(info.hitRate) : '—';
+  stepLine.fill.style.width = hasRate ? barWidth(info?.last?.hitRate) : '0%';
+  totalLine.fill.style.width = hasRate ? barWidth(info?.hitRate) : '0%';
+  const delta = hasRate ? info?.last?.delta : null;
+  if (typeof delta === 'number' && Number.isFinite(delta) && Math.abs(delta) >= 0.05) {
+    stepLine.delta.textContent = `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}`;
+    stepLine.delta.className = delta >= 0 ? 'delta up' : 'delta down';
+  } else {
+    stepLine.delta.textContent = '';
+    stepLine.delta.className = 'delta';
+  }
+  if (!hasSteps || !info) {
+    hitMissEl.textContent = '—';
+    outputEl.textContent = '—';
+    stepsEl.textContent = '—';
+    costEl.textContent = '—';
+    return;
+  }
+  hitMissEl.textContent = `${formatTokens(info.hit)} / ${formatTokens(info.miss)}`;
+  outputEl.textContent = `${formatTokens(info.output)} tok`;
+  stepsEl.textContent = info.sessions > 1
+    ? `${info.steps} · ${copy.subs} ${info.sessions - 1}`
+    : String(info.steps);
+  costEl.textContent = info.cost > 0 ? `$${Number(info.cost.toFixed(4))}` : '—';
 };
 
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
   if (!rate) {
     dot.className = 'dot';
     stateText.textContent = notice ?? copy.connecting;
+    paintCache(null);
     return;
   }
   if (rate.connection === 'error') {
@@ -230,11 +383,19 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   // session switches, and is a rolling rate window rather than turn history.
   // An empty curve means the answer belongs to no session, so nothing is drawn
   // rather than the previous session's shape being left on screen.
-  sparkFrame = sparkFrameFrom(rate);
-  sparkFrameAt = performance.now();
-  if (sparkFrame.values.length === 0) {
+  const nextFrame = sparkFrameFrom(rate);
+  const moving = nextFrame.values.some((value) => value > 0.05);
+  if (nextFrame.values.length === 0) {
     sparkFrame = null;
+    sparkMoving = false;
     clearSparkPaths(sparkParts);
+  } else {
+    sparkFrame = nextFrame;
+    sparkFrameAt = performance.now();
+    // A nonzero curve keeps panning even after the turn ends; a curve that is
+    // zero everywhere is drawn once and then held still.
+    sparkNeedsStatic = sparkMoving && !moving;
+    sparkMoving = moving;
   }
 
   const lt = rate.lastTurn;
@@ -253,6 +414,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   }
   connEl.textContent = rate.connection;
   eventsEl.textContent = String(rate.eventsSeen);
+  paintCache(rate.cache);
   if (notice) stateText.textContent = notice;
   if (!lt && !rate.busy) noteEl.textContent = copy.noData;
   else if (!lt) noteEl.textContent = copy.inProgress;
@@ -284,6 +446,7 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
   curve: [],
   turn: { active: false, ttftMs: null },
   lastTurn: null,
+  cache: null,
 });
 
 const poll = async (): Promise<void> => {
@@ -325,7 +488,11 @@ const configure = async (id: string | null): Promise<void> => {
 };
 
 const relabel = (): void => {
-  const labels = [copy.lastTurn, copy.ttft, copy.reasoning, copy.connection, copy.events];
+  const labels = [
+    copy.lastTurn, copy.ttft, copy.reasoning,
+    copy.hitMiss, copy.output, copy.steps, copy.cost,
+    copy.connection, copy.events,
+  ];
   list.querySelectorAll('dt').forEach((dt, i) => {
     if (i < labels.length) dt.textContent = labels[i];
   });
@@ -335,7 +502,7 @@ const relabel = (): void => {
 
 const mount = (): void => {
   relabel();
-  root.append(titleEl, stateLine, bigEl, unitLine, sparkEl, list, noteEl);
+  root.append(titleEl, stateLine, bigEl, unitLine, sparkEl, cacheBlock, list, noteEl);
   stopped = false;
   void configure(sessionId);
   void poll();

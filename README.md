@@ -18,10 +18,13 @@ no tokenizer. See [Counting](#counting).
 | `last … (measured)` | the finished turn's average — `measured` when the provider reported token counts, `estimated` otherwise |
 | `ttft` | time to first token |
 | Sparkline | the last 30 s of generation rate, one point per 1.25 s |
+| `step hit` | cache hit rate of the last settled step (an API call), with the change since the step before; drawn as a bar under the curve |
+| `total hit` | cache hit rate of the whole conversation, including its sub-sessions |
+| cache details | hit/miss tokens, output tokens, step and sub-session counts, cost |
 
 ## Requirements
 
-- OpenChamber ≥ 2.0.4
+- OpenChamber ≥ 2.0.4 (background counting needs a host that supports `sessionEvents`; verified on 2.7.0)
 - OpenCode v1.2.19+
 - Node.js v22+ on `PATH`
 
@@ -94,6 +97,38 @@ parts, and tool-call JSON:
 `ttft` is measured directly from event timestamps, and is exact. For `last`,
 provider-reported token counts are preferred when they arrive (these will show as
 `measured`), falling back to the character estimate above (`estimated`).
+
+## Cache hits
+
+Both rates come from provider-reported usage, never from the character
+heuristic:
+
+```
+hit rate = cache.read / (input + cache.read + cache.write) × 100
+```
+
+`input` is the prompt tokens billed without a cache hit, `cache.read` the ones
+served from cache, and `cache.write` the ones written to it (a write is not a
+hit). This is the same formula OpenChamber's own Turn stats use, so the two
+numbers agree. A provider that reports no `cache` block only adds to the step
+count; it does not draw a misleading 0%.
+
+The conversation total covers the watched session and every child session the
+stream places below it (`session.created` names the parent), so a subagent's
+calls count toward the same numbers. A session the service attached late to is
+asked about through `/api/session/{id}` once, and the step that triggered the
+lookup is replayed after the answer. Both the aggregate and the per-turn
+history are written beside the service, so OpenChamber can be closed and
+reopened without losing them. Counting starts when the service first sees the
+session; conversations from before the install are not backfilled.
+
+**Background counting**: the service declares `keepRunning: true`, so OpenChamber starts it
+with the app, not with a panel. It subscribes to the global event stream on startup and
+treats top-level conversations (and an existing conversation's first execution) as targets,
+so the numbers keep accumulating. The eight most recently active top-level conversations
+are counted (sub-sessions follow their parent). `contributes.sessionEvents` is declared too,
+so the host can push turn boundaries straight to the service. Opening the panel shows what
+is already there; the host supervises the process and totals come back from disk.
 
 ## Architecture
 

@@ -10,23 +10,24 @@
   html, body { margin: 0; padding: 0; }
   body {
     font-family: var(--oc-font, system-ui, "Microsoft YaHei", sans-serif);
-    font-size: 12px;
+    font-size: 0.857rem;
     line-height: 1.6;
     color: var(--oc-fg, inherit);
     background: transparent;
     padding: 12px;
   }
-  h1 { font-size: 13px; margin: 0 0 8px; }
+  h1 { font-size: 0.929rem; margin: 0 0 8px; }
   .big {
     font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
-    font-size: 34px;
+    font-size: 2.429rem;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
   }
-  .big.muted { color: var(--oc-muted, #888); font-size: 20px; font-weight: 500; }
+  .big.muted { color: var(--oc-muted, #888); font-size: 1.429rem; font-weight: 500; }
   .big.stale { color: var(--oc-muted, #888); }
   .unit { color: var(--oc-muted, #888); }
-  .spark { margin: 4px 0; color: var(--oc-primary, #888); display: flex; }
+  .spark { margin: 4px 0; color: var(--oc-primary, #888); display: flex; width: 100%; }
+  .spark svg { display: block; width: 100%; }
   .spark-line { stroke: currentColor; }
   .spark-area { fill: currentColor; opacity: 0.18; }
   .muted { color: var(--oc-muted, #888); }
@@ -44,8 +45,44 @@
   }
   .dot.live { background: var(--oc-primary, #888); animation: pulse 1s ease-in-out infinite; }
   .dot.wait { background: transparent; border: 1px solid var(--oc-primary, #888); }
+  .cacheblock {
+    margin: 6px 0 2px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .cacheline {
+    display: grid;
+    grid-template-columns: 5.5rem minmax(0, 1fr) 3.25rem 2.5rem;
+    gap: 0.429rem;
+    align-items: center;
+  }
+  .cache-name { color: var(--oc-muted, #888); }
+  .hitbar {
+    display: block;
+    height: 0.357rem;
+    border-radius: 0.143rem;
+    background: var(--oc-subtle, #3a3a3a);
+    overflow: hidden;
+  }
+  .hitbar .fill {
+    display: block;
+    height: 100%;
+    width: 0%;
+    background: var(--oc-primary, #888);
+    transition: width 240ms linear;
+  }
+  .pct {
+    color: var(--oc-fg, inherit);
+    font-variant-numeric: tabular-nums;
+    width: 3.25rem;
+    text-align: right;
+  }
+  .delta { font-size: 0.786rem; color: var(--oc-muted, #888); width: 2.5rem; text-align: right; }
+  .delta.up { color: var(--oc-success, #3c3); }
+  .delta.down { color: var(--oc-error, #f66); }
   @keyframes pulse { 50% { opacity: 0.35; } }
-  .note { margin-top: 12px; color: var(--oc-muted, #888); font-size: 11px; }
+  .note { margin-top: 12px; color: var(--oc-muted, #888); font-size: 0.786rem; }
 </style>
 </head>
 <body>

@@ -204,24 +204,312 @@ type TurnResult = {
   /** Whether any reasoning (deltas or settled tokens) was seen this turn. */
   hasReasoning: boolean;
   endedAt: number;
+  /** Cache share of the steps this turn settled; null when none reported any. */
+  cache: TurnCache | null;
 };
 
 type WaitingKind = 'permission' | 'question';
 
+/** Cache totals of one finished turn, kept in its history point. */
+type TurnCache = {
+  hit: number;
+  miss: number;
+  steps: number;
+  output: number;
+  hitRate: number | null;
+};
+
+/** Provider usage of one settled step, as the cache accounting sees it. */
+type StepUsage = {
+  /** `tokens.input`: the prompt tokens billed without a cache hit. */
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  output: number;
+  reasoning: number;
+  /** `cost` carried by the event, 0 when the provider reports none. */
+  cost: number;
+  /** Whether the provider sent a `tokens.cache` block at all. */
+  hasCache: boolean;
+};
+
+/** One settled step as the two hit rates remember it. */
+type StepCachePoint = {
+  at: number;
+  sessionId: string;
+  messageID: string;
+  hit: number;
+  miss: number;
+  hitRate: number | null;
+  /** Percentage points against the step before this one; null for the first. */
+  delta: number | null;
+  output: number;
+  reasoning: number;
+  /** Prompt split of this step, so a retry can take the old values back out. */
+  input: number;
+  write: number;
+};
+
+/**
+ * Conversation-wide cache accounting.
+ *
+ * Every settled step of the watched session — and of every session below it
+ * in the tree (`session.created` names the parent) — folds its provider usage
+ * in here, so one number covers the whole call tree. `steps` counts the settled
+ * steps that reported no cache too; only the two rates ignore those.
+ */
+type CacheTotals = {
+  startedAt: number | null;
+  steps: number;
+  /** Sessions whose usage is folded in; the wire reports its size. */
+  sessions: Set<string>;
+  /** Σ `cache.read`. */
+  hit: number;
+  /** Σ `input + cache.write`: prompt tokens that were not served from cache. */
+  miss: number;
+  /** Σ `cache.write`, shown separately because a write is not a hit. */
+  write: number;
+  /** Σ `input` (uncached prompt). */
+  input: number;
+  output: number;
+  reasoning: number;
+  cost: number;
+  last: StepCachePoint | null;
+  /** Rate of the step before `last`; a retry needs it to recompute the delta. */
+  prevHitRate: number | null;
+  /** Totals already folded into a finished turn: the base of the next snapshot. */
+  turnBase: { hit: number; miss: number; steps: number; output: number } | null;
+};
+
 /** A session's durable numbers, as written to disk and read back on startup. */
-type TurnPoint = { tps: number; at: number };
+type TurnPoint = { tps: number; at: number; cache?: TurnCache | null };
+/** The persisted form of `CacheTotals`: a Set does not survive JSON. */
+type CacheMemory = Omit<CacheTotals, 'sessions'> & { sessions: string[] };
 type SessionMemory = {
   lastTurn: TurnResult | null;
   turns: TurnPoint[];
+  cache?: CacheMemory | null;
 };
-/** Finished-turn curve points kept per session. */
-const TURNS_CAP = 30;
+/** Finished turns kept per conversation; each carries its own cache snapshot. */
+const TURNS_CAP = 100;
 /** Sessions remembered; oldest evicted past this. */
 const SESSIONS_CAP = 20;
 /** How long a change waits before it is written, so a burst of events coalesces. */
 const PERSIST_DEBOUNCE_MS = 1_500;
 /** On-disk schema version; a mismatch discards the file instead of guessing. */
 const PERSIST_VERSION = 1;
+
+/** Rate of hit tokens out of the prompt tokens that had a cache answer. */
+const cacheRate = (hit: number, miss: number): number | null => (
+  hit + miss > 0 ? (hit / (hit + miss)) * 100 : null
+);
+
+function emptyCache(): CacheTotals {
+  return {
+    startedAt: null,
+    steps: 0,
+    sessions: new Set<string>(),
+    hit: 0,
+    miss: 0,
+    write: 0,
+    input: 0,
+    output: 0,
+    reasoning: 0,
+    cost: 0,
+    last: null,
+    prevHitRate: null,
+    turnBase: null,
+  };
+}
+
+/** One settled step's provider usage; a missing `cache` block means "not reported". */
+const stepUsageFrom = (tokens: Record<string, unknown>, cost: number): StepUsage => {
+  const block = readRecord(tokens.cache);
+  return {
+    input: readNumber(tokens.input),
+    cacheRead: block ? readNumber(block.read) : 0,
+    cacheWrite: block ? readNumber(block.write) : 0,
+    output: readNumber(tokens.output),
+    reasoning: readNumber(tokens.reasoning),
+    cost,
+    hasCache: block !== null,
+  };
+};
+
+/**
+ * Fold one settled step into a conversation's totals.
+ *
+ * A retried step reuses its `assistantMessageID`, so when the last folded step
+ * is the same one its previous numbers are taken back out first. `prevHitRate`
+ * already names the step before it, which is why the new delta still compares
+ * against the right step.
+ */
+const foldCacheStep = (
+  agg: CacheTotals,
+  sessionId: string,
+  messageID: string,
+  usage: StepUsage,
+  now: number,
+): void => {
+  const last = agg.last;
+  const retrying = last !== null && last.sessionId === sessionId && last.messageID === messageID;
+  if (retrying && last) {
+    agg.hit -= last.hit;
+    agg.miss -= last.miss;
+    agg.input -= last.input;
+    agg.write -= last.write;
+    agg.output -= last.output;
+    agg.reasoning -= last.reasoning;
+    agg.steps = Math.max(0, agg.steps - 1);
+  }
+  if (agg.startedAt === null) agg.startedAt = now;
+  agg.sessions.add(sessionId);
+  agg.steps += 1;
+  agg.output += usage.output;
+  agg.reasoning += usage.reasoning;
+  agg.cost += usage.cost;
+  if (!usage.hasCache) {
+    // A provider that reports no cache still counts as a call, but must not
+    // move the two rates: its miss share is unknown, not zero.
+    return;
+  }
+  const hit = usage.cacheRead;
+  const miss = usage.input + usage.cacheWrite;
+  agg.hit += hit;
+  agg.miss += miss;
+  agg.write += usage.cacheWrite;
+  agg.input += usage.input;
+  const previous = retrying ? agg.prevHitRate : (last?.hitRate ?? null);
+  const hitRate = cacheRate(hit, miss);
+  agg.last = {
+    at: now,
+    sessionId,
+    messageID,
+    hit,
+    miss,
+    hitRate,
+    delta: hitRate !== null && previous !== null ? hitRate - previous : null,
+    output: usage.output,
+    reasoning: usage.reasoning,
+    input: usage.input,
+    write: usage.cacheWrite,
+  };
+  agg.prevHitRate = previous;
+};
+
+/** Record a settled step into every watched conversation it belongs to. */
+const recordCacheStep = (sessionId: string, messageID: string, usage: StepUsage, now: number): void => {
+  if (!sessionId) return;
+  for (const root of watchedRootsFor(sessionId)) {
+    const state = sessionStates.get(root);
+    if (state) foldCacheStep(state.cache, sessionId, messageID, usage, now);
+  }
+};
+
+/**
+ * Conversations whose tree contains `sessionId` (itself included).
+ *
+ * The last watched session keeps counting after every page unloads — the
+ * section is unloaded while collapsed, and losing the turns it was closed for
+ * would make the conversation total a lie. A new watch replaces it.
+ */
+const watchedRootsFor = (sessionId: string): string[] => {
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined = sessionId;
+  while (cursor && !seen.has(cursor)) {
+    seen.add(cursor);
+    if (watched.has(cursor) || cursor === watch?.sessionId || activeRoots.has(cursor)) roots.push(cursor);
+    cursor = sessionParents.get(cursor);
+  }
+  return roots;
+};
+
+type CacheWire = {
+  startedAt: number | null;
+  steps: number;
+  sessions: number;
+  hit: number;
+  miss: number;
+  hitRate: number | null;
+  write: number;
+  input: number;
+  output: number;
+  reasoning: number;
+  cost: number;
+  last: StepCachePoint | null;
+  prevHitRate: number | null;
+};
+
+/** What both surfaces receive; null until a step settles. */
+const cacheWire = (agg: CacheTotals): CacheWire | null => (
+  agg.steps === 0 ? null : {
+    startedAt: agg.startedAt,
+    steps: agg.steps,
+    sessions: agg.sessions.size,
+    hit: agg.hit,
+    miss: agg.miss,
+    hitRate: cacheRate(agg.hit, agg.miss),
+    write: agg.write,
+    input: agg.input,
+    output: agg.output,
+    reasoning: agg.reasoning,
+    cost: agg.cost,
+    last: agg.last,
+    prevHitRate: agg.prevHitRate,
+  }
+);
+
+/** Durable shape: the session set becomes a bounded list of ids. */
+const cacheMemory = (agg: CacheTotals): CacheMemory => ({
+  ...agg,
+  sessions: [...agg.sessions].slice(-60),
+});
+
+/** Restore a persisted aggregate; anything unreadable is simply an empty one. */
+const restoreCache = (raw: unknown): CacheTotals => {
+  const rec = readRecord(raw);
+  if (!rec) return emptyCache();
+  const agg = emptyCache();
+  agg.startedAt = typeof rec.startedAt === 'number' && Number.isFinite(rec.startedAt) ? rec.startedAt : null;
+  agg.steps = readNumber(rec.steps);
+  const sessions = Array.isArray(rec.sessions) ? rec.sessions : [];
+  for (const id of sessions.slice(-60)) if (typeof id === 'string' && id) agg.sessions.add(id);
+  agg.hit = readNumber(rec.hit);
+  agg.miss = readNumber(rec.miss);
+  agg.write = readNumber(rec.write);
+  agg.input = readNumber(rec.input);
+  agg.output = readNumber(rec.output);
+  agg.reasoning = readNumber(rec.reasoning);
+  agg.cost = readNumber(rec.cost);
+  const last = readRecord(rec.last);
+  if (last && typeof last.sessionId === 'string') {
+    agg.last = {
+      at: readNumber(last.at),
+      sessionId: last.sessionId,
+      messageID: readString(last.messageID),
+      hit: readNumber(last.hit),
+      miss: readNumber(last.miss),
+      hitRate: typeof last.hitRate === 'number' && Number.isFinite(last.hitRate) ? last.hitRate : null,
+      delta: typeof last.delta === 'number' && Number.isFinite(last.delta) ? last.delta : null,
+      output: readNumber(last.output),
+      reasoning: readNumber(last.reasoning),
+      input: readNumber(last.input),
+      write: readNumber(last.write),
+    };
+  }
+  agg.prevHitRate = typeof rec.prevHitRate === 'number' && Number.isFinite(rec.prevHitRate) ? rec.prevHitRate : null;
+  const base = readRecord(rec.turnBase);
+  if (base) {
+    agg.turnBase = {
+      hit: readNumber(base.hit),
+      miss: readNumber(base.miss),
+      steps: readNumber(base.steps),
+      output: readNumber(base.output),
+    };
+  }
+  return agg;
+};
 
 // Collection-valued state is `let` rather than `const`: `enterSession` swaps the
 // reference to the one belonging to the session being processed, so mutations
@@ -321,6 +609,12 @@ let pendingToolStep = new Map<string, string>();
 let fbChars = -1;
 let fbTps = NaN;
 let lastTurn: TurnResult | null = null;
+/**
+ * The watched session's cache totals. Mirrored like the rest: every event is
+ * dispatched inside `enterSession`, and cache steps from a child session are
+ * folded into the *root's* record through `sessionStates`, not this mirror.
+ */
+let cache: CacheTotals = emptyCache();
 // Pending permission and question requests for the watched session. OpenCode
 // keeps the session `busy` while an agent waits for the user; these sets are
 // what distinguishes generation from waiting.
@@ -399,6 +693,7 @@ type SessionState = {
   fbTps: number;
   lastTurn: TurnResult | null;
   turns: TurnPoint[];
+  cache: CacheTotals;
   pendingPermissions: Set<string>;
   pendingQuestions: Set<string>;
 };
@@ -411,6 +706,30 @@ const sessionStates = new Map<string, SessionState>();
  * the stream gets started after a restart.
  */
 const watched = new Set<string>();
+/**
+ * Child session -> parent session. `session.created` carries the link, and a
+ * session that the service missed that event for is asked about once through
+ * `/api/session/{id}` instead.
+ */
+const sessionParents = new Map<string, string>();
+/**
+ * Conversations counted in the background, without a page watching them.
+ *
+ * `contributes.sessionEvents` wakes the service at the start of every turn,
+ * even when Live TPS is closed, so the numbers are already there when the
+ * panel opens. The most recent roots are kept; older ones fall out, which
+ * bounds the work a long-running app does for chats nobody is looking at.
+ */
+const BACKGROUND_ROOT_CAP = 8;
+const activeRoots = new Map<string, number>();
+/** Sessions already asked about; a failure is not retried on every event. */
+const lookedUp = new Set<string>();
+/**
+ * Settled steps held back while a session's ancestry is unknown. Without this
+ * a service that restarts mid-subagent would drop the subagent's in-flight
+ * step instead of folding it into the conversation after the lookup answers.
+ */
+const deferredEvents = new Map<string, RawEvent[]>();
 /** How many sessions keep a record at once; the least recently touched goes. */
 const TRACKED_CAP = SESSIONS_CAP;
 
@@ -442,6 +761,7 @@ const createSessionState = (sessionId: string): SessionState => ({
   fbTps: NaN,
   lastTurn: null,
   turns: [],
+  cache: emptyCache(),
   pendingPermissions: new Set(),
   pendingQuestions: new Set(),
 });
@@ -457,7 +777,8 @@ const trimSessionStates = (): void => {
     let oldestKey: string | null = null;
     let oldestAt = Infinity;
     for (const [key, value] of sessionStates) {
-      if (key === activeSessionId || key === watch?.sessionId) continue;
+      if (key === activeSessionId || watched.has(key) || key === watch?.sessionId) continue;
+      if (activeRoots.has(key)) continue;
       if (value.lastSeenAt < oldestAt) {
         oldestAt = value.lastSeenAt;
         oldestKey = key;
@@ -511,6 +832,7 @@ const loadState = (state: SessionState): void => {
   fbTps = state.fbTps;
   lastTurn = state.lastTurn;
   turns = state.turns;
+  cache = state.cache;
   pendingPermissions = state.pendingPermissions;
   pendingQuestions = state.pendingQuestions;
 };
@@ -556,6 +878,7 @@ const leaveSession = (): void => {
   state.fbTps = fbTps;
   state.lastTurn = lastTurn;
   state.turns = turns;
+  state.cache = cache;
   state.pendingPermissions = pendingPermissions;
   state.pendingQuestions = pendingQuestions;
   inSession = false;
@@ -594,6 +917,7 @@ const statePaths = (): string[] => {
 const memoryOf = (state: SessionState): SessionMemory => ({
   lastTurn: state.lastTurn,
   turns: state.turns.slice(-TURNS_CAP),
+  cache: cacheMemory(state.cache),
 });
 
 /** Read a state file's raw session entries; anything unreadable is just empty. */
@@ -641,6 +965,7 @@ const readPersisted = (): void => {
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
       state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
+      state.cache = restoreCache(memory.cache);
       sessionStates.set(id, state);
     }
     return;
@@ -987,12 +1312,34 @@ const computeRunning = (): { tps: number; source: 'tokens' | 'estimate' } | null
   return { tps, source: 'estimate' };
 };
 
+/**
+ * Cache totals of the turn that is ending.
+ *
+ * The aggregate is conversation-wide, so a finished turn is the delta against
+ * the base the previous one left behind. A turn whose steps reported no cache
+ * stores null instead of a misleading 0%.
+ */
+const snapshotTurnCache = (): TurnCache | null => {
+  const agg = cache;
+  if (agg.steps === 0) return null;
+  const base = agg.turnBase ?? { hit: 0, miss: 0, steps: 0, output: 0 };
+  const hit = Math.max(0, agg.hit - base.hit);
+  const miss = Math.max(0, agg.miss - base.miss);
+  const steps = Math.max(0, agg.steps - base.steps);
+  const output = Math.max(0, agg.output - base.output);
+  agg.turnBase = { hit: agg.hit, miss: agg.miss, steps: agg.steps, output: agg.output };
+  if (steps === 0 || hit + miss === 0) return null;
+  return { hit, miss, steps, output, hitRate: cacheRate(hit, miss) };
+};
+
 const finalizeTurn = (now: number): void => {
   noteWaiting(now);
   noteTools(now);
   const wallMs = turnStartedAt !== null ? Math.max(1, now - turnStartedAt) : 1;
   const sum = sumSteps();
   if (sum) {
+    // Only consume the aggregate's base once the turn is actually recorded.
+    const turnCache = snapshotTurnCache();
     lastTurn = {
       tokensPerSecond: sum.tokens / (sum.netMs / 1000),
       source: sum.real ? 'tokens' : 'estimate',
@@ -1002,8 +1349,9 @@ const finalizeTurn = (now: number): void => {
       ttftMs: sum.ttftMs,
       hasReasoning: turnReasoningChars > 0 || [...steps.values()].some((s) => s.reasoning > 0),
       endedAt: now,
+      cache: turnCache,
     };
-    turns.push({ tps: lastTurn.tokensPerSecond, at: now });
+    turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
     if (turns.length > TURNS_CAP) turns.splice(0, turns.length - TURNS_CAP);
     schedulePersist();
     clearTurn();
@@ -1026,6 +1374,7 @@ const finalizeTurn = (now: number): void => {
     clearTurn();
     return;
   }
+  const turnCache = snapshotTurnCache();
   lastTurn = {
     tokensPerSecond: tps,
     source: 'estimate',
@@ -1035,8 +1384,9 @@ const finalizeTurn = (now: number): void => {
     ttftMs: turnTtftMs(),
     hasReasoning: turnReasoningChars > 0,
     endedAt: now,
+    cache: turnCache,
   };
-  turns.push({ tps: lastTurn.tokensPerSecond, at: now });
+  turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
   if (turns.length > TURNS_CAP) turns.splice(0, turns.length - TURNS_CAP);
   schedulePersist();
   clearTurn();
@@ -1183,13 +1533,120 @@ const eventSessionID = (event: RawEvent): string | null => {
  */
 const handleEvent = (event: RawEvent, now: number): void => {
   const sessionId = eventSessionID(event);
-  if (!sessionId || !sessionStates.has(sessionId)) return;
+  const type = normType(readString(event.type));
+  if (sessionId && type === 'session.created') {
+    // The stream announces every session with its parent, including the
+    // subagent sessions a turn spawns below the watched one.
+    const data = readRecord(event.data) ?? readRecord(event.properties);
+    const parentID = data ? readString(data.parentID) : '';
+    if (parentID) sessionParents.set(sessionId, parentID);
+    else {
+      sessionParents.delete(sessionId);
+      // A top-level conversation created while the service runs starts out as
+      // a background target; its steps then fold in even with no page open.
+      noteBackgroundRoot(sessionId, now);
+    }
+    if (watchedRootsFor(sessionId).length > 0) trackSession(sessionId);
+  }
+  if (!sessionId || !sessionStates.has(sessionId)) {
+    if (sessionId && (type === 'session.step.ended' || type === 'session.step.failed')) {
+      holdForLookup(sessionId, event);
+    }
+    return;
+  }
+  if (
+    sessionId
+    && !sessionParents.has(sessionId)
+    && watchedRootsFor(sessionId).length === 0
+    && (type === 'session.step.ended' || type === 'session.step.failed')
+  ) {
+    // A record restored from disk has no parent link: after a restart the
+    // child's ancestry has to be asked again before its step can be folded
+    // into the conversation.
+    holdForLookup(sessionId, event);
+    return;
+  }
   enterSession(sessionId);
   try {
     dispatchEvent(event, now);
   } finally {
     leaveSession();
   }
+};
+
+/**
+ * Start tracking a session the service has never seen.
+ *
+ * A session the stream announced through `session.created` is already linked
+ * and comes here through `trackSession`. One the service attached after it
+ * existed (a restart in the middle of a subagent turn) is looked up once: a
+ * short poll of its `parentID` decides whether it belongs below a watched
+ * session. The step that triggered the lookup is replayed afterwards.
+ */
+const holdForLookup = (sessionId: string, event: RawEvent): void => {
+  if (watched.size === 0 && !watch?.sessionId && activeRoots.size === 0) return;
+  if (!lookedUp.has(sessionId)) {
+    lookedUp.add(sessionId);
+    if (lookedUp.size > 200) {
+      const oldest = lookedUp.values().next();
+      if (!oldest.done) lookedUp.delete(oldest.value);
+    }
+    void resolveSessionParent(sessionId);
+  }
+  const held = deferredEvents.get(sessionId) ?? [];
+  held.push(event);
+  if (held.length > 4) held.shift();
+  deferredEvents.set(sessionId, held);
+};
+
+/** `parentID` of one session, read from the server; null when it cannot be read. */
+const fetchSessionParent = async (sessionId: string): Promise<string | null> => {
+  const bases: string[] = [];
+  for (const candidate of [serverOrigin, watch?.origin, desktopOrigin()]) {
+    if (candidate && !bases.includes(candidate)) bases.push(candidate);
+  }
+  for (const base of bases) {
+    let response: Response;
+    try {
+      response = await fetch(new URL(`/api/session/${encodeURIComponent(sessionId)}`, base), {
+        headers: { Accept: 'application/json', ...serverHeaders() },
+        signal: AbortSignal.timeout(3_000),
+        redirect: 'manual',
+      });
+    } catch {
+      continue;
+    }
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!response.ok || !contentType.includes('application/json')) {
+      await response.body?.cancel().catch(() => undefined);
+      continue;
+    }
+    try {
+      const body = await response.json() as Record<string, unknown>;
+      return readString(body.parentID);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+
+const resolveSessionParent = async (sessionId: string): Promise<void> => {
+  const parentID = await fetchSessionParent(sessionId);
+  if (parentID === null) {
+    deferredEvents.delete(sessionId);
+    return;
+  }
+  if (parentID) sessionParents.set(sessionId, parentID);
+  else sessionParents.delete(sessionId);
+  if (watchedRootsFor(sessionId).length === 0) {
+    deferredEvents.delete(sessionId);
+    return;
+  }
+  trackSession(sessionId);
+  const held = deferredEvents.get(sessionId) ?? [];
+  deferredEvents.delete(sessionId);
+  for (const event of held) handleEvent(event, Date.now());
 };
 
 const dispatchEvent = (event: RawEvent, now: number): void => {
@@ -1392,9 +1849,22 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     markActive(now);
     const tokens = readRecord(payload.tokens);
-    if (!tokens) return;
+    if (!tokens) {
+      lastEventAt = now;
+      return;
+    }
+    // The cache accounting runs before `settleStep` because that one skips
+    // steps with no generated tokens, while a tool-only step can still carry
+    // a whole prompt's worth of cache hits.
+    const messageID = readString(payload.assistantMessageID);
+    recordCacheStep(
+      readString(payload.sessionID),
+      messageID || `step@${now}`,
+      stepUsageFrom(tokens, readNumber(payload.cost)),
+      now,
+    );
     settleStep(
-      readString(payload.assistantMessageID),
+      messageID,
       readNumber(tokens.output),
       readNumber(tokens.reasoning),
       now,
@@ -1407,6 +1877,14 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
 
   if (type === 'session.execution.started') {
     if (!isWatchedSession(payload.sessionID)) return;
+    const startedSession = readString(payload.sessionID);
+    if (startedSession && !sessionParents.has(startedSession)) {
+      // A conversation that existed before this service started never emits
+      // its `session.created`: its first turn is the first time we see it.
+      // A subagent whose parent link was missed would look the same; the root
+      // cap keeps that bounded.
+      noteBackgroundRoot(startedSession, now);
+    }
     if (turnStepOrder.length > 0 || turnChars > 0) {
       // A previous turn never saw its terminal event (missed during a stream
       // gap): settle it from its own steps — step durations are
@@ -1775,8 +2253,10 @@ const scheduleReconnect = (message: string, kind: ErrorKind): void => {
 };
 
 const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void> => {
+  // A background service (`sessionEvents`) has no page watch. The stream still
+  // starts: the server's own address is discovered below, and the events
+  // carry every session at once.
   const current = watch;
-  if (!current) return;
   if (retryTimer) {
     clearTimeout(retryTimer);
     retryTimer = null;
@@ -1796,7 +2276,7 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
   const own = desktopOrigin();
   const seen = new Set(tried);
   const candidates: string[] = [];
-  for (const candidate of [serverOrigin, current.origin, own]) {
+  for (const candidate of [serverOrigin, current?.origin, own]) {
     if (!candidate || seen.has(candidate)) continue;
     seen.add(candidate);
     candidates.push(candidate);
@@ -1899,6 +2379,26 @@ const beginStream = (): void => {
   void startStream().catch((error: unknown) => {
     scheduleReconnect(error instanceof Error ? error.message : String(error), 'network');
   });
+};
+
+/**
+ * Make sure the background stream is running.
+ *
+ * The service can be spawned by a session event rather than by a page, so no
+ * `/watch` has named an origin yet. `startStream` falls back to the desktop's
+ * own port and then to listener discovery.
+ */
+let streamPending = false;
+const ensureStream = (): void => {
+  if (controller !== null || streamPending) return;
+  streamPending = true;
+  void startStream()
+    .catch((error: unknown) => {
+      scheduleReconnect(error instanceof Error ? error.message : String(error), 'network');
+    })
+    .finally(() => {
+      streamPending = false;
+    });
 };
 
 const stopStream = (): void => {
@@ -2079,6 +2579,57 @@ const readJsonBody = (req: http.IncomingMessage): Promise<unknown> => new Promis
   req.on('error', reject);
 });
 
+/**
+ * One event posted by the host for `contributes.sessionEvents`.
+ *
+ * The wire carries identifiers only; token counts still come from the SSE
+ * stream, which this wakes. A `turn-started` for a top-level session makes it
+ * a conversation worth counting in the background.
+ */
+const noteBackgroundRoot = (sessionId: string, now: number): void => {
+  // Re-inserting refreshes the insertion order, so the oldest root falls out.
+  activeRoots.delete(sessionId);
+  activeRoots.set(sessionId, now);
+  while (activeRoots.size > BACKGROUND_ROOT_CAP) {
+    const oldest = activeRoots.keys().next();
+    if (oldest.done) break;
+    activeRoots.delete(oldest.value);
+  }
+};
+
+const SESSION_EVENT_TYPES = new Set([
+  'turn-finished', 'turn-failed', 'permission-asked', 'question-asked',
+  'turn-started', 'session-created', 'session-archived', 'session-deleted',
+]);
+
+const handleSessionEvent = (body: unknown): boolean => {
+  const request = readRecord(body);
+  if (!request || request.v !== 1) return false;
+  const event = readRecord(request.event);
+  if (!event) return false;
+  const type = readString(event.type);
+  if (!SESSION_EVENT_TYPES.has(type)) return false;
+  const session = readRecord(event.session);
+  const sessionId = session ? readString(session.id) : '';
+  const parentId = session ? readString(session.parentId) : '';
+  if (!sessionId) return false;
+  const now = Date.now();
+  if (type === 'session-created') {
+    if (parentId) sessionParents.set(sessionId, parentId);
+    else sessionParents.delete(sessionId);
+  }
+  if (type === 'turn-started' && !parentId) noteBackgroundRoot(sessionId, now);
+  if (type === 'turn-started' || type === 'turn-finished') {
+    // A subagent's session is announced with its parent; remember the link so
+    // its steps fold into the conversation.
+    if (parentId) sessionParents.set(sessionId, parentId);
+    if (watchedRootsFor(sessionId).length > 0) trackSession(sessionId);
+    ensureStream();
+  }
+  if (type === 'turn-finished') flushPersist();
+  return true;
+};
+
 const server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     json(res, 401, { error: 'unauthorized' });
@@ -2123,6 +2674,42 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (url.pathname === '/session-events' && req.method === 'POST') {
+    void readJsonBody(req)
+      .then((body) => {
+        if (!handleSessionEvent(body)) {
+          json(res, 400, { ok: false, error: 'unsupported session event' });
+          return;
+        }
+        json(res, 200, { ok: true });
+      })
+      .catch((error: unknown) => {
+        json(res, 400, { ok: false, error: error instanceof Error ? error.message : 'bad body' });
+      });
+    return;
+  }
+
+  if (url.pathname === '/history') {
+    // The durable side of the cache numbers: per-turn snapshots and the
+    // conversation aggregate. Kept off `/rate` so a 250 ms poll does not carry
+    // the whole history.
+    const requested = readString(url.searchParams.get('sessionId')) || watch?.sessionId || null;
+    if (requested !== null) enterSession(requested);
+    else loadState(blankSession);
+    let body: Record<string, unknown>;
+    try {
+      body = {
+        sessionId: requested,
+        turns,
+        cache: cacheWire(cache),
+      };
+    } finally {
+      leaveSession();
+    }
+    json(res, 200, body);
+    return;
+  }
+
   if (url.pathname === '/rate') {
     const now = Date.now();
     // A page names its own session so two pages watching different sessions
@@ -2162,6 +2749,9 @@ const server = http.createServer((req, res) => {
           ttftMs: liveTtftMs(),
         },
         lastTurn,
+        // Conversation-wide cache accounting of the watched session and its
+        // sub-sessions; null until a step settles.
+        cache: cacheWire(cache),
         eventsSeen,
       };
     } finally {
@@ -2175,7 +2765,12 @@ const server = http.createServer((req, res) => {
 });
 
 readPersisted();
-server.listen(port, '127.0.0.1');
+server.listen(port, '127.0.0.1', () => {
+  // `service.keepRunning` starts this process with the host, not with a page.
+  // Subscribe immediately so background counting begins before anyone opens
+  // the panel; a later `/watch` restarts the stream onto the page's origin.
+  ensureStream();
+});
 
 const shutdown = (): void => {
   flushPersist();

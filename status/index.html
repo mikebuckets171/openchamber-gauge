@@ -10,7 +10,7 @@
   html, body { margin: 0; padding: 0; }
   body {
     font-family: var(--oc-font, system-ui, "Microsoft YaHei", sans-serif);
-    font-size: 12px;
+    font-size: 0.857rem;
     line-height: 1.5;
     color: var(--oc-fg, inherit);
     background: transparent;
@@ -38,36 +38,63 @@
   @keyframes pulse { 50% { opacity: 0.35; } }
   .value {
     font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
-    font-size: 17px;
+    font-size: 1.214rem;
     font-weight: 650;
     font-variant-numeric: tabular-nums;
   }
-  .unit { color: var(--oc-muted, #888); font-size: 11px; }
-  .spark {
-    margin-left: auto;
-    flex: none;
-    display: flex;
-    align-items: center;
+  .unit { color: var(--oc-muted, #888); font-size: 0.786rem; }
+  .sparkrow {
+    display: block;
+    margin: 1px 0 3px;
     color: var(--oc-primary, #888);
   }
+  .sparkrow svg { display: block; width: 100%; }
   .spark-line { stroke: currentColor; }
   .spark-area { fill: currentColor; opacity: 0.18; }
   .muted { color: var(--oc-muted, #888); }
   .value.stale { color: var(--oc-muted, #888); }
   .meta {
     font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
-    font-size: 11px;
+    font-size: 0.786rem;
     color: var(--oc-muted, #888);
     font-variant-numeric: tabular-nums;
   }
   .tag {
-    font-size: 10px;
+    font-size: 0.714rem;
     border: 1px solid currentColor;
     border-radius: 4px;
     padding: 0 4px;
     opacity: 0.8;
     flex: none;
   }
+  .cache {
+    display: grid;
+    grid-template-columns: 2.25rem minmax(0, 1fr) 3rem 2.25rem;
+    align-items: center;
+    gap: 0.357rem;
+    font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
+    font-size: 0.786rem;
+    color: var(--oc-muted, #888);
+    font-variant-numeric: tabular-nums;
+  }
+  .cache-label { flex: none; }
+  .hitbar {
+    display: block;
+    height: 0.286rem;
+    border-radius: 0.143rem;
+    background: var(--oc-subtle, #3a3a3a);
+    overflow: hidden;
+  }
+  .hitbar .fill {
+    display: block;
+    height: 100%;
+    width: 0%;
+    background: var(--oc-primary, #6af);
+  }
+  .cache-pct { color: var(--oc-fg, inherit); width: 3rem; text-align: right; }
+  .cache-delta { flex: none; width: 2.25rem; text-align: right; }
+  .cache-delta.up { color: var(--oc-success, #3c3); }
+  .cache-delta.down { color: var(--oc-error, #f66); }
 </style>
 </head>
 <body>

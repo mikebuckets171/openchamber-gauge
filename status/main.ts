@@ -22,6 +22,34 @@ type TurnResult = {
   endedAt: number;
 };
 
+type CachePoint = {
+  at: number;
+  sessionId: string;
+  messageID: string;
+  hit: number;
+  miss: number;
+  hitRate: number | null;
+  delta: number | null;
+  output: number;
+  reasoning: number;
+};
+
+type CacheInfo = {
+  startedAt: number | null;
+  steps: number;
+  sessions: number;
+  hit: number;
+  miss: number;
+  hitRate: number | null;
+  write: number;
+  input: number;
+  output: number;
+  reasoning: number;
+  cost: number;
+  last: CachePoint | null;
+  prevHitRate: number | null;
+};
+
 type RateResponse = {
   connection: 'idle' | 'connecting' | 'live' | 'error';
   error: string | null;
@@ -44,6 +72,8 @@ type RateResponse = {
   curveAt?: number;
   turn: { active: boolean; ttftMs: number | null };
   lastTurn: TurnResult | null;
+  /** Conversation-wide cache accounting; null until a step settles. */
+  cache?: CacheInfo | null;
   eventsSeen: number;
 };
 
@@ -65,6 +95,8 @@ const COPY = {
     measured: '实测',
     estimated: '估计',
     noReasoning: '无推理数据',
+    stepHit: '单步',
+    totalHit: '累计',
     inProgress: '进行中',
   },
   en: {
@@ -82,6 +114,8 @@ const COPY = {
     measured: 'measured',
     estimated: 'estimated',
     noReasoning: 'no reasoning data',
+    stepHit: 'step',
+    totalHit: 'total',
     inProgress: 'in progress',
   },
 } as const;
@@ -114,6 +148,14 @@ let sparkFrame: SparkFrame | null = null;
 let sparkFrameAt = 0;
 let sparkScale = 1;
 let sparkPaintedAt = 0;
+/**
+ * Whether the curve still holds a nonzero point. It slides as long as it does,
+ * even after the turn ended and the live number is already zero — a decaying
+ * tail is still moving data. Only a curve that is zero everywhere stops.
+ */
+let sparkMoving = false;
+/** A curve that just emptied still needs one static draw to flatten out. */
+let sparkNeedsStatic = false;
 
 const row1 = document.createElement('div');
 row1.className = 'row';
@@ -124,11 +166,18 @@ valueEl.className = 'value';
 valueEl.textContent = '—';
 const unitEl = document.createElement('span');
 unitEl.className = 'unit';
-const sparkEl = document.createElement('span');
-sparkEl.className = 'spark';
+const sparkEl = document.createElement('div');
+sparkEl.className = 'row sparkrow';
 const sparkParts = makeSparkSvg(SPARK_W, SPARK_H);
+// Same treatment as the panel: the drawing keeps its coordinate system and the
+// element spans the section, so the curve reaches both edges.
+sparkParts.svg.setAttribute('width', '100%');
+sparkParts.svg.setAttribute('preserveAspectRatio', 'none');
+for (const path of [sparkParts.line, sparkParts.area]) {
+  path.setAttribute('vector-effect', 'non-scaling-stroke');
+}
 sparkEl.append(sparkParts.svg);
-row1.append(dot, valueEl, unitEl, sparkEl);
+row1.append(dot, valueEl, unitEl);
 let lastHeight = 0;
 
 const row2 = document.createElement('div');
@@ -136,6 +185,37 @@ row2.className = 'row meta';
 const stateEl = document.createElement('span');
 const lastEl = document.createElement('span');
 row2.append(stateEl, lastEl);
+
+type CacheRow = {
+  root: HTMLElement;
+  label: HTMLElement;
+  bar: HTMLElement;
+  fill: HTMLElement;
+  pct: HTMLElement;
+  delta: HTMLElement;
+};
+
+const makeCacheRow = (): CacheRow => {
+  const root = document.createElement('div');
+  root.className = 'row cache';
+  const label = document.createElement('span');
+  label.className = 'cache-label';
+  const bar = document.createElement('span');
+  bar.className = 'hitbar';
+  const fill = document.createElement('span');
+  fill.className = 'fill';
+  bar.append(fill);
+  const pct = document.createElement('span');
+  pct.className = 'cache-pct';
+  pct.textContent = '—';
+  const delta = document.createElement('span');
+  delta.className = 'cache-delta';
+  root.append(label, bar, pct, delta);
+  return { root, label, bar, fill, pct, delta };
+};
+
+const stepCache = makeCacheRow();
+const totalCache = makeCacheRow();
 
 const resolveOrigin = (): string | null => {
   try {
@@ -185,13 +265,23 @@ const paintSpark = (): void => {
   if (stopped) return;
   const frame = sparkFrame;
   const at = performance.now();
-  // ~30 fps is enough for a 2 px/slide and keeps a decorative curve from
-  // repainting the whole section sixty times a second on an idle session.
-  if (frame && frame.values.length > 0 && at - sparkPaintedAt >= 30) {
-    sparkPaintedAt = at;
-    const elapsed = Math.min(2_000, at - sparkFrameAt);
-    sparkScale = nextScale(sparkScale, frame.values);
-    drawSpark(sparkParts, frame, frame.at + elapsed, SPARK_W, SPARK_H, sparkScale);
+  if (frame && frame.values.length > 0) {
+    if (sparkMoving) {
+      // ~30 fps is enough for a 2 px/slide and keeps a decorative curve from
+      // repainting the whole section sixty times a second.
+      if (at - sparkPaintedAt >= 30) {
+        sparkPaintedAt = at;
+        const elapsed = Math.min(2_000, at - sparkFrameAt);
+        sparkScale = nextScale(sparkScale, frame.values);
+        drawSpark(sparkParts, frame, frame.at + elapsed, SPARK_W, SPARK_H, sparkScale);
+      }
+    } else if (sparkNeedsStatic) {
+      // Snap to the frame's own edge so the frozen picture does not keep the
+      // projection of a slide that has stopped.
+      sparkNeedsStatic = false;
+      sparkScale = nextScale(sparkScale, frame.values);
+      drawSpark(sparkParts, frame, frame.at, SPARK_W, SPARK_H, sparkScale);
+    }
   }
   requestAnimationFrame(paintSpark);
 };
@@ -210,12 +300,58 @@ const setState = (text: string): void => {
   stateEl.hidden = text.length === 0;
 };
 
+const formatPct = (value: number | null | undefined): string => (
+  typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}%` : '—'
+);
+
+const barWidth = (value: number | null | undefined): string => (
+  `${Math.max(0, Math.min(100, typeof value === 'number' && Number.isFinite(value) ? value : 0))}%`
+);
+
+/**
+ * The two cache rates: the last settled step (which may belong to a
+ * sub-session) and the conversation total. Both are hidden when no step has
+ * reported a cache block, rather than drawn as a misleading 0%.
+ */
+const paintCache = (info: CacheInfo | null | undefined): void => {
+  const present = !!info && info.steps > 0 && info.hit + info.miss > 0;
+  stepCache.root.hidden = !present;
+  totalCache.root.hidden = !present;
+  if (!present || !info) {
+    stepCache.pct.textContent = '—';
+    totalCache.pct.textContent = '—';
+    stepCache.delta.textContent = '';
+    stepCache.bar.hidden = true;
+    totalCache.bar.hidden = true;
+    return;
+  }
+  stepCache.label.textContent = copy.stepHit;
+  totalCache.label.textContent = copy.totalHit;
+  stepCache.bar.hidden = false;
+  totalCache.bar.hidden = false;
+  const last = info.last;
+  stepCache.fill.style.width = barWidth(last?.hitRate);
+  stepCache.pct.textContent = formatPct(last?.hitRate);
+  const delta = last?.delta;
+  if (typeof delta === 'number' && Number.isFinite(delta) && Math.abs(delta) >= 0.05) {
+    stepCache.delta.textContent = `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}`;
+    stepCache.delta.className = delta >= 0 ? 'cache-delta up' : 'cache-delta down';
+  } else {
+    stepCache.delta.textContent = '';
+    stepCache.delta.className = 'cache-delta';
+  }
+  totalCache.fill.style.width = barWidth(info.hitRate);
+  totalCache.pct.textContent = formatPct(info.hitRate);
+  totalCache.delta.textContent = '';
+};
+
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
   if (!rate) {
     dot.className = 'dot';
     valueEl.textContent = '—';
     setState(notice ?? copy.connecting);
     lastEl.textContent = '';
+    paintCache(null);
     dropSpark();
     fitHeight();
     return;
@@ -262,9 +398,19 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   // session switches, and is a rolling rate window rather than turn history.
   // An empty curve means the answer belongs to no session, so nothing is drawn
   // rather than the previous session's shape being left on screen.
-  sparkFrame = sparkFrameFrom(rate);
-  sparkFrameAt = performance.now();
-  if (sparkFrame.values.length === 0) dropSpark();
+  const nextFrame = sparkFrameFrom(rate);
+  const moving = nextFrame.values.some((value) => value > 0.05);
+  if (nextFrame.values.length === 0) {
+    dropSpark();
+    sparkMoving = false;
+  } else {
+    sparkFrame = nextFrame;
+    sparkFrameAt = performance.now();
+    // A nonzero curve keeps panning at any time; all zeros flatten once and
+    // then hold, so a quiet session shows no motion at all.
+    sparkNeedsStatic = sparkMoving && !moving;
+    sparkMoving = moving;
+  }
 
   // Second row: last-turn average + TTFT. Prefer the finished turn; while a
   // turn runs, show its TTFT so far.
@@ -281,6 +427,8 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     parts.push(copy.noReasoning);
   }
   lastEl.textContent = parts.length > 0 ? parts.join(' · ') : (turnActive ? copy.inProgress : copy.noData);
+
+  paintCache(rate.cache);
 
   if (notice) setState(notice);
   fitHeight();
@@ -311,6 +459,7 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
   curve: [],
   turn: { active: false, ttftMs: null },
   lastTurn: null,
+  cache: null,
 });
 
 const poll = async (): Promise<void> => {
@@ -375,7 +524,7 @@ const configure = async (sessionId: string | null): Promise<void> => {
 };
 
 const mount = (): void => {
-  root.append(row1, row2);
+  root.append(row1, sparkEl, row2, stepCache.root, totalCache.root);
   unitEl.textContent = copy.unit;
   if (!heightReported) {
     heightReported = true;

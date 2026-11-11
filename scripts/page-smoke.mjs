@@ -110,11 +110,33 @@ const RATE = {
   curveAt: Date.now(),
   turn: { active: false, ttftMs: null },
   lastTurn: null,
+  cache: {
+    startedAt: Date.now() - 60_000,
+    steps: 8,
+    sessions: 2,
+    hit: 19_200,
+    miss: 3_800,
+    hitRate: 83.5,
+    write: 0,
+    output: 110,
+    reasoning: 0,
+    cost: 0,
+    last: {
+      at: Date.now(),
+      sessionId: SESSION,
+      messageID: 'msg_page',
+      hit: 1_600,
+      miss: 100,
+      hitRate: 94.1,
+      delta: 1.2,
+    },
+    prevHitRate: 92.9,
+  },
   eventsSeen: 0,
 };
 
 /** Run one built bundle in a fake frame and collect what it posts to its host. */
-const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false } } = {}) => {
+const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE } = {}) => {
   const source = fs.readFileSync(path.join(ROOT, bundle), 'utf8');
   const posted = [];
   const listeners = [];
@@ -213,7 +235,7 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
     if (request.payload?.path === '/watch') {
       reply(request, { status: 200, body: JSON.stringify({ ok: true, changed: true, connection: 'live', sessionId: SESSION }) });
     } else if (request.payload?.path?.startsWith('/rate')) {
-      reply(request, { status: 200, body: JSON.stringify(RATE) });
+      reply(request, { status: 200, body: JSON.stringify(rate) });
     }
   }
 
@@ -223,6 +245,18 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
 const settle = async () => {
   for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setImmediate(resolve));
 };
+
+const findByClass = (node, className) => {
+  if (String(node.className ?? '').split(/\s+/).includes(className)) return node;
+  for (const child of node.children) {
+    if (!(child instanceof El)) continue;
+    const hit = findByClass(child, className);
+    if (hit) return hit;
+  }
+  return null;
+};
+
+const widthOf = (node) => String(node?.style?.props?.width ?? node?.style?.width ?? '');
 
 const findByText = (node, text) => {
   if (node.textContent === text) return node;
@@ -282,11 +316,69 @@ for (const surface of SURFACES) {
     !NO_ORIGIN_COPY.some((copy) => relay.root().includes(copy)),
     JSON.stringify(relay.root()),
   );
+  // The two cache hit rates: last settled step and the conversation total,
+  // each drawn with a progress bar.
+  check(
+    `${surface.name}: the last-step hit rate is drawn`,
+    direct.root().includes('94.1'),
+    JSON.stringify(direct.root()),
+  );
+  check(
+    `${surface.name}: the conversation hit rate is drawn`,
+    direct.root().includes('83.5'),
+    JSON.stringify(direct.root()),
+  );
+  const lastBar = findByClass(direct.rootEl, 'hitbar');
+  const totalBars = [];
+  const collectBars = (node) => {
+    if (String(node.className ?? '').includes('hitbar')) totalBars.push(node);
+    for (const child of node.children) if (child instanceof El) collectBars(child);
+  };
+  collectBars(direct.rootEl);
+  check(
+    `${surface.name}: both hit rates carry a progress bar`,
+    lastBar !== null && totalBars.length === 2,
+    `bars=${totalBars.length}`,
+  );
+  const widths = totalBars.map((bar) => widthOf(findByClass(bar, 'fill')));
+  check(
+    `${surface.name}: the bars fill to their percentages`,
+    widths.some((w) => w.startsWith('94.1')) && widths.some((w) => w.startsWith('83.5')),
+    JSON.stringify(widths),
+  );
+  check(
+    `${surface.name}: the per-step rate says which step it is`,
+    direct.root().includes('单步') && direct.root().includes('累计'),
+    JSON.stringify(direct.root()),
+  );
+
   const relayValue = findByText(relay.rootEl, String(LIVE_TPS));
   check(
     `${surface.name}: a relay srcDoc keeps the stale styling`,
     relayValue !== null && relayValue.className.includes('stale'),
     JSON.stringify(relayValue && relayValue.className),
+  );
+
+  // A provider that has not reported any cache yet: no bars, just dashes.
+  // The empty tracks used to render as stray ``— [bar] —`` rows.
+  const noCache = runGuest(surface.bundle, surface.url, { rate: { ...RATE, cache: null } });
+  await settle();
+  const barHidden = [];
+  const collect = (node, hidden) => {
+    const nextHidden = hidden || node.hidden === true;
+    if (String(node.className ?? '').split(/\s+/).includes('hitbar')) barHidden.push(nextHidden);
+    for (const child of node.children) if (child instanceof El) collect(child, nextHidden);
+  };
+  collect(noCache.rootEl, false);
+  check(
+    `${surface.name}: no cache data draws no bars`,
+    barHidden.length > 0 && barHidden.every(Boolean),
+    `bars=${barHidden.length} hidden=${JSON.stringify(barHidden)}`,
+  );
+  check(
+    `${surface.name}: no cache data writes no percentage`,
+    !noCache.root().includes('94.1') && !noCache.root().includes('83.5'),
+    JSON.stringify(noCache.root()),
   );
 
   // The section is also mounted with no chat open: the watch must still go out,

@@ -136,10 +136,171 @@ var calibrate = (model, chars, generated) => {
   calibration.set(model, previous + (factor - previous) * CALIBRATION_WEIGHT);
 };
 var MAX_STREAM_GAP_MS = 1000;
-var TURNS_CAP = 30;
+var TURNS_CAP = 100;
 var SESSIONS_CAP = 20;
 var PERSIST_DEBOUNCE_MS = 1500;
 var PERSIST_VERSION = 1;
+var cacheRate = (hit, miss) => hit + miss > 0 ? hit / (hit + miss) * 100 : null;
+function emptyCache() {
+  return {
+    startedAt: null,
+    steps: 0,
+    sessions: new Set,
+    hit: 0,
+    miss: 0,
+    write: 0,
+    input: 0,
+    output: 0,
+    reasoning: 0,
+    cost: 0,
+    last: null,
+    prevHitRate: null,
+    turnBase: null
+  };
+}
+var stepUsageFrom = (tokens, cost) => {
+  const block = readRecord2(tokens.cache);
+  return {
+    input: readNumber(tokens.input),
+    cacheRead: block ? readNumber(block.read) : 0,
+    cacheWrite: block ? readNumber(block.write) : 0,
+    output: readNumber(tokens.output),
+    reasoning: readNumber(tokens.reasoning),
+    cost,
+    hasCache: block !== null
+  };
+};
+var foldCacheStep = (agg, sessionId, messageID, usage, now) => {
+  const last = agg.last;
+  const retrying = last !== null && last.sessionId === sessionId && last.messageID === messageID;
+  if (retrying && last) {
+    agg.hit -= last.hit;
+    agg.miss -= last.miss;
+    agg.input -= last.input;
+    agg.write -= last.write;
+    agg.output -= last.output;
+    agg.reasoning -= last.reasoning;
+    agg.steps = Math.max(0, agg.steps - 1);
+  }
+  if (agg.startedAt === null)
+    agg.startedAt = now;
+  agg.sessions.add(sessionId);
+  agg.steps += 1;
+  agg.output += usage.output;
+  agg.reasoning += usage.reasoning;
+  agg.cost += usage.cost;
+  if (!usage.hasCache) {
+    return;
+  }
+  const hit = usage.cacheRead;
+  const miss = usage.input + usage.cacheWrite;
+  agg.hit += hit;
+  agg.miss += miss;
+  agg.write += usage.cacheWrite;
+  agg.input += usage.input;
+  const previous = retrying ? agg.prevHitRate : last?.hitRate ?? null;
+  const hitRate = cacheRate(hit, miss);
+  agg.last = {
+    at: now,
+    sessionId,
+    messageID,
+    hit,
+    miss,
+    hitRate,
+    delta: hitRate !== null && previous !== null ? hitRate - previous : null,
+    output: usage.output,
+    reasoning: usage.reasoning,
+    input: usage.input,
+    write: usage.cacheWrite
+  };
+  agg.prevHitRate = previous;
+};
+var recordCacheStep = (sessionId, messageID, usage, now) => {
+  if (!sessionId)
+    return;
+  for (const root of watchedRootsFor(sessionId)) {
+    const state = sessionStates.get(root);
+    if (state)
+      foldCacheStep(state.cache, sessionId, messageID, usage, now);
+  }
+};
+var watchedRootsFor = (sessionId) => {
+  const roots = [];
+  const seen = new Set;
+  let cursor = sessionId;
+  while (cursor && !seen.has(cursor)) {
+    seen.add(cursor);
+    if (watched.has(cursor) || cursor === watch?.sessionId || activeRoots.has(cursor))
+      roots.push(cursor);
+    cursor = sessionParents.get(cursor);
+  }
+  return roots;
+};
+var cacheWire = (agg) => agg.steps === 0 ? null : {
+  startedAt: agg.startedAt,
+  steps: agg.steps,
+  sessions: agg.sessions.size,
+  hit: agg.hit,
+  miss: agg.miss,
+  hitRate: cacheRate(agg.hit, agg.miss),
+  write: agg.write,
+  input: agg.input,
+  output: agg.output,
+  reasoning: agg.reasoning,
+  cost: agg.cost,
+  last: agg.last,
+  prevHitRate: agg.prevHitRate
+};
+var cacheMemory = (agg) => ({
+  ...agg,
+  sessions: [...agg.sessions].slice(-60)
+});
+var restoreCache = (raw) => {
+  const rec = readRecord2(raw);
+  if (!rec)
+    return emptyCache();
+  const agg = emptyCache();
+  agg.startedAt = typeof rec.startedAt === "number" && Number.isFinite(rec.startedAt) ? rec.startedAt : null;
+  agg.steps = readNumber(rec.steps);
+  const sessions = Array.isArray(rec.sessions) ? rec.sessions : [];
+  for (const id of sessions.slice(-60))
+    if (typeof id === "string" && id)
+      agg.sessions.add(id);
+  agg.hit = readNumber(rec.hit);
+  agg.miss = readNumber(rec.miss);
+  agg.write = readNumber(rec.write);
+  agg.input = readNumber(rec.input);
+  agg.output = readNumber(rec.output);
+  agg.reasoning = readNumber(rec.reasoning);
+  agg.cost = readNumber(rec.cost);
+  const last = readRecord2(rec.last);
+  if (last && typeof last.sessionId === "string") {
+    agg.last = {
+      at: readNumber(last.at),
+      sessionId: last.sessionId,
+      messageID: readString(last.messageID),
+      hit: readNumber(last.hit),
+      miss: readNumber(last.miss),
+      hitRate: typeof last.hitRate === "number" && Number.isFinite(last.hitRate) ? last.hitRate : null,
+      delta: typeof last.delta === "number" && Number.isFinite(last.delta) ? last.delta : null,
+      output: readNumber(last.output),
+      reasoning: readNumber(last.reasoning),
+      input: readNumber(last.input),
+      write: readNumber(last.write)
+    };
+  }
+  agg.prevHitRate = typeof rec.prevHitRate === "number" && Number.isFinite(rec.prevHitRate) ? rec.prevHitRate : null;
+  const base = readRecord2(rec.turnBase);
+  if (base) {
+    agg.turnBase = {
+      hit: readNumber(base.hit),
+      miss: readNumber(base.miss),
+      steps: readNumber(base.steps),
+      output: readNumber(base.output)
+    };
+  }
+  return agg;
+};
 var samples = [];
 var partChars = new Map;
 var deltaParts = new Set;
@@ -174,6 +335,7 @@ var pendingToolStep = new Map;
 var fbChars = -1;
 var fbTps = NaN;
 var lastTurn = null;
+var cache = emptyCache();
 var pendingPermissions = new Set;
 var pendingQuestions = new Set;
 var waitingKind = () => pendingPermissions.size > 0 ? "permission" : pendingQuestions.size > 0 ? "question" : null;
@@ -197,6 +359,11 @@ var clearTurn = () => {
 var turns = [];
 var sessionStates = new Map;
 var watched = new Set;
+var sessionParents = new Map;
+var BACKGROUND_ROOT_CAP = 8;
+var activeRoots = new Map;
+var lookedUp = new Set;
+var deferredEvents = new Map;
 var TRACKED_CAP = SESSIONS_CAP;
 var createSessionState = (sessionId) => ({
   sessionId,
@@ -226,6 +393,7 @@ var createSessionState = (sessionId) => ({
   fbTps: NaN,
   lastTurn: null,
   turns: [],
+  cache: emptyCache(),
   pendingPermissions: new Set,
   pendingQuestions: new Set
 });
@@ -237,7 +405,9 @@ var trimSessionStates = () => {
     let oldestKey = null;
     let oldestAt = Infinity;
     for (const [key, value] of sessionStates) {
-      if (key === activeSessionId || key === watch?.sessionId)
+      if (key === activeSessionId || watched.has(key) || key === watch?.sessionId)
+        continue;
+      if (activeRoots.has(key))
         continue;
       if (value.lastSeenAt < oldestAt) {
         oldestAt = value.lastSeenAt;
@@ -291,6 +461,7 @@ var loadState = (state) => {
   fbTps = state.fbTps;
   lastTurn = state.lastTurn;
   turns = state.turns;
+  cache = state.cache;
   pendingPermissions = state.pendingPermissions;
   pendingQuestions = state.pendingQuestions;
 };
@@ -329,6 +500,7 @@ var leaveSession = () => {
   state.fbTps = fbTps;
   state.lastTurn = lastTurn;
   state.turns = turns;
+  state.cache = cache;
   state.pendingPermissions = pendingPermissions;
   state.pendingQuestions = pendingQuestions;
   inSession = false;
@@ -345,7 +517,8 @@ var statePaths = () => {
 };
 var memoryOf = (state) => ({
   lastTurn: state.lastTurn,
-  turns: state.turns.slice(-TURNS_CAP)
+  turns: state.turns.slice(-TURNS_CAP),
+  cache: cacheMemory(state.cache)
 });
 var readSessions = (file) => {
   try {
@@ -391,6 +564,7 @@ var readPersisted = () => {
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
       state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
+      state.cache = restoreCache(memory.cache);
       sessionStates.set(id, state);
     }
     return;
@@ -633,12 +807,27 @@ var computeRunning = () => {
   fbTps = tps;
   return { tps, source: "estimate" };
 };
+var snapshotTurnCache = () => {
+  const agg = cache;
+  if (agg.steps === 0)
+    return null;
+  const base = agg.turnBase ?? { hit: 0, miss: 0, steps: 0, output: 0 };
+  const hit = Math.max(0, agg.hit - base.hit);
+  const miss = Math.max(0, agg.miss - base.miss);
+  const steps = Math.max(0, agg.steps - base.steps);
+  const output = Math.max(0, agg.output - base.output);
+  agg.turnBase = { hit: agg.hit, miss: agg.miss, steps: agg.steps, output: agg.output };
+  if (steps === 0 || hit + miss === 0)
+    return null;
+  return { hit, miss, steps, output, hitRate: cacheRate(hit, miss) };
+};
 var finalizeTurn = (now) => {
   noteWaiting(now);
   noteTools(now);
   const wallMs = turnStartedAt !== null ? Math.max(1, now - turnStartedAt) : 1;
   const sum = sumSteps();
   if (sum) {
+    const turnCache = snapshotTurnCache();
     lastTurn = {
       tokensPerSecond: sum.tokens / (sum.netMs / 1000),
       source: sum.real ? "tokens" : "estimate",
@@ -647,9 +836,10 @@ var finalizeTurn = (now) => {
       wallMs,
       ttftMs: sum.ttftMs,
       hasReasoning: turnReasoningChars > 0 || [...steps.values()].some((s) => s.reasoning > 0),
-      endedAt: now
+      endedAt: now,
+      cache: turnCache
     };
-    turns.push({ tps: lastTurn.tokensPerSecond, at: now });
+    turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
     if (turns.length > TURNS_CAP)
       turns.splice(0, turns.length - TURNS_CAP);
     schedulePersist();
@@ -666,6 +856,7 @@ var finalizeTurn = (now) => {
     clearTurn();
     return;
   }
+  const turnCache = snapshotTurnCache();
   lastTurn = {
     tokensPerSecond: tps,
     source: "estimate",
@@ -674,9 +865,10 @@ var finalizeTurn = (now) => {
     wallMs,
     ttftMs: turnTtftMs(),
     hasReasoning: turnReasoningChars > 0,
-    endedAt: now
+    endedAt: now,
+    cache: turnCache
   };
-  turns.push({ tps: lastTurn.tokensPerSecond, at: now });
+  turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
   if (turns.length > TURNS_CAP)
     turns.splice(0, turns.length - TURNS_CAP);
   schedulePersist();
@@ -768,14 +960,106 @@ var eventSessionID = (event) => {
 };
 var handleEvent = (event, now) => {
   const sessionId = eventSessionID(event);
-  if (!sessionId || !sessionStates.has(sessionId))
+  const type = normType(readString(event.type));
+  if (sessionId && type === "session.created") {
+    const data = readRecord2(event.data) ?? readRecord2(event.properties);
+    const parentID = data ? readString(data.parentID) : "";
+    if (parentID)
+      sessionParents.set(sessionId, parentID);
+    else {
+      sessionParents.delete(sessionId);
+      noteBackgroundRoot(sessionId, now);
+    }
+    if (watchedRootsFor(sessionId).length > 0)
+      trackSession(sessionId);
+  }
+  if (!sessionId || !sessionStates.has(sessionId)) {
+    if (sessionId && (type === "session.step.ended" || type === "session.step.failed")) {
+      holdForLookup(sessionId, event);
+    }
     return;
+  }
+  if (sessionId && !sessionParents.has(sessionId) && watchedRootsFor(sessionId).length === 0 && (type === "session.step.ended" || type === "session.step.failed")) {
+    holdForLookup(sessionId, event);
+    return;
+  }
   enterSession(sessionId);
   try {
     dispatchEvent(event, now);
   } finally {
     leaveSession();
   }
+};
+var holdForLookup = (sessionId, event) => {
+  if (watched.size === 0 && !watch?.sessionId && activeRoots.size === 0)
+    return;
+  if (!lookedUp.has(sessionId)) {
+    lookedUp.add(sessionId);
+    if (lookedUp.size > 200) {
+      const oldest = lookedUp.values().next();
+      if (!oldest.done)
+        lookedUp.delete(oldest.value);
+    }
+    resolveSessionParent(sessionId);
+  }
+  const held = deferredEvents.get(sessionId) ?? [];
+  held.push(event);
+  if (held.length > 4)
+    held.shift();
+  deferredEvents.set(sessionId, held);
+};
+var fetchSessionParent = async (sessionId) => {
+  const bases = [];
+  for (const candidate of [serverOrigin, watch?.origin, desktopOrigin()]) {
+    if (candidate && !bases.includes(candidate))
+      bases.push(candidate);
+  }
+  for (const base of bases) {
+    let response;
+    try {
+      response = await fetch(new URL(`/api/session/${encodeURIComponent(sessionId)}`, base), {
+        headers: { Accept: "application/json", ...serverHeaders() },
+        signal: AbortSignal.timeout(3000),
+        redirect: "manual"
+      });
+    } catch {
+      continue;
+    }
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!response.ok || !contentType.includes("application/json")) {
+      await response.body?.cancel().catch(() => {
+        return;
+      });
+      continue;
+    }
+    try {
+      const body = await response.json();
+      return readString(body.parentID);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+var resolveSessionParent = async (sessionId) => {
+  const parentID = await fetchSessionParent(sessionId);
+  if (parentID === null) {
+    deferredEvents.delete(sessionId);
+    return;
+  }
+  if (parentID)
+    sessionParents.set(sessionId, parentID);
+  else
+    sessionParents.delete(sessionId);
+  if (watchedRootsFor(sessionId).length === 0) {
+    deferredEvents.delete(sessionId);
+    return;
+  }
+  trackSession(sessionId);
+  const held = deferredEvents.get(sessionId) ?? [];
+  deferredEvents.delete(sessionId);
+  for (const event of held)
+    handleEvent(event, Date.now());
 };
 var dispatchEvent = (event, now) => {
   const type = normType(readString(event.type));
@@ -966,15 +1250,23 @@ var dispatchEvent = (event, now) => {
       return;
     markActive(now);
     const tokens = readRecord2(payload.tokens);
-    if (!tokens)
+    if (!tokens) {
+      lastEventAt = now;
       return;
-    settleStep(readString(payload.assistantMessageID), readNumber(tokens.output), readNumber(tokens.reasoning), now);
+    }
+    const messageID = readString(payload.assistantMessageID);
+    recordCacheStep(readString(payload.sessionID), messageID || `step@${now}`, stepUsageFrom(tokens, readNumber(payload.cost)), now);
+    settleStep(messageID, readNumber(tokens.output), readNumber(tokens.reasoning), now);
     lastEventAt = now;
     return;
   }
   if (type === "session.execution.started") {
     if (!isWatchedSession(payload.sessionID))
       return;
+    const startedSession = readString(payload.sessionID);
+    if (startedSession && !sessionParents.has(startedSession)) {
+      noteBackgroundRoot(startedSession, now);
+    }
     if (turnStepOrder.length > 0 || turnChars > 0) {
       finalizeTurn(now);
     }
@@ -1317,8 +1609,6 @@ var scheduleReconnect = (message, kind) => {
 };
 var startStream = async (tried = new Set) => {
   const current = watch;
-  if (!current)
-    return;
   if (retryTimer) {
     clearTimeout(retryTimer);
     retryTimer = null;
@@ -1332,7 +1622,7 @@ var startStream = async (tried = new Set) => {
   const own = desktopOrigin();
   const seen = new Set(tried);
   const candidates = [];
-  for (const candidate of [serverOrigin, current.origin, own]) {
+  for (const candidate of [serverOrigin, current?.origin, own]) {
     if (!candidate || seen.has(candidate))
       continue;
     seen.add(candidate);
@@ -1427,6 +1717,17 @@ var startStream = async (tried = new Set) => {
 var beginStream = () => {
   startStream().catch((error) => {
     scheduleReconnect(error instanceof Error ? error.message : String(error), "network");
+  });
+};
+var streamPending = false;
+var ensureStream = () => {
+  if (controller !== null || streamPending)
+    return;
+  streamPending = true;
+  startStream().catch((error) => {
+    scheduleReconnect(error instanceof Error ? error.message : String(error), "network");
+  }).finally(() => {
+    streamPending = false;
   });
 };
 var stopStream = () => {
@@ -1540,6 +1841,61 @@ var readJsonBody = (req) => new Promise((resolve, reject) => {
   });
   req.on("error", reject);
 });
+var noteBackgroundRoot = (sessionId, now) => {
+  activeRoots.delete(sessionId);
+  activeRoots.set(sessionId, now);
+  while (activeRoots.size > BACKGROUND_ROOT_CAP) {
+    const oldest = activeRoots.keys().next();
+    if (oldest.done)
+      break;
+    activeRoots.delete(oldest.value);
+  }
+};
+var SESSION_EVENT_TYPES = new Set([
+  "turn-finished",
+  "turn-failed",
+  "permission-asked",
+  "question-asked",
+  "turn-started",
+  "session-created",
+  "session-archived",
+  "session-deleted"
+]);
+var handleSessionEvent = (body) => {
+  const request = readRecord2(body);
+  if (!request || request.v !== 1)
+    return false;
+  const event = readRecord2(request.event);
+  if (!event)
+    return false;
+  const type = readString(event.type);
+  if (!SESSION_EVENT_TYPES.has(type))
+    return false;
+  const session = readRecord2(event.session);
+  const sessionId = session ? readString(session.id) : "";
+  const parentId = session ? readString(session.parentId) : "";
+  if (!sessionId)
+    return false;
+  const now = Date.now();
+  if (type === "session-created") {
+    if (parentId)
+      sessionParents.set(sessionId, parentId);
+    else
+      sessionParents.delete(sessionId);
+  }
+  if (type === "turn-started" && !parentId)
+    noteBackgroundRoot(sessionId, now);
+  if (type === "turn-started" || type === "turn-finished") {
+    if (parentId)
+      sessionParents.set(sessionId, parentId);
+    if (watchedRootsFor(sessionId).length > 0)
+      trackSession(sessionId);
+    ensureStream();
+  }
+  if (type === "turn-finished")
+    flushPersist();
+  return true;
+};
 var server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     json(res, 401, { error: "unauthorized" });
@@ -1573,6 +1929,37 @@ var server = http.createServer((req, res) => {
     });
     return;
   }
+  if (url.pathname === "/session-events" && req.method === "POST") {
+    readJsonBody(req).then((body) => {
+      if (!handleSessionEvent(body)) {
+        json(res, 400, { ok: false, error: "unsupported session event" });
+        return;
+      }
+      json(res, 200, { ok: true });
+    }).catch((error) => {
+      json(res, 400, { ok: false, error: error instanceof Error ? error.message : "bad body" });
+    });
+    return;
+  }
+  if (url.pathname === "/history") {
+    const requested = readString(url.searchParams.get("sessionId")) || watch?.sessionId || null;
+    if (requested !== null)
+      enterSession(requested);
+    else
+      loadState(blankSession);
+    let body;
+    try {
+      body = {
+        sessionId: requested,
+        turns,
+        cache: cacheWire(cache)
+      };
+    } finally {
+      leaveSession();
+    }
+    json(res, 200, body);
+    return;
+  }
   if (url.pathname === "/rate") {
     const now = Date.now();
     const requested = readString(url.searchParams.get("sessionId")) || watch?.sessionId || null;
@@ -1602,6 +1989,7 @@ var server = http.createServer((req, res) => {
           ttftMs: liveTtftMs()
         },
         lastTurn,
+        cache: cacheWire(cache),
         eventsSeen
       };
     } finally {
@@ -1613,7 +2001,9 @@ var server = http.createServer((req, res) => {
   json(res, 404, { error: "not-found" });
 });
 readPersisted();
-server.listen(port, "127.0.0.1");
+server.listen(port, "127.0.0.1", () => {
+  ensureStream();
+});
 var shutdown = () => {
   flushPersist();
   stopStream();
