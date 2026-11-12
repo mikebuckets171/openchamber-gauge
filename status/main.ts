@@ -1,6 +1,7 @@
 import { connectHost, HostRequestError } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 import { sameModelId } from '../shared/models';
+import { SLICES, biggestSlice, readSplit, sliceMs, type SliceName, type TurnSplit } from '../shared/receipt';
 import { clearSpark as clearSparkPaths, drawSpark, makeSparkSvg, nextScale, type SparkFrame } from '../shared/spark';
 
 type Live = {
@@ -21,6 +22,8 @@ type TurnResult = {
   ttftMs: number | null;
   hasReasoning: boolean;
   endedAt: number;
+  /** Where the turn's time went; absent from an older service. */
+  split?: TurnSplit;
 };
 
 type CachePoint = {
@@ -133,26 +136,36 @@ const COPY = {
     reconnecting: '重连中',
     noService: '需在 设置 → 扩展 里允许本地服务',
     unreachable: '连不上服务端事件流',
-    noData: '对话开始后显示',
     measured: '实测',
     estimated: '估计',
     noReasoning: '无推理数据',
     inProgress: '进行中',
     lastReply: '上轮',
-    firstToken: '首字',
-    work: '工作',
-    prompt: '读取提示',
+    mostly: '主要是',
+    read: '读取提示',
+    wait: '等待',
+    write: '生成',
+    tool: '工具',
+    speed: '速度',
+    firstWord: '首字',
+    reading: '读取提示',
     render: '渲染',
     queued: '排队',
-    memory: '内存',
-    swap: '交换',
     left: '剩余',
+    model: '模型',
+    cost: '本对话费用',
     cacheHit: '缓存命中',
     step: '单步',
     total: '累计',
-    model: '模型',
-    engineHolds: '本地引擎载有',
+    engineHolds: '引擎载有',
+    thisModel: '当前模型',
     ago: '前',
+    memory: '内存',
+    swap: '交换',
+    pressure: '压力',
+    normal: '正常',
+    warning: '警告',
+    critical: '严重',
   },
   en: {
     unit: 'tok/s',
@@ -163,30 +176,40 @@ const COPY = {
     reconnecting: 'reconnecting',
     noService: 'Allow the local service in Settings → Extensions',
     unreachable: 'cannot reach the server stream',
-    noData: 'shows once a turn runs',
     measured: 'measured',
     estimated: 'estimated',
     noReasoning: 'no reasoning data',
     inProgress: 'in progress',
     lastReply: 'Last reply',
-    firstToken: 'First token',
-    work: 'Work',
-    prompt: 'Prompt reading',
-    render: 'Render',
+    mostly: 'mostly',
+    read: 'reading',
+    wait: 'waiting',
+    write: 'writing',
+    tool: 'tools',
+    speed: 'Speed',
+    firstWord: 'First word',
+    reading: 'reading prompt',
+    render: 'render',
     queued: 'queued',
-    memory: 'Memory',
-    swap: 'swap',
     left: 'left',
+    model: 'Model',
+    cost: 'Cost this chat',
     cacheHit: 'Cache hit',
     step: 'step',
     total: 'total',
-    model: 'Model',
-    engineHolds: 'the local engine holds',
+    engineHolds: 'Engine holds',
+    thisModel: 'this model',
     ago: 'ago',
+    memory: 'Memory',
+    swap: 'Swap',
+    pressure: 'Pressure',
+    normal: 'normal',
+    warning: 'warning',
+    critical: 'critical',
   },
 } as const;
 
-type Copy = Record<keyof (typeof COPY)['zh'], string>;
+type Copy = Record<keyof (typeof COPY)['en'], string>;
 
 const SPARK_W = 120;
 const SPARK_H = 18;
@@ -194,12 +217,16 @@ const SPARK_H = 18;
 const SPARK_WINDOW_MS = 30_000;
 /** Floor between watch re-asserts, so a service that is down costs one call a second, not one per poll. */
 const REASSERT_MIN_MS = 1_000;
+/** How long the headline number takes to settle on a new value. */
+const GLIDE_MS = 140;
+/** How long a line takes to open; the frame's height is followed for this long. */
+const OPEN_MS = 180;
 
 const host = connectHost();
 const root = document.querySelector('#root');
 if (!root) throw new Error('Missing #root');
 
-let copy: Copy = COPY.zh;
+let copy: Copy = COPY.en;
 let origin: string | null = null;
 let session: HostSession = null;
 let mounted = false;
@@ -223,25 +250,35 @@ let sparkMoving = false;
 /** A curve that just emptied still needs one static draw to flatten out. */
 let sparkNeedsStatic = false;
 
-// The headline: the speed, its unit, and the state word on the far right.
-const hero = document.createElement('div');
-hero.className = 'hero';
-const dot = document.createElement('span');
-dot.className = 'dot';
-const valueEl = document.createElement('span');
-valueEl.className = 'value';
-valueEl.textContent = '—';
-const unitEl = document.createElement('span');
-unitEl.className = 'unit';
-const stateEl = document.createElement('span');
-stateEl.className = 'state';
+/** Motion is decoration here: a reader who asked for less gets none of it. */
+const reducedMotion = (): boolean => {
+  try {
+    return typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+};
+
+const el = (tag: string, className: string, text?: string): HTMLElement => {
+  const node = document.createElement(tag);
+  node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+};
+
+// The headline: the speed, its unit, and the state on the far right. The state
+// also carries the heavy job running now, so no line appears for it.
+const hero = el('div', 'hero');
+const dot = el('span', 'dot');
+const valueEl = el('span', 'value', '—');
+const unitEl = el('span', 'unit');
+const stateEl = el('span', 'state');
 hero.append(dot, valueEl, unitEl, stateEl);
 
-const sparkEl = document.createElement('div');
-sparkEl.className = 'row sparkrow';
+const sparkEl = el('div', 'sparkrow');
 const sparkParts = makeSparkSvg(SPARK_W, SPARK_H);
-// Same treatment as the panel: the drawing keeps its coordinate system and the
-// element spans the section, so the curve reaches both edges.
+// The drawing keeps its coordinate system and the element spans the section,
+// so the curve reaches both edges.
 sparkParts.svg.setAttribute('width', '100%');
 sparkParts.svg.setAttribute('preserveAspectRatio', 'none');
 for (const path of [sparkParts.line, sparkParts.area]) {
@@ -249,54 +286,131 @@ for (const path of [sparkParts.line, sparkParts.area]) {
 }
 sparkEl.append(sparkParts.svg);
 
+// The divider under the curve doubles as the progress bar of the job in the
+// headline: it fills while a prompt is read or a render runs.
+const rule = el('div', 'rule');
+const ruleFill = el('i', 'fill');
+rule.append(ruleFill);
+
 /**
- * One measured fact: a small label, its value, and the meters under it.
- *
- * Every fact is always drawn, at the same height. A reading that is missing
- * is a dash and an empty track, never a fact that appears or disappears, so
- * the section never changes size under the reader.
+ * One line: a label and the one value worth a glance. A tap opens what is
+ * behind it; one line is open at a time, so the section stays short.
  */
-type Meter = { root: HTMLElement; fill: HTMLElement };
-type Fact = {
+type Line = {
+  key: string;
   root: HTMLElement;
+  button: HTMLElement;
   label: HTMLElement;
   value: HTMLElement;
-  meters: Meter[];
+  detail: HTMLElement;
 };
 
-const makeFact = (meterCount: number, wide = false, full = false): Fact => {
-  const root = document.createElement('div');
-  root.className = wide ? 'fact wide' : (full ? 'fact full' : 'fact');
-  const label = document.createElement('span');
-  label.className = 'k';
-  const value = document.createElement('span');
-  value.className = 'v';
-  value.textContent = '—';
+/** A detail entry: a label and its value, side by side. */
+type Item = { root: HTMLElement; label: HTMLElement; value: HTMLElement };
+
+const makeItem = (): Item => {
+  const itemRoot = el('div', 'item');
+  const label = el('span', 'k');
+  const value = el('span', 'v', '—');
+  itemRoot.append(label, value);
+  return { root: itemRoot, label, value };
+};
+
+type Meter = { root: HTMLElement; fill: HTMLElement };
+
+const makeMeters = (count: number): { root: HTMLElement; meters: Meter[] } => {
+  const track = el('div', 'meters');
   const meters: Meter[] = [];
-  const track = document.createElement('span');
-  track.className = 'meters';
-  for (let i = 0; i < meterCount; i += 1) {
-    const bar = document.createElement('span');
-    bar.className = 'meter';
-    const fill = document.createElement('i');
-    fill.className = 'fill';
+  for (let i = 0; i < count; i += 1) {
+    const bar = el('span', 'meter');
+    const fill = el('i', 'fill');
     bar.append(fill);
     track.append(bar);
     meters.push({ root: bar, fill });
   }
-  root.append(label, value, track);
-  return { root, label, value, meters };
+  return { root: track, meters };
 };
 
-const facts = document.createElement('div');
-facts.className = 'facts';
-const factLast = makeFact(0);
-const factTtft = makeFact(0);
-const factWork = makeFact(1, true);
-const factModel = makeFact(0, false, true);
-const factMemory = makeFact(1, true);
-const factCache = makeFact(2, true);
-facts.append(factLast.root, factTtft.root, factWork.root, factModel.root, factMemory.root, factCache.root);
+let openKey: string | null = null;
+const lines: Line[] = [];
+/** Until when the frame's height follows a line that is still sliding. */
+let fitUntil = 0;
+
+const applyOpen = (): void => {
+  for (const line of lines) {
+    const open = line.key === openKey;
+    line.root.className = `${line.root.className.split(/\s+/).filter((name) => name && name !== 'open').join(' ')}${open ? ' open' : ''}`;
+    line.button.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+};
+
+const makeLine = (key: string): Line => {
+  const lineRoot = el('div', 'row');
+  const button = el('button', 'line');
+  button.setAttribute('type', 'button');
+  button.setAttribute('aria-expanded', 'false');
+  const label = el('span', 'k');
+  const value = el('span', 'v', '—');
+  const chevron = el('span', 'chev', '›');
+  chevron.setAttribute('aria-hidden', 'true');
+  button.append(label, value, chevron);
+  const shell = el('div', 'det');
+  const detail = el('div', 'in');
+  shell.append(detail);
+  lineRoot.append(button, shell);
+  const line: Line = { key, root: lineRoot, button, label, value, detail };
+  button.addEventListener('click', () => {
+    openKey = openKey === key ? null : key;
+    applyOpen();
+    fitUntil = performance.now() + OPEN_MS + 120;
+    fitHeight();
+  });
+  lines.push(line);
+  return line;
+};
+
+/** Keep the line's own state class (`warning`, `critical`) beside `row` and `open`. */
+const setLineTone = (line: Line, tone: string): void => {
+  line.root.className = `row${tone ? ` ${tone}` : ''}${line.key === openKey ? ' open' : ''}`;
+};
+
+const rows = el('div', 'rows');
+
+// Last reply: how long it took and what most of that was. Behind it, the
+// receipt: the turn cut into slices, its speed and its first word.
+const lineReply = makeLine('reply');
+const segs = el('div', 'segs');
+const segFills = new Map<SliceName, HTMLElement>();
+for (const name of SLICES) {
+  const fill = el('i', `seg ${name}`);
+  segFills.set(name, fill);
+  segs.append(fill);
+}
+const receiptCaption = el('div', 'sub', '—');
+const itemSpeed = makeItem();
+const itemFirst = makeItem();
+lineReply.detail.append(segs, receiptCaption, itemSpeed.root, itemFirst.root);
+
+// Model: the model in play and what the chat has cost. Behind it, the cost on
+// its own, the cache hit rates, the local engine's reading and the full name.
+const lineModel = makeLine('model');
+const itemCost = makeItem();
+const itemCache = makeItem();
+const cacheMeters = makeMeters(2);
+const itemEngine = makeItem();
+itemEngine.root.className = 'item wrap';
+const modelId = el('div', 'sub id');
+lineModel.detail.append(itemCost.root, itemCache.root, cacheMeters.root, itemEngine.root, modelId);
+
+// Memory: what the Mac is using. Behind it, the meter, the swap and the
+// kernel's own pressure level.
+const lineMemory = makeLine('memory');
+const memoryMeters = makeMeters(1);
+const itemSwap = makeItem();
+const itemPressure = makeItem();
+lineMemory.detail.append(memoryMeters.root, itemSwap.root, itemPressure.root);
+
+rows.append(lineReply.root, lineModel.root, lineMemory.root);
 
 let lastHeight = 0;
 
@@ -323,6 +437,12 @@ const barWidth = (value: number | null | undefined): string => (
 const formatPct = (value: number | null | undefined): string => (
   typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}%` : '—'
 );
+
+/** What the provider charged, or a dash when it reported nothing. */
+const formatCost = (cost: number | null | undefined): string => {
+  if (typeof cost !== 'number' || !Number.isFinite(cost) || cost <= 0) return '—';
+  return cost < 0.01 ? '<$0.01' : `$${cost.toFixed(2)}`;
+};
 
 /**
  * The origin the page was served from, or null when it has none: a relay
@@ -359,14 +479,48 @@ const dropSpark = (): void => {
 };
 
 /**
- * Redraw between polls against a projected clock, so the curve slides instead
- * of stepping two pixels at a time four times a second. The point values stay
- * exactly what the service measured; only the window edge moves.
+ * The headline number glides to a new value instead of snapping to it. The
+ * first value, and every value for a reader who asked for less motion, is
+ * written at once.
+ */
+let heroShown: number | null = null;
+let heroTarget: number | null = null;
+let heroAt = 0;
+
+const setHero = (target: number | null): void => {
+  if (target === null) {
+    heroShown = null;
+    heroTarget = null;
+    valueEl.textContent = '—';
+    return;
+  }
+  heroTarget = target;
+  if (heroShown === null || reducedMotion()) {
+    heroShown = target;
+    valueEl.textContent = formatTps(target);
+  }
+};
+
+const glideHero = (at: number): void => {
+  const dt = Math.min(250, at - heroAt);
+  heroAt = at;
+  if (heroShown === null || heroTarget === null || heroShown === heroTarget) return;
+  heroShown += (heroTarget - heroShown) * (1 - Math.exp(-dt / GLIDE_MS));
+  if (Math.abs(heroTarget - heroShown) < 0.05) heroShown = heroTarget;
+  valueEl.textContent = formatTps(heroShown);
+};
+
+/**
+ * One frame: the curve slides between polls against a projected clock, so it
+ * pans instead of stepping four times a second; the headline number glides;
+ * and the frame's height follows a line that is sliding open.
  */
 const paintSpark = (): void => {
   if (stopped) return;
   const frame = sparkFrame;
   const at = performance.now();
+  glideHero(at);
+  if (at < fitUntil) fitHeight();
   if (frame && frame.values.length > 0) {
     if (sparkMoving) {
       // ~30 fps is enough for a 2 px/slide and keeps a decorative curve from
@@ -389,7 +543,7 @@ const paintSpark = (): void => {
 };
 
 const fitHeight = (): void => {
-  const h = Math.min(320, Math.max(24, Math.ceil(root.scrollHeight) + 2));
+  const h = Math.min(480, Math.max(24, Math.ceil(root.scrollHeight) + 2));
   if (h !== lastHeight) {
     lastHeight = h;
     void host.setHeight(h).catch(() => undefined);
@@ -402,142 +556,201 @@ const setState = (text: string): void => {
   stateEl.hidden = text.length === 0;
 };
 
-/** The work fact: the heavy job running now, or a dash when there is none. */
-const paintWork = (gauge: GaugeWire | null | undefined): void => {
+/**
+ * The heavy job running now, as the headline says it and as the divider fills:
+ * the prompt a local chat is reading, or a ComfyUI render.
+ */
+type Job = { kind: 'prompt' | 'render'; text: string; percent: number | null };
+
+const jobFrom = (gauge: GaugeWire | null | undefined): Job | null => {
   const prompt = gauge?.prompt ?? null;
-  const job = gauge?.render ?? null;
   if (prompt && prompt.total > 0) {
     const percent = (prompt.processed / prompt.total) * 100;
     // Time left from the rate Splash itself reported: processed tokens over the
     // prefill time so far. No rate, no estimate.
     const perMs = prompt.timeMs > 0 ? prompt.processed / prompt.timeMs : 0;
     const leftMs = perMs > 0 ? (prompt.total - prompt.processed) / perMs : null;
-    factWork.label.textContent = copy.prompt;
-    factWork.value.textContent = leftMs !== null
-      ? `${percent.toFixed(0)}% · ${formatSecs(leftMs)} ${copy.left}`
-      : `${percent.toFixed(0)}%`;
-    factWork.meters[0].fill.style.width = barWidth(percent);
-    factWork.root.className = 'fact wide active';
-    return;
+    const parts = [`${copy.reading} ${percent.toFixed(0)}%`];
+    if (leftMs !== null) parts.push(`${formatSecs(leftMs)} ${copy.left}`);
+    return { kind: 'prompt', text: parts.join(' · '), percent };
   }
+  const job = gauge?.render ?? null;
   if (job) {
     const step = job.step;
-    const parts = [copy.render];
-    if (step) parts.push(`${step.value} / ${step.max}`);
+    const parts: string[] = [step ? `${copy.render} ${step.value} / ${step.max}` : copy.render];
     if (job.state === 'queued') parts.push(`${job.queued} ${copy.queued}`);
     else if (job.startedAt) parts.push(formatSecs(Date.now() - job.startedAt));
     // Jobs waiting behind the running one: how much is still to come.
     if (job.state !== 'queued' && job.queued > 0) parts.push(`${job.queued} ${copy.queued}`);
-    factWork.label.textContent = copy.render;
-    factWork.value.textContent = parts.join(' · ');
-    factWork.meters[0].fill.style.width = barWidth(step && step.max > 0 ? (step.value / step.max) * 100 : null);
-    factWork.root.className = 'fact wide active';
-    return;
+    return { kind: 'render', text: parts.join(' · '), percent: step && step.max > 0 ? (step.value / step.max) * 100 : null };
   }
-  factWork.label.textContent = copy.work;
-  factWork.value.textContent = '—';
-  factWork.meters[0].fill.style.width = '0%';
-  factWork.root.className = 'fact wide';
+  return null;
+};
+
+/** Whether the previous answer was for a running turn of this session: a reply that ends then fills its bar in once. */
+let replyWasActive = false;
+let replySession: string | null = null;
+let replyEndedAt: number | null = null;
+
+/** The reply line: the finished turn, its receipt, its speed and its first word. */
+const paintReply = (rate: RateResponse | null): void => {
+  lineReply.label.textContent = copy.lastReply;
+  itemSpeed.label.textContent = copy.speed;
+  itemFirst.label.textContent = copy.firstWord;
+  const lt = rate?.lastTurn ?? null;
+  const turnActive = !!rate && (rate.busy || rate.toolActive);
+  const split = readSplit(lt?.split);
+
+  if (lt && split) {
+    const top = biggestSlice(split);
+    lineReply.value.textContent = top
+      ? `${formatSecs(split.totalMs)} · ${copy.mostly} ${copy[top]}`
+      : formatSecs(split.totalMs);
+    receiptCaption.textContent = SLICES
+      .filter((name) => sliceMs(split, name) >= 50)
+      .map((name) => `${formatSecs(sliceMs(split, name))} ${copy[name]}`)
+      .join(' · ') || '—';
+  } else if (lt) {
+    // A turn an older service recorded: its speed is all there is.
+    lineReply.value.textContent = `${formatTps(lt.tokensPerSecond)} ${copy.unit}`;
+    receiptCaption.textContent = '—';
+  } else {
+    lineReply.value.textContent = turnActive ? copy.inProgress : '—';
+    receiptCaption.textContent = '—';
+  }
+
+  const widths = SLICES.map((name) => barWidth(split ? (sliceMs(split, name) / split.totalMs) * 100 : 0));
+  const sessionId = rate?.sessionId ?? null;
+  const ended = lt?.endedAt ?? null;
+  // A reply that just ended, watched as it ran, fills its bar in once. Anything
+  // else — the first answer, another session, a reload — is drawn as it is.
+  const fresh = split !== null && ended !== null && ended !== replyEndedAt
+    && replyWasActive && sessionId === replySession && !reducedMotion();
+  if (fresh) {
+    SLICES.forEach((name) => { segFills.get(name)!.style.width = '0%'; });
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      SLICES.forEach((name, i) => { segFills.get(name)!.style.width = widths[i]; });
+    }));
+  } else if (ended !== replyEndedAt || sessionId !== replySession || !split) {
+    SLICES.forEach((name, i) => { segFills.get(name)!.style.width = widths[i]; });
+  }
+  replyEndedAt = ended;
+  replySession = sessionId;
+  replyWasActive = turnActive;
+
+  itemSpeed.value.textContent = lt
+    ? `${formatTps(lt.tokensPerSecond)} ${copy.unit} · ${lt.source === 'tokens' ? copy.measured : copy.estimated}`
+      + (!lt.hasReasoning && lt.tokens > 0 ? ` · ${copy.noReasoning}` : '')
+    : '—';
+  const ttft = rate?.turn.active ? rate.turn.ttftMs : lt?.ttftMs ?? null;
+  itemFirst.value.textContent = ttft !== null ? formatSecs(ttft) : '—';
 };
 
 /**
- * The model fact: the model in play, and the local engine's own reading.
+ * The model line: the model in play and what the chat has cost.
  *
- * The row never names a model the chat is not using. When the local engine
- * holds the very model the chat is on, its quantization is part of the name
- * and the reading's age is shown; when the engine holds another one, that
- * reading waits on the hover.
+ * The line never names a model the chat is not using. When the local engine
+ * holds the very model the chat is on, its quantization is part of the name;
+ * when it holds another one, that reading waits behind the line.
  */
-const paintModel = (gauge: GaugeWire | null | undefined): void => {
+const paintModel = (gauge: GaugeWire | null | undefined, info: CacheInfo | null | undefined): void => {
   const chat = gauge?.chatModel ?? null;
   const loaded = gauge?.model ?? null;
-  factModel.label.textContent = copy.model;
-  if (!chat && !loaded) {
-    factModel.value.textContent = '—';
-    factModel.root.removeAttribute('title');
-    factModel.root.className = 'fact full';
-    return;
+  lineModel.label.textContent = copy.model;
+  itemCost.label.textContent = copy.cost;
+  itemCache.label.textContent = copy.cacheHit;
+  itemEngine.label.textContent = copy.engineHolds;
+
+  const cost = formatCost(info?.cost);
+  itemCost.value.textContent = cost;
+
+  // The cache: the last settled step's hit rate and the conversation's.
+  const cached = !!info && info.steps > 0 && info.hit + info.miss > 0;
+  if (cached && info) {
+    const last = info.last;
+    const delta = last?.delta;
+    const moved = typeof delta === 'number' && Number.isFinite(delta) && Math.abs(delta) >= 0.05;
+    const arrow = moved ? `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}` : '';
+    itemCache.value.textContent = `${formatPct(last?.hitRate)}${arrow} ${copy.step} · ${formatPct(info.hitRate)} ${copy.total}`;
+    cacheMeters.meters[0].fill.style.width = barWidth(last?.hitRate);
+    cacheMeters.meters[1].fill.style.width = barWidth(info.hitRate);
+  } else {
+    itemCache.value.textContent = '—';
+    cacheMeters.meters[0].fill.style.width = '0%';
+    cacheMeters.meters[1].fill.style.width = '0%';
   }
-  // The engine holds the chat's model when the two identifiers name one model.
-  const same = !!(chat && loaded && sameModelId(chat.id, loaded.id));
-  const parts: string[] = [];
-  if (chat) parts.push(chat.name);
-  else parts.push(loaded!.name);
-  if (chat && same) {
-    if (loaded!.quant) parts.push(loaded!.quant);
-  } else if (!chat && loaded!.quant) {
-    parts.push(loaded!.quant);
-  }
-  // How old the engine's reading is. It belongs to the engine, so it is shown
-  // with the engine's own model, and kept for the hover when the row names
-  // the chat's model instead.
+
+  // How old the engine's reading is; said only once it has grown old.
   const age = loaded ? Date.now() - loaded.at : 0;
   const ageText = age > 10_000 ? `${Math.round(age / 1000)}s ${copy.ago}` : '';
-  if (ageText && (!chat || same)) parts.push(ageText);
-  factModel.value.textContent = parts.join(' · ');
-  // The full identifiers stay reachable when the name has to be cut short.
-  const engineText = loaded
-    ? `${copy.engineHolds} ${loaded.name}${loaded.quant ? ' · ' + loaded.quant : ''}${ageText ? ' · ' + ageText : ''}`
-    : '';
+  const engineValue = loaded
+    ? [loaded.name, loaded.quant, ageText].filter(Boolean).join(' · ')
+    : '—';
+  // The engine holds the chat's model when the two identifiers name one model;
+  // then the name is already on the line and is not said twice.
+  const same = !!(chat && loaded && sameModelId(chat.id, loaded.id));
+  itemEngine.value.textContent = same
+    ? [copy.thisModel, loaded!.quant, ageText].filter(Boolean).join(' · ')
+    : engineValue;
+
+  if (!chat && !loaded) {
+    lineModel.value.textContent = cost === '—' ? '—' : cost;
+    modelId.textContent = '';
+    modelId.hidden = true;
+    lineModel.root.removeAttribute('title');
+    return;
+  }
+  const parts: string[] = [chat ? chat.name : loaded!.name];
+  if ((same || !chat) && loaded!.quant) parts.push(loaded!.quant);
+  if (cost !== '—') parts.push(cost);
+  lineModel.value.textContent = parts.join(' · ');
+  // The full identifier is behind the line for a tap, and on the hover for a mouse.
+  const id = chat ? chat.id : loaded!.id;
+  modelId.textContent = id;
+  modelId.hidden = false;
   const title = chat
-    ? [chat.id, engineText].filter(Boolean).join(' · ')
+    ? [chat.id, loaded ? `${copy.engineHolds} ${engineValue}` : ''].filter(Boolean).join(' · ')
     : loaded!.id;
-  factModel.root.setAttribute('title', title);
-  factModel.root.className = 'fact full';
+  lineModel.root.setAttribute('title', title);
 };
 
-/** The memory fact: what the Mac is using, and the kernel's own pressure level. */
+/** The memory line: what the Mac is using, and the kernel's own pressure level. */
 const paintMemory = (gauge: GaugeWire | null | undefined): void => {
   const mac = gauge?.mac ?? null;
-  factMemory.label.textContent = copy.memory;
+  lineMemory.label.textContent = copy.memory;
+  itemSwap.label.textContent = copy.swap;
+  itemPressure.label.textContent = copy.pressure;
   if (mac && mac.usedBytes !== null && mac.totalBytes) {
-    const percent = (mac.usedBytes / mac.totalBytes) * 100;
-    const swap = mac.swapUsedBytes && mac.swapUsedBytes > 0 ? ` · ${copy.swap} ${formatGb(mac.swapUsedBytes)}` : '';
-    factMemory.value.textContent = `${formatGb(mac.usedBytes)} / ${formatGb(mac.totalBytes)} GB${swap}`;
-    factMemory.meters[0].fill.style.width = barWidth(percent);
-    factMemory.root.className = `fact wide ${mac.pressure ?? 'normal'}`;
+    lineMemory.value.textContent = `${formatGb(mac.usedBytes)} / ${formatGb(mac.totalBytes)} GB`;
+    memoryMeters.meters[0].fill.style.width = barWidth((mac.usedBytes / mac.totalBytes) * 100);
+    itemSwap.value.textContent = mac.swapUsedBytes !== null ? `${formatGb(mac.swapUsedBytes)} GB` : '—';
+    itemPressure.value.textContent = mac.pressure ? copy[mac.pressure] : '—';
+    // Amber and red are the kernel's words, so they show on the closed line too.
+    setLineTone(lineMemory, mac.pressure && mac.pressure !== 'normal' ? mac.pressure : '');
     return;
   }
-  factMemory.value.textContent = '—';
-  factMemory.meters[0].fill.style.width = '0%';
-  factMemory.root.className = 'fact wide';
-};
-
-/** The cache fact: the last settled step's hit rate and the conversation's. */
-const paintCache = (info: CacheInfo | null | undefined): void => {
-  factCache.label.textContent = copy.cacheHit;
-  const present = !!info && info.steps > 0 && info.hit + info.miss > 0;
-  if (!present || !info) {
-    factCache.value.textContent = '—';
-    factCache.meters[0].fill.style.width = '0%';
-    factCache.meters[1].fill.style.width = '0%';
-    return;
-  }
-  const last = info.last;
-  const delta = last?.delta;
-  const moved = typeof delta === 'number' && Number.isFinite(delta) && Math.abs(delta) >= 0.05;
-  const arrow = moved ? `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}` : '';
-  factCache.value.textContent = `${formatPct(last?.hitRate)}${arrow} ${copy.step} · ${formatPct(info.hitRate)} ${copy.total}`;
-  factCache.meters[0].fill.style.width = barWidth(last?.hitRate);
-  factCache.meters[1].fill.style.width = barWidth(info.hitRate);
+  lineMemory.value.textContent = '—';
+  memoryMeters.meters[0].fill.style.width = '0%';
+  itemSwap.value.textContent = '—';
+  itemPressure.value.textContent = '—';
+  setLineTone(lineMemory, '');
 };
 
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
   if (!rate) {
     dot.className = 'dot';
-    valueEl.textContent = '—';
+    setHero(null);
     valueEl.className = 'value';
     setState(notice ?? copy.connecting);
-    factLast.value.textContent = '—';
-    factTtft.value.textContent = '—';
-    paintCache(null);
-    paintWork(null);
-    paintModel(null);
+    ruleFill.style.width = '0%';
+    paintReply(null);
+    paintModel(null, null);
     paintMemory(null);
     dropSpark();
     fitHeight();
     return;
   }
+  const job = jobFrom(rate.gauge);
   if (rate.connection === 'error') {
     dot.className = 'dot wait';
     // A network failure is a wrong address, not a bad response: name the
@@ -554,24 +767,29 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   } else if (rate.waiting === 'question') {
     dot.className = 'dot wait';
     setState(copy.waitingQuestion);
+  } else if (job?.kind === 'prompt') {
+    // The chat is waiting on this, so it outranks everything but a question.
+    dot.className = 'dot live';
+    setState(job.text);
   } else if (rate.toolActive) {
     dot.className = 'dot live';
     setState(copy.toolRunning);
   } else {
     // "generating" and "idle" say nothing the dot and the headline do not
-    // already say — they only stretched the meta line.
+    // already say. A render is the Mac's job, not the chat's, so it is said
+    // only when the chat has nothing of its own to say.
     dot.className = rate.busy ? 'dot live' : 'dot';
-    setState('');
+    setState(job ? job.text : '');
   }
+  ruleFill.style.width = barWidth(job?.percent);
 
   const live = rate.live.tps;
   const streaming = rate.busy && rate.waiting === null && live > 0.05;
-  const turnActive = rate.busy || rate.toolActive;
   // Headline is the running turn average: stable across network jitter and
   // identical to the finalized average when the turn ends.
   const shown = rate.running ? rate.running.tps : (rate.lastTurn?.tokensPerSecond ?? NaN);
   const hasValue = Number.isFinite(shown) && shown > 0;
-  valueEl.textContent = hasValue ? formatTps(shown) : '—';
+  setHero(hasValue ? shown : null);
   // Grey whenever tokens are not arriving, so the number does not read as a
   // live rate next to a curve that has already decayed towards zero.
   valueEl.className = hasValue && !streaming ? 'value stale' : 'value';
@@ -594,23 +812,8 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     sparkMoving = moving;
   }
 
-  // The two facts under the curve: the finished turn and the first token.
-  const lt = rate.lastTurn;
-  factLast.label.textContent = copy.lastReply;
-  factLast.value.textContent = lt
-    ? `${formatTps(lt.tokensPerSecond)} ${copy.unit} · ${lt.source === 'tokens' ? copy.measured : copy.estimated}`
-    : '—';
-  const ttft = rate.turn.active ? rate.turn.ttftMs : lt?.ttftMs ?? null;
-  factTtft.label.textContent = copy.firstToken;
-  factTtft.value.textContent = ttft !== null ? formatSecs(ttft) : '—';
-  if (lt && !lt.hasReasoning && lt.tokens > 0) {
-    factLast.value.textContent += ` · ${copy.noReasoning}`;
-  }
-  if (!lt && turnActive) factLast.value.textContent = copy.inProgress;
-
-  paintCache(rate.cache);
-  paintWork(rate.gauge);
-  paintModel(rate.gauge);
+  paintReply(rate);
+  paintModel(rate.gauge, rate.cache);
   paintMemory(rate.gauge);
 
   if (notice) setState(notice);
@@ -711,7 +914,7 @@ const configure = async (sessionId: string | null): Promise<void> => {
 };
 
 const mount = (): void => {
-  root.append(hero, sparkEl, facts);
+  root.append(hero, sparkEl, rule, rows);
   unitEl.textContent = copy.unit;
   if (!heightReported) {
     heightReported = true;
@@ -735,6 +938,8 @@ const mount = (): void => {
 host.onReady((next) => {
   copy = next.locale.toLowerCase().startsWith('zh') ? COPY.zh : COPY.en;
   applyHostReady(next, document.documentElement);
+  // The markup says English; the host knows what the reader actually reads.
+  document.documentElement.lang = copy === COPY.zh ? 'zh' : 'en';
   session = next.session ? { id: next.session.id, title: next.session.title, busy: next.session.busy, model: next.session.model } : null;
   origin = resolveOrigin();
   unitEl.textContent = copy.unit;

@@ -182,6 +182,16 @@ check(
   Math.abs(rate.lastTurn.tokensPerSecond - rate.lastTurn.tokens / (rate.lastTurn.activeMs / 1000)) < 0.01,
   JSON.stringify(rate.lastTurn),
 );
+{
+  const split = rate.lastTurn?.split;
+  check(
+    'last turn carries a receipt whose slices add up to the turn',
+    !!split && split.totalMs > 0
+      && split.readMs + split.waitMs + split.writeMs + split.toolMs === split.totalMs
+      && split.writeMs === rate.lastTurn.activeMs,
+    JSON.stringify(split),
+  );
+}
 check(
   'headline is continuous: running average converges to the final number',
   Number.isFinite(runningBeforeEnd)

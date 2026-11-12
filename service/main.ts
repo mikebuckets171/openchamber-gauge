@@ -25,9 +25,10 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { modelDisplayName } from '../shared/models';
+import { splitTurn, type TurnSplit } from '../shared/receipt';
 import { tokensFromChars } from '../shared/tokens';
 import { passwordAuthHeaders, trustedClientOrigin } from './auth';
-import { gaugeWire, noteDemand } from './gauge';
+import { gaugeWire, noteDemand, takeReadMs } from './gauge';
 
 const execFileAsync = promisify(execFile);
 
@@ -222,6 +223,8 @@ type TurnResult = {
   endedAt: number;
   /** Cache share of the steps this turn settled; null when none reported any. */
   cache: TurnCache | null;
+  /** Where the turn's time went; absent from a turn an older service recorded. */
+  split?: TurnSplit;
 };
 
 type WaitingKind = 'permission' | 'question';
@@ -1386,6 +1389,20 @@ const snapshotTurnCache = (): TurnCache | null => {
   return { hit, miss, steps, output, hitRate: cacheRate(hit, miss) };
 };
 
+/**
+ * The finished turn's receipt: its whole span without the time spent waiting
+ * on the user, cut into reading, waiting, writing and tools.
+ */
+const turnSplit = (now: number, writeMs: number): TurnSplit => {
+  const started = turnExecAt ?? turnStartedAt;
+  return splitTurn({
+    totalMs: started !== null ? now - started - turnWaitMs : 0,
+    writeMs,
+    toolMs: turnToolMs,
+    readMs: takeReadMs(sessionIdsFor(activeSessionId)),
+  });
+};
+
 const finalizeTurn = (now: number): void => {
   noteWaiting(now);
   noteTools(now);
@@ -1404,6 +1421,7 @@ const finalizeTurn = (now: number): void => {
       hasReasoning: turnReasoningChars > 0 || [...steps.values()].some((s) => s.reasoning > 0),
       endedAt: now,
       cache: turnCache,
+      split: turnSplit(now, sum.netMs),
     };
     turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
     if (turns.length > TURNS_CAP) turns.splice(0, turns.length - TURNS_CAP);
@@ -1439,6 +1457,7 @@ const finalizeTurn = (now: number): void => {
     hasReasoning: turnReasoningChars > 0,
     endedAt: now,
     cache: turnCache,
+    split: turnSplit(now, activeMs),
   };
   turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
   if (turns.length > TURNS_CAP) turns.splice(0, turns.length - TURNS_CAP);

@@ -54,8 +54,9 @@ class El {
   getAttribute(key) { return this.attrs[key] ?? null; }
   hasAttribute(key) { return Object.hasOwn(this.attrs, key); }
   removeAttribute(key) { delete this.attrs[key]; }
-  addEventListener() {}
+  addEventListener(type, fn) { (this.listeners ??= []).push([type, fn]); }
   removeEventListener() {}
+  click() { for (const [type, fn] of this.listeners ?? []) if (type === 'click') fn({ type: 'click' }); }
   querySelectorAll(selector) {
     const found = [];
     const walk = (el) => {
@@ -68,7 +69,20 @@ class El {
     walk(this);
     return found;
   }
-  get scrollHeight() { return 0; }
+  // Tall enough to tell an open line from a closed one: the page reports its
+  // height from this, so a line that opens must make the frame taller.
+  get scrollHeight() {
+    let open = 0;
+    const walk = (el) => {
+      for (const child of el.children) {
+        if (!(child instanceof El)) continue;
+        if (String(child.className).split(/\s+/).includes('open')) open += 1;
+        walk(child);
+      }
+    };
+    walk(this);
+    return 150 + open * 80;
+  }
   set textContent(value) { this._text = String(value); this.children = []; }
   get textContent() { return this._text + this.children.map((child) => child.textContent).join(''); }
 }
@@ -120,7 +134,7 @@ const RATE = {
     write: 0,
     output: 110,
     reasoning: 0,
-    cost: 0,
+    cost: 0.4234,
     last: {
       at: Date.now(),
       sessionId: SESSION,
@@ -258,16 +272,27 @@ const findByClass = (node, className) => {
 
 const widthOf = (node) => String(node?.style?.props?.width ?? node?.style?.width ?? '');
 
-/** The fact whose label is `text`: the fact root, not its label. */
-const findFact = (node, text) => {
-  if (String(node.className ?? '').split(/\s+/).includes('fact') && node.textContent.includes(text)) return node;
+/** The line whose label is `text`: the line's root, with what is behind it. */
+const findLine = (node, text) => {
+  if (String(node.className ?? '').split(/\s+/).includes('row')) {
+    const label = findByClass(node, 'k');
+    if (label && label.textContent === text) return node;
+  }
   for (const child of node.children) {
     if (!(child instanceof El)) continue;
-    const hit = findFact(child, text);
+    const hit = findLine(child, text);
     if (hit) return hit;
   }
   return null;
 };
+
+const collectByClass = (node, className, out = []) => {
+  if (String(node.className ?? '').split(/\s+/).includes(className)) out.push(node);
+  for (const child of node.children) if (child instanceof El) collectByClass(child, className, out);
+  return out;
+};
+
+const isOpen = (line) => String(line.className ?? '').split(/\s+/).includes('open');
 
 const findByText = (node, text) => {
   if (node.textContent === text) return node;
@@ -338,17 +363,12 @@ for (const surface of SURFACES) {
     direct.root().includes('83.5'),
     JSON.stringify(direct.root()),
   );
-  // The cache fact carries the two hit rates as meters under its value.
-  const cacheFact = findFact(direct.rootEl, '缓存命中');
-  const cacheMeters = [];
-  const collectMeters = (node) => {
-    if (String(node.className ?? '').split(/\s+/).includes('meter')) cacheMeters.push(node);
-    for (const child of node.children) if (child instanceof El) collectMeters(child);
-  };
-  collectMeters(cacheFact ?? direct.rootEl);
+  // The cache rates live behind the model line, as two meters under their value.
+  const modelLineZh = findLine(direct.rootEl, '模型');
+  const cacheMeters = collectByClass(modelLineZh ?? direct.rootEl, 'meter');
   check(
     `${surface.name}: both hit rates carry a progress bar`,
-    cacheFact !== null && cacheMeters.length === 2,
+    modelLineZh !== null && cacheMeters.length === 2,
     `bars=${cacheMeters.length}`,
   );
   const widths = cacheMeters.map((bar) => widthOf(findByClass(bar, 'fill')));
@@ -370,26 +390,14 @@ for (const surface of SURFACES) {
     JSON.stringify(relayValue && relayValue.className),
   );
 
-  // A provider that has not reported any cache yet: no bars, just dashes.
-  // The empty tracks used to render as stray ``— [bar] —`` rows.
+  // A provider that has not reported any cache yet: empty tracks and a dash.
   const noCache = runGuest(surface.bundle, surface.url, { rate: { ...RATE, cache: null } });
   await settle();
-  const cacheFactEmpty = findFact(noCache.rootEl, '缓存命中');
-  const emptyMeters = [];
-  const collect = (node) => {
-    if (String(node.className ?? '').split(/\s+/).includes('meter')) emptyMeters.push(node);
-    for (const child of node.children) if (child instanceof El) collect(child);
-  };
-  collect(cacheFactEmpty ?? noCache.rootEl);
+  const emptyMeters = collectByClass(findLine(noCache.rootEl, '模型') ?? noCache.rootEl, 'meter');
   check(
     `${surface.name}: no cache data leaves the cache meters empty`,
     emptyMeters.length === 2 && emptyMeters.every((bar) => widthOf(findByClass(bar, 'fill')) === '0%'),
     `meters=${emptyMeters.length} widths=${JSON.stringify(emptyMeters.map((bar) => widthOf(findByClass(bar, 'fill'))))}`,
-  );
-  check(
-    `${surface.name}: no cache data writes a dash in the cache fact`,
-    cacheFactEmpty !== null && cacheFactEmpty.textContent.includes('—'),
-    JSON.stringify(noCache.root()),
   );
   check(
     `${surface.name}: no cache data writes no percentage`,
@@ -397,26 +405,113 @@ for (const surface of SURFACES) {
     JSON.stringify(noCache.root()),
   );
 
-  // Gauge's own rows are always there, the same height whether they show a
-  // reading or a dash. A missing reading is a dash, never a missing row.
-  const facts = (node, out = []) => {
-    if (String(node.className ?? '').split(/\s+/).includes('fact')) out.push(node);
-    for (const child of node.children) if (child instanceof El) facts(child, out);
-    return out;
-  };
+  // The glance layout: three lines, always drawn, a dash for a missing reading.
   const plain = runGuest(surface.bundle, surface.url, { rate: { ...RATE, gauge: null, cache: null, lastTurn: null }, locale: 'en' });
   await settle();
-  const plainFacts = facts(plain.rootEl);
+  const plainLines = collectByClass(plain.rootEl, 'row');
+  check(`${surface.name}: three lines are always drawn`, plainLines.length === 3, `lines=${plainLines.length}`);
   check(
-    `${surface.name}: every fact is always drawn`,
-    plainFacts.length === 6,
-    `facts=${plainFacts.length}`,
+    `${surface.name}: a missing reading is a dash on its line`,
+    plainLines.length === 3 && plainLines.every((line) => findByClass(line, 'v').textContent === '—'),
+    JSON.stringify(plainLines.map((line) => findByClass(line, 'v').textContent)),
   );
   check(
-    `${surface.name}: a missing reading is a dash, not an empty fact`,
-    plainFacts.length === 6 && plainFacts.every((fact) => fact.textContent.includes('—')),
-    JSON.stringify(plainFacts.map((fact) => fact.textContent)),
+    `${surface.name}: no line is open until it is tapped`,
+    plainLines.every((line) => !isOpen(line)),
+    JSON.stringify(plainLines.map((line) => line.className)),
   );
+  check(
+    `${surface.name}: an idle section has an empty divider`,
+    widthOf(findByClass(findByClass(plain.rootEl, 'rule'), 'fill')) === '0%',
+  );
+
+  // Tapping: a line opens, a second tap on another closes the first, and a tap
+  // on the open one closes it. One line is open at a time.
+  {
+    const [reply, model, memory] = plainLines;
+    findByClass(reply, 'line').click();
+    check(`${surface.name}: a tap opens a line`, isOpen(reply) && !isOpen(model) && !isOpen(memory), reply.className);
+    check(
+      `${surface.name}: the open line says so to assistive tech`,
+      findByClass(reply, 'line').getAttribute('aria-expanded') === 'true'
+        && findByClass(model, 'line').getAttribute('aria-expanded') === 'false',
+    );
+    findByClass(memory, 'line').click();
+    check(
+      `${surface.name}: opening another line closes the first`,
+      !isOpen(reply) && !isOpen(model) && isOpen(memory),
+      JSON.stringify(plainLines.map((line) => line.className)),
+    );
+    findByClass(memory, 'line').click();
+    check(`${surface.name}: a tap on the open line closes it`, plainLines.every((line) => !isOpen(line)));
+    const heights = plain.posted.filter((message) => message && message.type === 'resize').map((message) => message.payload.height);
+    check(
+      `${surface.name}: the frame grows for an open line and shrinks back when it closes`,
+      heights.length >= 3 && Math.max(...heights) > heights[0] && heights.at(-1) === heights[0],
+      JSON.stringify(heights),
+    );
+  }
+
+  // The receipt: a finished reply says how long it took and what most of that
+  // was; behind the line, the slices add up to the whole bar.
+  const SPLIT = { totalMs: 48_000, readMs: 0, waitMs: 6_000, writeMs: 33_000, toolMs: 9_000 };
+  const LAST_TURN = {
+    tokensPerSecond: 38.2, source: 'tokens', tokens: 1260, activeMs: 33_000, wallMs: 47_000,
+    ttftMs: 6_100, hasReasoning: true, endedAt: Date.now() - 5_000, split: SPLIT,
+  };
+  const receipt = runGuest(surface.bundle, surface.url, { locale: 'en', rate: { ...RATE, running: null, lastTurn: LAST_TURN } });
+  await settle();
+  const replyLine = findLine(receipt.rootEl, 'Last reply');
+  check(
+    `${surface.name}: the reply line says how long and what most of it was`,
+    replyLine !== null && findByClass(replyLine, 'v').textContent === '48s · mostly writing',
+    JSON.stringify(replyLine && findByClass(replyLine, 'v').textContent),
+  );
+  check(
+    `${surface.name}: the receipt names each slice that took time, and no reading for a cloud reply`,
+    replyLine !== null && findByClass(replyLine, 'sub').textContent === '6.0s waiting · 33s writing · 9.0s tools',
+    JSON.stringify(replyLine && findByClass(replyLine, 'sub').textContent),
+  );
+  const segWidths = collectByClass(replyLine ?? receipt.rootEl, 'seg').map(widthOf);
+  check(
+    `${surface.name}: the receipt bar's slices add up to the whole bar`,
+    segWidths.length === 4 && Math.abs(segWidths.reduce((sum, w) => sum + Number.parseFloat(w), 0) - 100) < 0.01
+      && segWidths[0] === '0%' && segWidths[2] === '68.75%',
+    JSON.stringify(segWidths),
+  );
+  check(
+    `${surface.name}: speed and first word sit behind the reply line`,
+    replyLine !== null && replyLine.textContent.includes('38.2 tok/s · measured') && replyLine.textContent.includes('First word6.1s'),
+    JSON.stringify(replyLine && replyLine.textContent),
+  );
+  check(`${surface.name}: the headline keeps the last reply's speed`, receipt.root().includes('38.2'), JSON.stringify(receipt.root()));
+
+  const localReceipt = runGuest(surface.bundle, surface.url, {
+    locale: 'en',
+    rate: { ...RATE, running: null, lastTurn: { ...LAST_TURN, split: { totalMs: 48_000, readMs: 20_000, waitMs: 6_000, writeMs: 13_000, toolMs: 9_000 } } },
+  });
+  await settle();
+  const localReply = findLine(localReceipt.rootEl, 'Last reply');
+  check(
+    `${surface.name}: a local reply has a reading slice`,
+    localReply !== null && findByClass(localReply, 'v').textContent === '48s · mostly reading'
+      && findByClass(localReply, 'sub').textContent.startsWith('20s reading'),
+    JSON.stringify(localReply && localReply.textContent),
+  );
+
+  // A turn recorded by an older service has no receipt: its speed stands in,
+  // and a split that does not add up is not drawn.
+  for (const [name, split] of [['absent', undefined], ['broken', { ...SPLIT, waitMs: 60_000 }]]) {
+    const old = runGuest(surface.bundle, surface.url, { locale: 'en', rate: { ...RATE, running: null, lastTurn: { ...LAST_TURN, split } } });
+    await settle();
+    const oldLine = findLine(old.rootEl, 'Last reply');
+    check(
+      `${surface.name}: an ${name} receipt falls back to the speed`,
+      oldLine !== null && findByClass(oldLine, 'v').textContent === '38.2 tok/s'
+        && collectByClass(oldLine, 'seg').every((seg) => widthOf(seg) === '0%'),
+      JSON.stringify(oldLine && oldLine.textContent),
+    );
+  }
 
   const busy = runGuest(surface.bundle, surface.url, {
     locale: 'en',
@@ -425,43 +520,63 @@ for (const surface of SURFACES) {
       gauge: {
         mac: { pressure: 'warning', usedBytes: 34 * 1024 ** 3, totalBytes: 48 * 1024 ** 3, swapUsedBytes: 5 * 1024 ** 3, at: Date.now() },
         prompt: { kind: 'primary', total: 1000, cache: 100, processed: 400, timeMs: 4000, observedAt: Date.now() },
-        render: null,
+        render: { state: 'running', startedAt: Date.now() - 30_000, queued: 0, step: { value: 8, max: 20, at: Date.now() } },
         model: { name: 'Qwen3.8-Flash-Next-GSQ-RCO', quant: 'IQ3_XXS', id: 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_XXS', at: Date.now() },
       },
     },
   });
   await settle();
-  const busyText = busy.root();
   check(
-    `${surface.name}: a prompt being read shows its percentage`,
-    busyText.includes('Prompt reading') && busyText.includes('40%'),
-    JSON.stringify(busyText),
+    `${surface.name}: a prompt being read is said in the headline, ahead of a render`,
+    findByClass(busy.rootEl, 'state').textContent === 'reading prompt 40% · 6.0s left',
+    JSON.stringify(findByClass(busy.rootEl, 'state').textContent),
   );
   check(
-    `${surface.name}: the memory fact shows the Mac's memory and swap`,
-    busyText.includes('34.0 / 48.0 GB') && busyText.includes('swap 5.0'),
-    JSON.stringify(busyText),
+    `${surface.name}: the divider fills to the prompt's percentage`,
+    widthOf(findByClass(findByClass(busy.rootEl, 'rule'), 'fill')) === '40%',
+    widthOf(findByClass(findByClass(busy.rootEl, 'rule'), 'fill')),
+  );
+  check(`${surface.name}: a job adds no line`, collectByClass(busy.rootEl, 'row').length === 3);
+  const memoryLine = findLine(busy.rootEl, 'Memory');
+  check(
+    `${surface.name}: the memory line shows the Mac's memory`,
+    memoryLine !== null && findByClass(memoryLine, 'v').textContent === '34.0 / 48.0 GB',
+    JSON.stringify(memoryLine && memoryLine.textContent),
   );
   check(
-    `${surface.name}: the model row names the model the engine holds`,
-    busyText.includes('Model') && busyText.includes('Qwen3.8-Flash-Next-GSQ-RCO') && busyText.includes('IQ3_XXS'),
-    JSON.stringify(busyText),
-  );
-  const modelFact = findFact(busy.rootEl, 'Model');
-  check(
-    `${surface.name}: the model row owns the whole width`,
-    modelFact !== null && String(modelFact.className ?? '').split(/\s+/).includes('full'),
-    JSON.stringify(modelFact && modelFact.className),
+    `${surface.name}: a kernel warning shows on the closed memory line`,
+    memoryLine !== null && memoryLine.className.split(/\s+/).includes('warning'),
+    JSON.stringify(memoryLine && memoryLine.className),
   );
   check(
-    `${surface.name}: the full model identifier stays reachable`,
-    modelFact !== null && modelFact.getAttribute('title') === 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_XXS',
-    JSON.stringify(modelFact && modelFact.getAttribute('title')),
+    `${surface.name}: swap and pressure sit behind the memory line`,
+    memoryLine !== null && memoryLine.textContent.includes('Swap5.0 GB') && memoryLine.textContent.includes('Pressurewarning'),
+    JSON.stringify(memoryLine && memoryLine.textContent),
+  );
+  {
+    findByClass(memoryLine, 'line').click();
+    check(
+      `${surface.name}: an open line keeps its warning`,
+      isOpen(memoryLine) && memoryLine.className.split(/\s+/).includes('warning'),
+      memoryLine.className,
+    );
+  }
+  const modelLine = findLine(busy.rootEl, 'Model');
+  check(
+    `${surface.name}: the model line names the model the engine holds`,
+    modelLine !== null && findByClass(modelLine, 'v').textContent === 'Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS · $0.42',
+    JSON.stringify(modelLine && findByClass(modelLine, 'v').textContent),
+  );
+  check(
+    `${surface.name}: the full model identifier is behind the line, and on the hover`,
+    modelLine !== null && findByClass(modelLine, 'id').textContent === 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_XXS'
+      && modelLine.getAttribute('title') === 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_XXS',
+    JSON.stringify(modelLine && modelLine.getAttribute('title')),
   );
 
-  // A cloud chat: the model in play is the cloud one, and the local engine's
-  // reading waits on the hover. The row must never name the local model as
-  // the one the chat is on.
+  // A cloud chat: the model in play is the cloud one, with what it has cost,
+  // and the local engine's reading waits behind the line. The line itself
+  // must never name the local model as the one the chat is on.
   const cloud = runGuest(surface.bundle, surface.url, {
     locale: 'en',
     rate: {
@@ -476,29 +591,36 @@ for (const surface of SURFACES) {
     },
   });
   await settle();
-  const cloudFact = findFact(cloud.rootEl, 'Model');
+  const cloudLine = findLine(cloud.rootEl, 'Model');
   check(
-    `${surface.name}: a cloud chat names the cloud model`,
-    cloudFact !== null && cloudFact.textContent.includes('MiniMax-M3.1-Flash'),
-    JSON.stringify(cloudFact && cloudFact.textContent),
+    `${surface.name}: a cloud chat names the cloud model and its cost`,
+    cloudLine !== null && findByClass(cloudLine, 'v').textContent === 'MiniMax-M3.1-Flash · $0.42',
+    JSON.stringify(cloudLine && findByClass(cloudLine, 'v').textContent),
   );
   check(
-    `${surface.name}: a cloud chat does not name the local model as its own`,
-    cloudFact !== null && !cloudFact.textContent.includes('Qwen3.8-Flash-Next-GSQ-RCO'),
-    JSON.stringify(cloudFact && cloudFact.textContent),
+    `${surface.name}: the cost has its own entry behind the line`,
+    cloudLine !== null && cloudLine.textContent.includes('Cost this chat$0.42'),
+    JSON.stringify(cloudLine && cloudLine.textContent),
   );
   check(
-    `${surface.name}: the local engine's reading stays on the hover`,
-    cloudFact !== null && String(cloudFact.getAttribute('title') ?? '').includes('the local engine holds Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS'),
-    JSON.stringify(cloudFact && cloudFact.getAttribute('title')),
+    `${surface.name}: the local engine's reading is behind the line, a tap away`,
+    cloudLine !== null && cloudLine.textContent.includes('Engine holdsQwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS')
+      && String(cloudLine.getAttribute('title') ?? '').includes('Engine holds Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS'),
+    JSON.stringify(cloudLine && cloudLine.textContent),
+  );
+  check(
+    `${surface.name}: a cloud chat's identifier is its own, not the engine's`,
+    cloudLine !== null && findByClass(cloudLine, 'id').textContent === 'MiniMax-M3.1-Flash',
+    JSON.stringify(cloudLine && findByClass(cloudLine, 'id').textContent),
   );
 
   // A local chat: the model in play is the one the engine holds, so its
-  // quantization belongs to the name.
+  // quantization belongs to the name. A chat that cost nothing shows no cost.
   const local = runGuest(surface.bundle, surface.url, {
     locale: 'en',
     rate: {
       ...RATE,
+      cache: { ...RATE.cache, cost: 0 },
       gauge: {
         mac: null,
         prompt: null,
@@ -509,11 +631,13 @@ for (const surface of SURFACES) {
     },
   });
   await settle();
-  const localFact = findFact(local.rootEl, 'Model');
+  const localLine = findLine(local.rootEl, 'Model');
   check(
-    `${surface.name}: a local chat names the model with its quantization`,
-    localFact !== null && localFact.textContent.includes('Qwen3.8-Flash-Next-GSQ-RCO') && localFact.textContent.includes('IQ3_XXS'),
-    JSON.stringify(localFact && localFact.textContent),
+    `${surface.name}: a local chat names the model with its quantization and no cost`,
+    localLine !== null && findByClass(localLine, 'v').textContent === 'Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS'
+      && localLine.textContent.includes('Cost this chat—')
+      && localLine.textContent.includes('Engine holdsthis model · IQ3_XXS'),
+    JSON.stringify(localLine && localLine.textContent),
   );
 
   // The page tells the service which model the chat is on. The service needs
@@ -551,11 +675,30 @@ for (const surface of SURFACES) {
     },
   });
   await settle();
-  const renderingText = rendering.root();
+  const renderingState = findByClass(rendering.rootEl, 'state').textContent;
   check(
-    `${surface.name}: a render shows its step and the queue`,
-    renderingText.includes('Render') && renderingText.includes('8 / 20') && renderingText.includes('1 queued'),
-    JSON.stringify(renderingText),
+    `${surface.name}: a render says its step and the queue in the headline`,
+    renderingState.startsWith('render 8 / 20 · ') && renderingState.endsWith(' · 1 queued'),
+    JSON.stringify(renderingState),
+  );
+  check(
+    `${surface.name}: the divider fills to the render's step`,
+    widthOf(findByClass(findByClass(rendering.rootEl, 'rule'), 'fill')) === '40%',
+  );
+  const toolAndRender = runGuest(surface.bundle, surface.url, {
+    locale: 'en',
+    rate: {
+      ...RATE,
+      busy: true,
+      toolActive: true,
+      gauge: { mac: null, prompt: null, render: { state: 'running', startedAt: null, queued: 0, step: null } },
+    },
+  });
+  await settle();
+  check(
+    `${surface.name}: the chat's own state outranks a render`,
+    findByClass(toolAndRender.rootEl, 'state').textContent === 'running tool',
+    JSON.stringify(findByClass(toolAndRender.rootEl, 'state').textContent),
   );
 
   // A page with no chat of its own must never show the prompt a *watched* chat
@@ -566,6 +709,7 @@ for (const surface of SURFACES) {
     locale: 'en',
     rate: {
       ...RATE,
+      lastTurn: LAST_TURN,
       gauge: {
         mac: { pressure: 'normal', usedBytes: 34 * 1024 ** 3, totalBytes: 48 * 1024 ** 3, swapUsedBytes: 0, at: Date.now() },
         prompt: { kind: 'primary', total: 1000, cache: 100, processed: 400, timeMs: 4000, observedAt: Date.now() },
@@ -576,14 +720,25 @@ for (const surface of SURFACES) {
   await settle();
   const noSessionText = noSession.root();
   check(
-    `${surface.name}: a page with no session never shows another chat's gauge readings`,
-    !noSessionText.includes('40%') && !noSessionText.includes('Prompt reading'),
+    `${surface.name}: a page with no session never shows another chat's readings`,
+    !noSessionText.includes('40%') && !noSessionText.includes('reading prompt')
+      && !noSessionText.includes('48s') && !noSessionText.includes('$0.42'),
     JSON.stringify(noSessionText),
   );
   check(
-    `${surface.name}: a page with no session still draws its work fact as a dash`,
-    noSessionText.includes('Work') && noSessionText.includes('—'),
-    JSON.stringify(noSessionText),
+    `${surface.name}: a page with no session leaves the divider empty`,
+    widthOf(findByClass(findByClass(noSession.rootEl, 'rule'), 'fill')) === '0%',
+  );
+
+  // English is the page's own language until the host says otherwise.
+  check(
+    `${surface.name}: the page markup declares English and no leftover font`,
+    /<html lang="en">/.test(fs.readFileSync(path.join(ROOT, 'status/index.html'), 'utf8'))
+      && !fs.readFileSync(path.join(ROOT, 'status/index.html'), 'utf8').includes('YaHei'),
+  );
+  check(
+    `${surface.name}: motion is switched off for a reader who asked for less`,
+    /prefers-reduced-motion: reduce/.test(fs.readFileSync(path.join(ROOT, 'status/index.html'), 'utf8')),
   );
 
   // The section is also mounted with no chat open: the watch must still go out,

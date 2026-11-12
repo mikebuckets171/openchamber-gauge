@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -9,7 +9,7 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   body {
-    font-family: var(--oc-font, system-ui, "Microsoft YaHei", sans-serif);
+    font-family: var(--oc-font, system-ui, sans-serif);
     font-size: 1rem;
     line-height: 1.5;
     color: var(--oc-fg, inherit);
@@ -57,56 +57,84 @@
     text-overflow: ellipsis;
   }
 
-  /* The curve: the last 30 s of generation rate. */
+  /* The curve: the last 30 s of generation rate. Older seconds dim out on the
+     left instead of ending at a hard edge. */
   .sparkrow {
     display: block;
-    margin: .375rem 0 .75rem;
+    margin: .375rem 0 .5rem;
     color: var(--oc-primary, #888);
   }
-  .sparkrow svg { display: block; width: 100%; height: 1.75rem; }
+  .sparkrow svg {
+    display: block;
+    width: 100%;
+    height: 1.75rem;
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 35%);
+    mask-image: linear-gradient(90deg, transparent, #000 35%);
+  }
   .spark-line { stroke: currentColor; }
   .spark-area { fill: currentColor; opacity: .16; }
 
-  /* The facts: a label, its value, and the meters under it. */
-  .facts {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: .625rem .875rem;
-    padding-top: .75rem;
-    border-top: 1px solid color-mix(in srgb, var(--oc-fg, #888) 12%, transparent);
-  }
-  /* A short fact stacks: label above its value. */
-  .fact { display: flex; flex-direction: column; gap: .125rem; min-width: 0; }
-  /* A fact with a long value puts the label beside it: label left, value right. */
-  .fact.wide {
-    grid-column: 1 / -1;
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    align-items: baseline;
-    gap: .125rem .75rem;
-  }
-  /* A fact that owns the whole width stacks: label above value, so a long
-     value such as a model name gets the room it needs. */
-  .fact.full { grid-column: 1 / -1; }
-  .fact .k {
-    font-size: .8125rem;
-    letter-spacing: .03em;
-    text-transform: uppercase;
-    color: var(--oc-muted, #888);
-    white-space: nowrap;
+  /* The divider, which fills while a prompt is read or a render runs. */
+  .rule {
+    height: .125rem;
+    border-radius: .0625rem;
+    background: color-mix(in srgb, var(--oc-fg, #888) 12%, transparent);
     overflow: hidden;
-    text-overflow: ellipsis;
   }
-  .fact .v {
-    font-size: .8125rem;
+  .rule .fill {
+    display: block;
+    height: 100%;
+    width: 0%;
+    background: var(--oc-primary, #6af);
+    transition: width .25s linear;
+  }
+
+  /* The lines: a label and the one value worth a glance. A tap opens the rest. */
+  .rows { padding-top: .125rem; font-size: .8125rem; }
+  .line {
+    display: flex;
+    align-items: center;
+    gap: .75rem;
+    width: 100%;
+    min-height: 2.25rem;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .line:focus-visible { outline: 1px solid var(--oc-focus, #6af); outline-offset: 2px; border-radius: .25rem; }
+  .k { color: var(--oc-muted, #888); white-space: nowrap; flex: none; }
+  .v {
+    flex: 1;
+    min-width: 0;
+    text-align: right;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .fact.wide .v { text-align: right; }
-  .fact.wide .meters { grid-column: 1 / -1; }
-  .meters { display: flex; gap: .375rem; margin-top: .0625rem; }
+  .chev { flex: none; color: var(--oc-muted, #888); transition: transform .18s ease; }
+  .row.open .chev { transform: rotate(90deg); }
+  .row.warning .line .v { color: var(--oc-warning, #fb0); }
+  .row.critical .line .v { color: var(--oc-error, #f66); }
+
+  /* What is behind a line. It slides open; closed, it takes no room. */
+  .det { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .18s ease; }
+  .row.open .det { grid-template-rows: 1fr; }
+  .in { min-height: 0; overflow: hidden; visibility: hidden; transition: visibility 0s .18s; }
+  .row.open .in { visibility: visible; transition-delay: 0s; padding-bottom: .5rem; }
+  .item { display: flex; align-items: baseline; gap: .75rem; line-height: 1.6; }
+  /* A long value, such as another model's name, takes a second line instead of being cut. */
+  .item.wrap .v { white-space: normal; overflow-wrap: anywhere; }
+  .sub { color: var(--oc-muted, #888); font-size: .75rem; line-height: 1.5; }
+  .sub.id { overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
+
+  .meters { display: flex; gap: .375rem; margin: .25rem 0; }
   .meter {
     display: block;
     flex: 1;
@@ -115,18 +143,39 @@
     background: var(--oc-subtle, #3a3a3a);
     overflow: hidden;
   }
-  .meter i {
+  .meter .fill {
     display: block;
     height: 100%;
     width: 0%;
     background: var(--oc-primary, #6af);
     border-radius: .15625rem;
   }
-  .fact.active .meter i { background: var(--oc-primary, #6af); }
-  .fact.warning .meter i { background: var(--oc-warning, #fb0); }
-  .fact.warning .v { color: var(--oc-warning, #fb0); }
-  .fact.critical .meter i { background: var(--oc-error, #f66); }
-  .fact.critical .v { color: var(--oc-error, #f66); }
+  .row.warning .meter .fill { background: var(--oc-warning, #fb0); }
+  .row.critical .meter .fill { background: var(--oc-error, #f66); }
+
+  /* The receipt: the reply's time, cut into reading, waiting, writing, tools. */
+  .segs {
+    display: flex;
+    height: .3125rem;
+    margin: .125rem 0 .25rem;
+    border-radius: .15625rem;
+    background: var(--oc-subtle, #3a3a3a);
+    overflow: hidden;
+  }
+  .seg {
+    display: block;
+    height: 100%;
+    width: 0%;
+    background: var(--oc-primary, #6af);
+    transition: width .5s ease;
+  }
+  .seg.read { opacity: .6; }
+  .seg.wait { opacity: .25; }
+  .seg.tool { opacity: .45; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
 </style>
 </head>
 <body>

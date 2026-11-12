@@ -1,8 +1,8 @@
 // What Gauge adds to the speed service: the Mac's memory, the prompt a local
-// Splash chat is reading, and a ComfyUI render. Each is a passive read; nothing
+// Splash chat is reading, a ComfyUI render, and the model the engine holds. Each is a passive read; nothing
 // here sends inference, starts a render or changes a setting.
 //
-// The three readers only run while a Work Status section is asking (`noteDemand`,
+// The readers only run while a Work Status section is asking (`noteDemand`,
 // called from `/rate`). The speed measurement next door keeps counting in the
 // background either way; these readings are only worth taking while visible.
 import { execFile } from 'node:child_process';
@@ -161,6 +161,57 @@ export const readProgressEntries = (dir: string, now: number): Array<PromptReadi
   return out;
 };
 
+/**
+ * How long each chat has spent reading prompts since its last finished turn.
+ *
+ * A reply's receipt wants the reading as its own slice. Splash reports the
+ * prefill time of the prompt it is reading; a turn can read several, so the
+ * finished ones are added up and the running one counts at its latest value.
+ * Readings are only taken while a page is looking, so a turn nobody watched
+ * has no reading slice and that time stays in the wait.
+ */
+type ReadRecord = { doneMs: number; curMs: number; skipMs: number; processed: number; total: number; at: number };
+const reads = new Map<string, ReadRecord>();
+const READS_CAP = 64;
+
+export const noteRead = (entry: PromptReading & { sessionKey: string }): void => {
+  const key = `${entry.sessionKey}:${entry.kind}`;
+  const record = reads.get(key);
+  if (!record) {
+    if (reads.size >= READS_CAP) reads.delete(reads.keys().next().value as string);
+    reads.set(key, { doneMs: 0, curMs: entry.timeMs, skipMs: 0, processed: entry.processed, total: entry.total, at: entry.observedAt });
+    return;
+  }
+  if (entry.observedAt <= record.at) return;
+  // Another prompt: its counters started over.
+  if (entry.total !== record.total || entry.processed < record.processed || entry.timeMs < record.curMs) {
+    record.doneMs += Math.max(0, record.curMs - record.skipMs);
+    record.skipMs = 0;
+    record.curMs = entry.timeMs;
+  } else {
+    record.curMs = Math.max(record.curMs, entry.timeMs);
+  }
+  record.processed = entry.processed;
+  record.total = entry.total;
+  record.at = entry.observedAt;
+};
+
+/** The reading time these sessions gathered, handed over once: the next turn starts from zero. */
+export const takeReadMs = (sessionIds: string[]): number => {
+  let sum = 0;
+  for (const id of sessionIds) {
+    const prefix = `${sessionKey(id)}:`;
+    for (const [key, record] of reads) {
+      if (!key.startsWith(prefix)) continue;
+      sum += record.doneMs + Math.max(0, record.curMs - record.skipMs);
+      record.doneMs = 0;
+      // The same entry stays on disk until it expires; do not count it twice.
+      record.skipMs = record.curMs;
+    }
+  }
+  return sum;
+};
+
 let progressCache: { at: number; entries: Array<PromptReading & { sessionKey: string }> } | null = null;
 
 /** The newest prompt being read by one of these sessions (the chat and its subagents), or null. */
@@ -168,6 +219,7 @@ const promptFor = (sessionIds: string[], now: number): PromptReading | null => {
   if (sessionIds.length === 0) return null;
   if (!progressCache || now - progressCache.at >= PROGRESS_EVERY_MS) {
     progressCache = { at: now, entries: readProgressEntries(PROGRESS_DIR, now) };
+    for (const entry of progressCache.entries) noteRead(entry);
   }
   const keys = new Set(sessionIds.map(sessionKey));
   let best: PromptReading | null = null;
@@ -193,7 +245,7 @@ export type RenderReading = {
   step: { value: number; max: number; at: number } | null;
 };
 
-/** The headless server Michael's scripts start (18188), ComfyUI's default (8188), Comfy Desktop (8000). */
+/** A headless server on 18188, ComfyUI's default (8188), Comfy Desktop (8000). */
 const COMFY_ORIGINS = (process.env.GAUGE_COMFY_URL || 'http://127.0.0.1:18188,http://127.0.0.1:8188,http://127.0.0.1:8000')
   .split(',')
   .map((value) => value.trim())
@@ -559,7 +611,7 @@ export type GaugeWire = {
   model: ModelReading | null;
 };
 
-/** A page is looking: keep the three readers warm. Never awaits; answers from the last reading. */
+/** A page is looking: keep the readers warm. Never awaits; answers from the last reading. */
 export const noteDemand = (now: number): void => {
   demandAt = now;
   if (!mac || now - mac.at >= MAC_EVERY_MS) void sampleMac();

@@ -16,6 +16,16 @@ var modelDisplayName = (id) => {
   return last.replace(/-GGUF$/i, "");
 };
 
+// shared/receipt.ts
+var whole = (value) => typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+var splitTurn = (input) => {
+  const writeMs = whole(input.writeMs);
+  const totalMs = Math.max(whole(input.totalMs), writeMs);
+  const toolMs = Math.min(whole(input.toolMs), totalMs - writeMs);
+  const readMs = Math.min(whole(input.readMs), totalMs - writeMs - toolMs);
+  return { totalMs, readMs, waitMs: totalMs - writeMs - toolMs - readMs, writeMs, toolMs };
+};
+
 // shared/tokens.ts
 var CHARS_DIV_4 = 4;
 var CHARS_DIV_3 = 3;
@@ -221,12 +231,52 @@ var readProgressEntries = (dir, now) => {
   }
   return out;
 };
+var reads = new Map;
+var READS_CAP = 64;
+var noteRead = (entry) => {
+  const key = `${entry.sessionKey}:${entry.kind}`;
+  const record = reads.get(key);
+  if (!record) {
+    if (reads.size >= READS_CAP)
+      reads.delete(reads.keys().next().value);
+    reads.set(key, { doneMs: 0, curMs: entry.timeMs, skipMs: 0, processed: entry.processed, total: entry.total, at: entry.observedAt });
+    return;
+  }
+  if (entry.observedAt <= record.at)
+    return;
+  if (entry.total !== record.total || entry.processed < record.processed || entry.timeMs < record.curMs) {
+    record.doneMs += Math.max(0, record.curMs - record.skipMs);
+    record.skipMs = 0;
+    record.curMs = entry.timeMs;
+  } else {
+    record.curMs = Math.max(record.curMs, entry.timeMs);
+  }
+  record.processed = entry.processed;
+  record.total = entry.total;
+  record.at = entry.observedAt;
+};
+var takeReadMs = (sessionIds) => {
+  let sum = 0;
+  for (const id of sessionIds) {
+    const prefix = `${sessionKey(id)}:`;
+    for (const [key, record] of reads) {
+      if (!key.startsWith(prefix))
+        continue;
+      sum += record.doneMs + Math.max(0, record.curMs - record.skipMs);
+      record.doneMs = 0;
+      record.skipMs = record.curMs;
+    }
+  }
+  return sum;
+};
 var progressCache = null;
 var promptFor = (sessionIds, now) => {
   if (sessionIds.length === 0)
     return null;
   if (!progressCache || now - progressCache.at >= PROGRESS_EVERY_MS) {
     progressCache = { at: now, entries: readProgressEntries(PROGRESS_DIR, now) };
+    for (const entry of progressCache.entries)
+      noteRead(entry);
   }
   const keys = new Set(sessionIds.map(sessionKey));
   let best = null;
@@ -1347,6 +1397,15 @@ var snapshotTurnCache = () => {
     return null;
   return { hit, miss, steps, output, hitRate: cacheRate(hit, miss) };
 };
+var turnSplit = (now, writeMs) => {
+  const started = turnExecAt ?? turnStartedAt;
+  return splitTurn({
+    totalMs: started !== null ? now - started - turnWaitMs : 0,
+    writeMs,
+    toolMs: turnToolMs,
+    readMs: takeReadMs(sessionIdsFor(activeSessionId))
+  });
+};
 var finalizeTurn = (now) => {
   noteWaiting(now);
   noteTools(now);
@@ -1363,7 +1422,8 @@ var finalizeTurn = (now) => {
       ttftMs: sum.ttftMs,
       hasReasoning: turnReasoningChars > 0 || [...steps2.values()].some((s) => s.reasoning > 0),
       endedAt: now,
-      cache: turnCache
+      cache: turnCache,
+      split: turnSplit(now, sum.netMs)
     };
     turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
     if (turns.length > TURNS_CAP)
@@ -1392,7 +1452,8 @@ var finalizeTurn = (now) => {
     ttftMs: turnTtftMs(),
     hasReasoning: turnReasoningChars > 0,
     endedAt: now,
-    cache: turnCache
+    cache: turnCache,
+    split: turnSplit(now, activeMs)
   };
   turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
   if (turns.length > TURNS_CAP)

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0
+
+- A shorter section: the headline, the curve and three lines (`Last reply`,
+  `Model`, `Memory`). A tap on a line opens what is behind it, one line at a
+  time, so everything is reachable on a phone, where there is no hover. This
+  replaces the grid of always-drawn facts; the section now grows while a line
+  is open.
+- The reply's receipt: how long the last reply took and what most of that was
+  (`48s · mostly writing`), with a bar behind the line that cuts the reply
+  into reading, waiting, writing and tools. The reading slice needs a local
+  Splash chat and an open Work Status panel while the prompt is read.
+- What a cloud chat has cost, beside the model's name. It was already counted
+  and never shown. A provider that reports no cost shows a dash.
+- Prompt reading and renders are said in the headline instead of on a line of
+  their own, and the divider under the curve fills as they progress. A chat's
+  own state outranks a render.
+- Motion, each once and none of it under reduced motion: the headline number
+  glides to a new value, a line slides open, the reply bar fills in when a
+  reply ends, and the curve dims out on the left.
+- Clean-up: the page no longer starts in Chinese before the host answers or
+  asks for a Windows font, labels are no longer in capitals, and the manifest
+  reserves the height the section actually has.
+
 ## 0.3.0
 
 - The model row now names the model the chat is on, not the one the local

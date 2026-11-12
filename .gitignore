@@ -3,3 +3,5 @@ node_modules/
 # still shows numbers. Never tracked — a git install must stay clean.
 .gauge-state.json
 .gauge-state.json.*.tmp
+# OpenChamber's own working files (screenshots from its browser panel).
+.openchamber/
