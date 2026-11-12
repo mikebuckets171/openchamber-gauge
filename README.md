@@ -14,17 +14,19 @@ one value worth a glance; a tap opens what is behind it, one line at a time.
 
 | | |
 |---|---|
-| headline | the running turn's average speed, greyed when nothing is arriving. The state sits on the right: `running tool`, `waiting for permission`, the prompt a local Splash chat is reading (`reading prompt 40% · 6s left`), or the ComfyUI render running now (`render 8 / 20 · 30s · 1 queued`) |
-| curve | the last 30 s of generation rate, one point per 1.25 s, dimming out on the left |
+| headline | the running turn's average speed, greyed and labelled `Last reply` when nothing is arriving. The state sits on the right: `running tool`, `waiting for permission`, the prompt a local Splash chat is reading (`reading prompt 40% · 6s left`), `compacting` while the chat rewrites its own history, or the ComfyUI render running now (`render 8 / 20 · 30s · 1 queued`). A watched chat with nothing to report says `no reply yet`, and a dot is coloured only while tokens are arriving |
+| curve | the last 30 s of generation rate, one point per 1.25 s, dimming out on the left. While there is nothing to draw the band closes up |
 | divider | the line under the curve fills while a prompt is read or a render runs |
 | `Last reply` | how long the reply took and what most of that was (`48s · mostly writing`). Behind it: the receipt, a bar cut into `reading`, `waiting`, `writing` and `tools` that add up to the whole reply; the speed (`measured` when the provider reported token counts, `estimated` otherwise); and the time to the first word |
 | `Model` | the model the chat is on and what the chat has cost (`MiniMax-M3.1-Flash · $0.42`), or `Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS` when the local engine holds it. Behind it: the cost, the cache hit rate of the last settled step and of the whole conversation, the model the local engine holds, and the full identifier |
 | `Memory` | the Mac's memory in use and the total; amber at a kernel warning, red at a critical level. Behind it: the meter, the swap in use and the pressure level |
 
 A reading that is missing is a dash. A job never adds a line: it is said in the
-headline. Nothing needs a mouse; the hover text is a duplicate of what a tap
-shows. Motion (the number gliding, a line sliding open, the reply bar filling
-in once) is switched off when the system asks for reduced motion.
+headline. A notice too long for the headline is read in full in the curve's
+spot. A turn longer than a minute is read as minutes (`2m 5s`). Nothing needs a
+mouse; the hover text is a duplicate of what a tap shows. Motion (the number
+gliding, a line sliding open, the reply bar filling in once) is switched off
+when the system asks for reduced motion.
 
 ## What it needs
 
@@ -122,6 +124,11 @@ sections**.
 npm test          # smoke, regressions, page smoke, cache and the OpenCode plugin
 bun test service  # the parsers behind the readings, and the receipt's arithmetic
 ```
+
+`node scripts/preview.mjs <file.html>` writes a scratch page that draws the
+section's own CSS around the markup the page builds, for checking a layout
+change in a browser without OpenChamber. It is a development aid: nothing in
+the shipped section uses it.
 
 ## Credits and licence
 

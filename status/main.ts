@@ -149,6 +149,8 @@ const COPY = {
     speed: '速度',
     firstWord: '首字',
     reading: '读取提示',
+    compacting: '正在整理上下文',
+    noReplyYet: '尚无回复',
     render: '渲染',
     queued: '排队',
     left: '剩余',
@@ -189,6 +191,8 @@ const COPY = {
     speed: 'Speed',
     firstWord: 'First word',
     reading: 'reading prompt',
+    compacting: 'compacting',
+    noReplyYet: 'no reply yet',
     render: 'render',
     queued: 'queued',
     left: 'left',
@@ -272,8 +276,10 @@ const hero = el('div', 'hero');
 const dot = el('span', 'dot');
 const valueEl = el('span', 'value', '—');
 const unitEl = el('span', 'unit');
+const captionEl = el('span', 'cap');
+captionEl.hidden = true;
 const stateEl = el('span', 'state');
-hero.append(dot, valueEl, unitEl, stateEl);
+hero.append(dot, valueEl, unitEl, captionEl, stateEl);
 
 const sparkEl = el('div', 'sparkrow');
 const sparkParts = makeSparkSvg(SPARK_W, SPARK_H);
@@ -285,6 +291,11 @@ for (const path of [sparkParts.line, sparkParts.area]) {
   path.setAttribute('vector-effect', 'non-scaling-stroke');
 }
 sparkEl.append(sparkParts.svg);
+
+// What a notice too long for the headline says, in the curve's spot: the whole
+// sentence, wrapped, instead of an ellipsis next to the number.
+const noticeEl = el('div', 'notice');
+noticeEl.hidden = true;
 
 // The divider under the curve doubles as the progress bar of the job in the
 // headline: it fills while a prompt is read or a render runs.
@@ -394,6 +405,15 @@ lineReply.detail.append(segs, receiptCaption, itemSpeed.root, itemFirst.root);
 // Model: the model in play and what the chat has cost. Behind it, the cost on
 // its own, the cache hit rates, the local engine's reading and the full name.
 const lineModel = makeLine('model');
+// The model value is built from parts so an over-long name is what gives way:
+// the quantization and the cost at its end stay readable.
+const modelParts = [el('span', 'part'), el('span', 'part keep'), el('span', 'part keep')];
+const modelJoiners = [el('span', 'join', ' · '), el('span', 'join', ' · ')];
+// The parts are the whole value: the dash makeLine put there is cleared so a
+// stale one cannot sit in front of them.
+lineModel.value.textContent = '';
+lineModel.value.className = 'v pieces';
+lineModel.value.append(modelParts[0], modelJoiners[0], modelParts[1], modelJoiners[1], modelParts[2]);
 const itemCost = makeItem();
 const itemCache = makeItem();
 const cacheMeters = makeMeters(2);
@@ -419,10 +439,15 @@ const formatTps = (tps: number): string => {
   return tps >= 100 ? tps.toFixed(0) : tps.toFixed(1);
 };
 
+/** A turn of several minutes reads as minutes, not as two or three hundred seconds. */
 const formatSecs = (ms: number | null): string => {
   if (ms === null || !Number.isFinite(ms)) return '—';
   const s = ms / 1000;
-  return s >= 10 ? `${s.toFixed(0)}s` : `${s.toFixed(1)}s`;
+  if (s < 60) return s >= 10 ? `${s.toFixed(0)}s` : `${s.toFixed(1)}s`;
+  const whole = Math.round(s);
+  const mins = Math.floor(whole / 60);
+  const secs = whole % 60;
+  return secs === 0 ? `${mins}m` : `${mins}m ${secs}s`;
 };
 
 const formatGb = (bytes: number | null | undefined): string => {
@@ -556,6 +581,22 @@ const setState = (text: string): void => {
   stateEl.hidden = text.length === 0;
 };
 
+/** `Last reply` beside a grey headline number, so a kept value never reads as live. */
+const setCaption = (text: string): void => {
+  captionEl.textContent = text;
+  captionEl.hidden = text.length === 0;
+};
+
+/**
+ * A notice too long for the headline is read in full in the curve's spot,
+ * which has nothing to draw while the notice stands.
+ */
+const showNotice = (text: string): void => {
+  noticeEl.textContent = text;
+  noticeEl.hidden = text.length === 0;
+  sparkEl.className = text.length > 0 ? 'sparkrow tight' : 'sparkrow';
+};
+
 /**
  * The heavy job running now, as the headline says it and as the divider fills:
  * the prompt a local chat is reading, or a ComfyUI render.
@@ -570,7 +611,10 @@ const jobFrom = (gauge: GaugeWire | null | undefined): Job | null => {
     // prefill time so far. No rate, no estimate.
     const perMs = prompt.timeMs > 0 ? prompt.processed / prompt.timeMs : 0;
     const leftMs = perMs > 0 ? (prompt.total - prompt.processed) / perMs : null;
-    const parts = [`${copy.reading} ${percent.toFixed(0)}%`];
+    // Compaction is the one reading the user can name: the chat is rewriting
+    // its own history, not merely starting to answer.
+    const label = prompt.kind === 'compaction' ? copy.compacting : copy.reading;
+    const parts = [`${label} ${percent.toFixed(0)}%`];
     if (leftMs !== null) parts.push(`${formatSecs(leftMs)} ${copy.left}`);
     return { kind: 'prompt', text: parts.join(' · '), percent };
   }
@@ -693,17 +737,31 @@ const paintModel = (gauge: GaugeWire | null | undefined, info: CacheInfo | null 
     ? [copy.thisModel, loaded!.quant, ageText].filter(Boolean).join(' · ')
     : engineValue;
 
+  const writeParts = (parts: string[]): void => {
+    // A joiner is said only between two parts it has: one whose following
+    // part is not drawn takes its ` · ` with it.
+    modelJoiners.forEach((joiner, i) => {
+      joiner.textContent = parts[i + 1] === undefined ? '' : ' · ';
+    });
+    modelParts.forEach((node, i) => {
+      node.textContent = parts[i] ?? '';
+      node.hidden = parts[i] === undefined;
+    });
+  };
+
   if (!chat && !loaded) {
-    lineModel.value.textContent = cost === '—' ? '—' : cost;
+    writeParts([cost]);
     modelId.textContent = '';
     modelId.hidden = true;
     lineModel.root.removeAttribute('title');
     return;
   }
+  // The name first: on a narrow panel the ellipsis lands on the name, and the
+  // quantization or the cost that follows stays whole.
   const parts: string[] = [chat ? chat.name : loaded!.name];
   if ((same || !chat) && loaded!.quant) parts.push(loaded!.quant);
   if (cost !== '—') parts.push(cost);
-  lineModel.value.textContent = parts.join(' · ');
+  writeParts(parts);
   // The full identifier is behind the line for a tap, and on the hover for a mouse.
   const id = chat ? chat.id : loaded!.id;
   modelId.textContent = id;
@@ -738,15 +796,18 @@ const paintMemory = (gauge: GaugeWire | null | undefined): void => {
 
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
   if (!rate) {
-    dot.className = 'dot';
+    dot.className = 'dot idle';
     setHero(null);
+    setCaption('');
     valueEl.className = 'value';
     setState(notice ?? copy.connecting);
+    showNotice('');
     ruleFill.style.width = '0%';
     paintReply(null);
     paintModel(null, null);
     paintMemory(null);
     dropSpark();
+    sparkMoving = false;
     fitHeight();
     return;
   }
@@ -755,31 +816,42 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     dot.className = 'dot wait';
     // A network failure is a wrong address, not a bad response: name the
     // condition rather than leak the runtime's `fetch failed`.
-    setState(
-      rate.errorKind === 'network' ? copy.unreachable : (rate.error ?? copy.reconnecting),
-    );
+    if (rate.errorKind === 'network') {
+      showNotice(copy.unreachable);
+    } else {
+      setState(copy.reconnecting);
+      showNotice(rate.error ?? copy.reconnecting);
+    }
   } else if (rate.connection !== 'live') {
-    dot.className = 'dot';
+    dot.className = 'dot idle';
     setState(copy.connecting);
+    showNotice('');
   } else if (rate.waiting === 'permission') {
     dot.className = 'dot wait';
     setState(copy.waitingPermission);
+    showNotice('');
   } else if (rate.waiting === 'question') {
     dot.className = 'dot wait';
     setState(copy.waitingQuestion);
+    showNotice('');
   } else if (job?.kind === 'prompt') {
     // The chat is waiting on this, so it outranks everything but a question.
     dot.className = 'dot live';
     setState(job.text);
+    showNotice('');
   } else if (rate.toolActive) {
     dot.className = 'dot live';
     setState(copy.toolRunning);
+    showNotice('');
   } else {
     // "generating" and "idle" say nothing the dot and the headline do not
     // already say. A render is the Mac's job, not the chat's, so it is said
-    // only when the chat has nothing of its own to say.
-    dot.className = rate.busy ? 'dot live' : 'dot';
-    setState(job ? job.text : '');
+    // only when the chat has nothing of its own to say. A watched chat with
+    // nothing to report says so once, instead of a row of dashes.
+    dot.className = rate.busy ? 'dot live' : 'dot idle';
+    const empty = !rate.busy && !rate.toolActive && !job && !rate.lastTurn && rate.sessionId !== null;
+    setState(job ? job.text : (empty ? copy.noReplyYet : ''));
+    showNotice('');
   }
   ruleFill.style.width = barWidth(job?.percent);
 
@@ -791,21 +863,27 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   const hasValue = Number.isFinite(shown) && shown > 0;
   setHero(hasValue ? shown : null);
   // Grey whenever tokens are not arriving, so the number does not read as a
-  // live rate next to a curve that has already decayed towards zero.
+  // live rate next to a curve that has already decayed towards zero — and
+  // named, so a kept value is plainly the last reply's.
   valueEl.className = hasValue && !streaming ? 'value stale' : 'value';
+  setCaption(hasValue && !streaming && rate.lastTurn ? copy.lastReply : '');
 
   // The curve is owned by the service: it survives iframe remounts and
   // session switches, and is a rolling rate window rather than turn history.
   // An empty curve means the answer belongs to no session, so nothing is drawn
-  // rather than the previous session's shape being left on screen.
+  // rather than the previous session's shape being left on screen. A band with
+  // nothing to draw closes up, so an idle section is shorter.
   const nextFrame = sparkFrameFrom(rate);
   const moving = nextFrame.values.some((value) => value > 0.05);
   if (nextFrame.values.length === 0) {
     dropSpark();
     sparkMoving = false;
+    sparkNeedsStatic = false;
+    if (noticeEl.hidden) sparkEl.className = 'sparkrow tight';
   } else {
     sparkFrame = nextFrame;
     sparkFrameAt = performance.now();
+    sparkEl.className = 'sparkrow';
     // A nonzero curve keeps panning at any time; all zeros flatten once and
     // then hold, so a quiet session shows no motion at all.
     sparkNeedsStatic = sparkMoving && !moving;
@@ -816,7 +894,13 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   paintModel(rate.gauge, rate.cache);
   paintMemory(rate.gauge);
 
-  if (notice) setState(notice);
+  // A caller-supplied notice is the loudest thing on screen: the whole line
+  // when it is short, otherwise the curve's spot.
+  if (notice) {
+    const short = notice.length <= 28;
+    setState(short ? notice : '');
+    showNotice(short ? '' : notice);
+  }
   fitHeight();
 };
 
@@ -914,8 +998,11 @@ const configure = async (sessionId: string | null): Promise<void> => {
 };
 
 const mount = (): void => {
-  root.append(hero, sparkEl, rule, rows);
+  root.append(hero, sparkEl, noticeEl, rule, rows);
   unitEl.textContent = copy.unit;
+  // Nothing has been polled yet, so the band starts closed and opens with the
+  // first curve, instead of a blank gap filling the section's first frame.
+  sparkEl.className = 'sparkrow tight';
   if (!heightReported) {
     heightReported = true;
     // Real height follows content via fitHeight() on every render.

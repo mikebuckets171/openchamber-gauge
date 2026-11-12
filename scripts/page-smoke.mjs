@@ -730,6 +730,112 @@ for (const surface of SURFACES) {
     widthOf(findByClass(findByClass(noSession.rootEl, 'rule'), 'fill')) === '0%',
   );
 
+  // The section adjusts itself to what there is to show: the curve's band
+  // closes when there is nothing to draw, a notice too long for the headline is
+  // read in full there, and an idle number is named.
+  {
+    const idle = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { ...RATE, gauge: null, cache: null, running: null, curve: [], lastTurn: null },
+    });
+    await settle();
+    const idleDot = findByClass(idle.rootEl, 'dot');
+    check(
+      `${surface.name}: an idle section closes the curve's band`,
+      String(findByClass(idle.rootEl, 'sparkrow').className).split(/\s+/).includes('tight'),
+      idleDot && idleDot.className,
+    );
+    check(
+      `${surface.name}: an idle dot is quiet, not lit`,
+      String(idleDot.className).split(/\s+/).includes('idle'),
+      idleDot.className,
+    );
+    check(
+      `${surface.name}: a watched chat with no reply says so once`,
+      findByClass(idle.rootEl, 'state').textContent === 'no reply yet',
+      JSON.stringify(findByClass(idle.rootEl, 'state').textContent),
+    );
+    check(
+      `${surface.name}: a chat that is reading a prompt is not called empty`,
+      findByClass(busy.rootEl, 'state').textContent.includes('reading prompt')
+        && !findByClass(busy.rootEl, 'state').textContent.includes('no reply yet'),
+      JSON.stringify(findByClass(busy.rootEl, 'state').textContent),
+    );
+
+    const written = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { ...RATE, gauge: null, cache: null, running: null, curve: [12, 14, 11], lastTurn: LAST_TURN },
+    });
+    await settle();
+    check(
+      `${surface.name}: a curve older than the window still keeps its band open`,
+      !String(findByClass(written.rootEl, 'sparkrow').className).split(/\s+/).includes('tight'),
+      findByClass(written.rootEl, 'sparkrow').className,
+    );
+    const writtenValue = findByClass(written.rootEl, 'value');
+    check(
+      `${surface.name}: a kept number is grey and named as the last reply's`,
+      writtenValue.className.includes('stale')
+        && findByClass(written.rootEl, 'cap').textContent === 'Last reply',
+      `${writtenValue.className} / ${findByClass(written.rootEl, 'cap').textContent}`,
+    );
+    check(
+      `${surface.name}: a running rate carries no such label`,
+      String(findByClass(direct.rootEl, 'cap').hidden) === 'true',
+      JSON.stringify(findByClass(direct.rootEl, 'cap').textContent),
+    );
+
+    const longError = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { connection: 'error', error: 'Allow the local service in Settings → Extensions', errorKind: 'http', sessionId: null, busy: false, waiting: null, toolActive: false, live: { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 }, running: null, curve: [], turn: { active: false, ttftMs: null }, lastTurn: null, cache: null, eventsSeen: 0 },
+    });
+    await settle();
+    check(
+      `${surface.name}: a long notice is read in full in the curve's spot`,
+      findByClass(longError.rootEl, 'notice').textContent === 'Allow the local service in Settings → Extensions'
+        && String(findByClass(longError.rootEl, 'notice').hidden) === 'false',
+      JSON.stringify(findByClass(longError.rootEl, 'notice').textContent),
+    );
+    const longState = findByClass(longError.rootEl, 'state');
+    check(
+      `${surface.name}: the headline keeps a short state beside the number`,
+      String(longState.hidden) === 'true' || longState.textContent.length <= 28,
+      JSON.stringify(longState.textContent),
+    );
+
+    const compact = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { ...RATE, gauge: { prompt: { kind: 'compaction', total: 1000, cache: 100, processed: 400, timeMs: 4000, observedAt: Date.now() } } },
+    });
+    await settle();
+    check(
+      `${surface.name}: a compaction read is named in the headline`,
+      findByClass(compact.rootEl, 'state').textContent.startsWith('compacting 40%')
+        && String(findByClass(compact.rootEl, 'sparkrow').className).split(/\s+/).includes('tight'),
+      JSON.stringify(findByClass(compact.rootEl, 'state').textContent),
+    );
+
+    // A turn of several minutes is read as minutes, in the line and in the receipt.
+    const longTurn = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: {
+        ...RATE,
+        running: null,
+        turn: { active: false, ttftMs: null },
+        lastTurn: { ...LAST_TURN, wallMs: 125_000, ttftMs: 61_000, split: { totalMs: 125_000, readMs: 0, waitMs: 5_000, writeMs: 120_000, toolMs: 0 } },
+      },
+    });
+    await settle();
+    const longLine = findLine(longTurn.rootEl, 'Last reply');
+    check(
+      `${surface.name}: a long reply reads as minutes`,
+      longLine !== null && findByClass(longLine, 'v').textContent === '2m 5s · mostly writing'
+        && findByClass(longLine, 'sub').textContent === '5.0s waiting · 2m writing'
+        && longLine.textContent.includes('First word1m 1s'),
+      JSON.stringify(longLine && longLine.textContent),
+    );
+  }
+
   // English is the page's own language until the host says otherwise.
   check(
     `${surface.name}: the page markup declares English and no leftover font`,

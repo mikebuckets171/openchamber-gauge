@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.0
+
+- The section carries its own icon: the Work Status header draws a dial with
+  its needle off idle. It used to fall back to OpenChamber's generic
+  four-squares glyph, because the app has no built-in icon named `gauge`.
+- A shorter idle section: while there is nothing to draw, the curve's band
+  closes up instead of leaving a blank strip, and it opens again when a reply
+  starts.
+- The number says what it is: an idle headline is greyed *and* labelled
+  `Last reply`, and its dot is coloured only while tokens are arriving.
+- A watched chat with nothing to report says `no reply yet` once, in the
+  headline, rather than a row of dashes.
+- A turn longer than a minute reads as minutes: `2m 5s`, not `250s` — in the
+  reply line, the receipt and the time left of a prompt read.
+- The prompt reading is called `compacting` when the chat is rewriting its own
+  history.
+- A long notice (an unapproved local service, an unreachable stream) is read
+  in full in the curve's spot, wrapped over its own lines, instead of being
+  cut off beside the number.
+- A too-long model name is what gives way: the line keeps its quantization and
+  its cost, which the ellipsis used to eat.
+
 ## 0.4.0
 
 - A shorter section: the headline, the curve and three lines (`Last reply`,

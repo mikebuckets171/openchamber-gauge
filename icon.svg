@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true">
+  <!-- A dial with its needle lifted off idle: a filled half-disc with the
+       needle cut out of it, so it still reads as a gauge at glyph size.
+       Filled shapes, so the host paints it in its own text colour. -->
+  <path fill="currentColor" fill-rule="evenodd" d="M4 16A8 8 0 0 1 20 16ZM12.9 15.6L16.6 9.9L17.6 11.1L13.6 16.4Z"/>
+</svg>

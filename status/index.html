@@ -38,6 +38,8 @@
   }
   .dot.live { background: var(--oc-primary, #888); animation: pulse 1s ease-in-out infinite; }
   .dot.wait { background: transparent; border: 1px solid var(--oc-primary, #888); }
+  /* Colour means tokens are arriving. Idle gets a quiet dot. */
+  .dot.idle { background: var(--oc-muted, #888); opacity: .55; }
   @keyframes pulse { 50% { opacity: .35; } }
   .value {
     font-size: 1.75rem;
@@ -48,6 +50,8 @@
   }
   .value.stale { color: var(--oc-muted, #888); }
   .unit { color: var(--oc-muted, #888); font-size: .8125rem; }
+  /* Says so when the number is the last reply's, not a live rate. */
+  .cap { color: var(--oc-muted, #888); font-size: .75rem; white-space: nowrap; }
   .state {
     margin-left: auto;
     color: var(--oc-muted, #888);
@@ -63,6 +67,19 @@
     display: block;
     margin: .375rem 0 .5rem;
     color: var(--oc-primary, #888);
+    /* Collapsed, the band takes no room: its height and margins slide shut.
+       A frameless curve already draws nothing, so only the space moves. */
+    max-height: 1.75rem;
+    transition: max-height .18s ease, margin .18s ease;
+  }
+  .sparkrow.tight { max-height: 0; margin-top: 0; margin-bottom: 0; }
+  /* A notice too long for the headline is read here, in full, on its own lines. */
+  .notice {
+    color: var(--oc-muted, #888);
+    font-size: .8125rem;
+    line-height: 1.45;
+    margin: .375rem 0 .5rem;
+    text-wrap: pretty;
   }
   .sparkrow svg {
     display: block;
@@ -118,6 +135,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* A value made of parts: the name gives way first, the readings at its end
+     are never what gets cut. The joiner keeps the text the same as before. */
+  .v.pieces { display: flex; align-items: baseline; gap: 0; white-space: nowrap; }
+  .v.pieces .part { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .v.pieces .part.keep { flex: none; }
+  .v.pieces .join { flex: none; padding: 0 .2rem; }
   .chev { flex: none; color: var(--oc-muted, #888); transition: transform .18s ease; }
   .row.open .chev { transform: rotate(90deg); }
   .row.warning .line .v { color: var(--oc-warning, #fb0); }
