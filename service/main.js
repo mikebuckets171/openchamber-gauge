@@ -6,6 +6,16 @@ import path3 from "node:path";
 import { execFile as execFile2 } from "node:child_process";
 import { promisify as promisify2 } from "node:util";
 
+// shared/models.ts
+var modelDisplayName = (id) => {
+  const trimmed = id.trim();
+  if (!trimmed)
+    return "";
+  const withoutQuant = trimmed.split(":")[0] ?? "";
+  const last = withoutQuant.slice(withoutQuant.lastIndexOf("/") + 1);
+  return last.replace(/-GGUF$/i, "");
+};
+
 // shared/tokens.ts
 var CHARS_DIV_4 = 4;
 var CHARS_DIV_3 = 3;
@@ -818,6 +828,7 @@ var partChars = new Map;
 var deltaParts = new Set;
 var deltaToolCalls = new Set;
 var messageChars = new Map;
+var chatModel = null;
 var watch = null;
 var connection = "idle";
 var lastError = null;
@@ -880,6 +891,7 @@ var TRACKED_CAP = SESSIONS_CAP;
 var createSessionState = (sessionId) => ({
   sessionId,
   currentModel: "*",
+  chatModel: null,
   lastSeenAt: Date.now(),
   samples: [],
   partChars: new Map,
@@ -949,6 +961,7 @@ var loadState = (state) => {
   activeSessionId = state.sessionId || null;
   inSession = true;
   currentModel = state.currentModel;
+  chatModel = state.chatModel;
   samples = state.samples;
   partChars = state.partChars;
   deltaParts = state.deltaParts;
@@ -987,6 +1000,7 @@ var leaveSession = () => {
     return;
   const state = activeSession;
   state.currentModel = currentModel;
+  state.chatModel = chatModel;
   state.lastSeenAt = Date.now();
   state.samples = samples;
   state.partChars = partChars;
@@ -2315,7 +2329,9 @@ var applyWatch = (next) => {
   watch = next;
   if (next.sessionId) {
     watched.add(next.sessionId);
-    trackSession(next.sessionId);
+    const state = trackSession(next.sessionId);
+    if (next.model)
+      state.chatModel = next.model;
   }
   if (!originChanged)
     return false;
@@ -2408,6 +2424,12 @@ var handleSessionEvent = (body) => {
     flushPersist();
   return true;
 };
+var chatModelReading = () => {
+  const id = chatModel || (currentModel !== "*" ? currentModel : null);
+  if (!id)
+    return null;
+  return { id, name: modelDisplayName(id) };
+};
 var server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     json(res, 401, { error: "unauthorized" });
@@ -2433,8 +2455,9 @@ var server = http.createServer((req, res) => {
       }
       const origin = hinted === "" ? null : hinted;
       const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId : null;
+      const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : null;
       const fresh = sessionId !== null && !watched.has(sessionId);
-      const changed = applyWatch({ origin, sessionId }) || fresh;
+      const changed = applyWatch({ origin, sessionId, model }) || fresh;
       json(res, 200, { ok: true, changed, connection, sessionId });
     }).catch((error) => {
       json(res, 400, { error: error instanceof Error ? error.message : "Invalid request" });
@@ -2503,7 +2526,7 @@ var server = http.createServer((req, res) => {
         },
         lastTurn,
         cache: cacheWire(cache),
-        gauge: gaugeWire(sessionIdsFor(requested), now),
+        gauge: { ...gaugeWire(sessionIdsFor(requested), now), chatModel: chatModelReading() },
         eventsSeen
       };
     } finally {

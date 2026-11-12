@@ -443,13 +443,13 @@ for (const surface of SURFACES) {
     JSON.stringify(busyText),
   );
   check(
-    `${surface.name}: the loaded model is named with its quantization`,
-    busyText.includes('Loaded model') && busyText.includes('Qwen3.8-Flash-Next-GSQ-RCO') && busyText.includes('IQ3_XXS'),
+    `${surface.name}: the model row names the model the engine holds`,
+    busyText.includes('Model') && busyText.includes('Qwen3.8-Flash-Next-GSQ-RCO') && busyText.includes('IQ3_XXS'),
     JSON.stringify(busyText),
   );
-  const modelFact = findFact(busy.rootEl, 'Loaded model');
+  const modelFact = findFact(busy.rootEl, 'Model');
   check(
-    `${surface.name}: the loaded model row owns the whole width`,
+    `${surface.name}: the model row owns the whole width`,
     modelFact !== null && String(modelFact.className ?? '').split(/\s+/).includes('full'),
     JSON.stringify(modelFact && modelFact.className),
   );
@@ -457,6 +457,86 @@ for (const surface of SURFACES) {
     `${surface.name}: the full model identifier stays reachable`,
     modelFact !== null && modelFact.getAttribute('title') === 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_XXS',
     JSON.stringify(modelFact && modelFact.getAttribute('title')),
+  );
+
+  // A cloud chat: the model in play is the cloud one, and the local engine's
+  // reading waits on the hover. The row must never name the local model as
+  // the one the chat is on.
+  const cloud = runGuest(surface.bundle, surface.url, {
+    locale: 'en',
+    rate: {
+      ...RATE,
+      gauge: {
+        mac: null,
+        prompt: null,
+        render: null,
+        model: { name: 'Qwen3.8-Flash-Next-GSQ-RCO', quant: 'IQ3_XXS', id: 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_XXS', at: Date.now() },
+        chatModel: { id: 'MiniMax-M3.1-Flash', name: 'MiniMax-M3.1-Flash' },
+      },
+    },
+  });
+  await settle();
+  const cloudFact = findFact(cloud.rootEl, 'Model');
+  check(
+    `${surface.name}: a cloud chat names the cloud model`,
+    cloudFact !== null && cloudFact.textContent.includes('MiniMax-M3.1-Flash'),
+    JSON.stringify(cloudFact && cloudFact.textContent),
+  );
+  check(
+    `${surface.name}: a cloud chat does not name the local model as its own`,
+    cloudFact !== null && !cloudFact.textContent.includes('Qwen3.8-Flash-Next-GSQ-RCO'),
+    JSON.stringify(cloudFact && cloudFact.textContent),
+  );
+  check(
+    `${surface.name}: the local engine's reading stays on the hover`,
+    cloudFact !== null && String(cloudFact.getAttribute('title') ?? '').includes('the local engine holds Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS'),
+    JSON.stringify(cloudFact && cloudFact.getAttribute('title')),
+  );
+
+  // A local chat: the model in play is the one the engine holds, so its
+  // quantization belongs to the name.
+  const local = runGuest(surface.bundle, surface.url, {
+    locale: 'en',
+    rate: {
+      ...RATE,
+      gauge: {
+        mac: null,
+        prompt: null,
+        render: null,
+        model: { name: 'Qwen3.8-Flash-Next-GSQ-RCO', quant: 'IQ3_XXS', id: 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_XXS', at: Date.now() },
+        chatModel: { id: 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF', name: 'Qwen3.8-Flash-Next-GSQ-RCO' },
+      },
+    },
+  });
+  await settle();
+  const localFact = findFact(local.rootEl, 'Model');
+  check(
+    `${surface.name}: a local chat names the model with its quantization`,
+    localFact !== null && localFact.textContent.includes('Qwen3.8-Flash-Next-GSQ-RCO') && localFact.textContent.includes('IQ3_XXS'),
+    JSON.stringify(localFact && localFact.textContent),
+  );
+
+  // The page tells the service which model the chat is on. The service needs
+  // it to say which model is in play, which is not the model the engine holds.
+  const withModel = runGuest(surface.bundle, surface.url, {
+    locale: 'en',
+    session: { id: SESSION, title: 'page smoke', busy: false, model: 'MiniMax-M3.1-Flash' },
+  });
+  await settle();
+  const watchBody = withModel.posted
+    .filter((message) => message && message.type === 'service-request' && message.payload?.path === '/watch')
+    .map((message) => {
+      try {
+        return JSON.parse(message.payload.body);
+      } catch {
+        return null;
+      }
+    })
+    .find(Boolean);
+  check(
+    `${surface.name}: the watch carries the chat's model`,
+    watchBody && watchBody.model === 'MiniMax-M3.1-Flash',
+    JSON.stringify(watchBody),
   );
 
   const rendering = runGuest(surface.bundle, surface.url, {

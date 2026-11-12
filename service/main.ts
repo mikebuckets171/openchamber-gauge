@@ -24,6 +24,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { modelDisplayName } from '../shared/models';
 import { tokensFromChars } from '../shared/tokens';
 import { passwordAuthHeaders, trustedClientOrigin } from './auth';
 import { gaugeWire, noteDemand } from './gauge';
@@ -193,6 +194,14 @@ type WatchConfig = {
    */
   origin: string | null;
   sessionId: string | null;
+  /**
+   * The model the chat has selected, as the page knows it.
+   *
+   * It is the model in play, which is not the model the local engine holds: a
+   * cloud chat runs on a cloud model while the Mac keeps a local one in
+   * memory. The page sends it with every watch.
+   */
+  model: string | null;
 };
 
 /** The finished turn's average rate, shown after the session goes idle. */
@@ -550,6 +559,13 @@ let deltaParts = new Set<string>();
 let deltaToolCalls = new Set<string>();
 /** Characters seen per assistant message id. */
 let messageChars = new Map<string, number>();
+/**
+ * The model the watched session's chat is using, as the page reported it.
+ *
+ * Mirrored like the rest of the session register: the page sets it through
+ * `/watch`, and `/rate` reads it for the session it answers about.
+ */
+let chatModel: string | null = null;
 
 let watch: WatchConfig | null = null;
 let connection: ConnectionState = 'idle';
@@ -694,6 +710,14 @@ type SessionState = {
   sessionId: string;
   /** Model behind this session's turn, kept apart from the others' models. */
   currentModel: string;
+  /**
+   * The model this session's chat is using, as the status page reports it.
+   *
+   * `currentModel` is what the last step actually ran; this is what the chat
+   * has selected, which is known before the first step and survives a restart
+   * of the service. The page sends it with `/watch`.
+   */
+  chatModel: string | null;
   /** Last time this record was touched; drives the tracked-session cap. */
   lastSeenAt: number;
   samples: Sample[];
@@ -763,6 +787,7 @@ const TRACKED_CAP = SESSIONS_CAP;
 const createSessionState = (sessionId: string): SessionState => ({
   sessionId,
   currentModel: '*',
+  chatModel: null,
   lastSeenAt: Date.now(),
   samples: [],
   partChars: new Map(),
@@ -835,6 +860,7 @@ const loadState = (state: SessionState): void => {
   activeSessionId = state.sessionId || null;
   inSession = true;
   currentModel = state.currentModel;
+  chatModel = state.chatModel;
   samples = state.samples;
   partChars = state.partChars;
   deltaParts = state.deltaParts;
@@ -880,6 +906,7 @@ const leaveSession = (): void => {
   if (!inSession) return;
   const state = activeSession;
   state.currentModel = currentModel;
+  state.chatModel = chatModel;
   state.lastSeenAt = Date.now();
   state.samples = samples;
   state.partChars = partChars;
@@ -2566,7 +2593,10 @@ const applyWatch = (next: WatchConfig): boolean => {
   watch = next;
   if (next.sessionId) {
     watched.add(next.sessionId);
-    trackSession(next.sessionId);
+    const state = trackSession(next.sessionId);
+    // A page that names no model keeps the one it named last: the row then
+    // still says which model the chat is on.
+    if (next.model) state.chatModel = next.model;
   }
   if (!originChanged) return false;
   retryDelay = RETRY_BASE_MS;
@@ -2657,6 +2687,19 @@ const handleSessionEvent = (body: unknown): boolean => {
   return true;
 };
 
+/**
+ * The model in play for the session this answer is about.
+ *
+ * The page names the model the chat has selected; the step events name the
+ * model that actually ran. The page wins, because that is the model the chat
+ * is on now, and the step is the fallback for a page that names nothing.
+ */
+const chatModelReading = (): { id: string; name: string } | null => {
+  const id = chatModel || (currentModel !== '*' ? currentModel : null);
+  if (!id) return null;
+  return { id, name: modelDisplayName(id) };
+};
+
 const server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     json(res, 401, { error: 'unauthorized' });
@@ -2672,7 +2715,7 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/watch' && req.method === 'POST') {
     void readJsonBody(req).then((raw) => {
-      const body = (raw && typeof raw === 'object' ? raw : {}) as { origin?: unknown; sessionId?: unknown };
+      const body = (raw && typeof raw === 'object' ? raw : {}) as { origin?: unknown; sessionId?: unknown; model?: unknown };
       // A relay surface has no origin to report: its document is a srcDoc and
       // its location is `about:srcdoc`. An absent/empty origin is therefore
       // valid, and the service finds the server on this machine itself. A
@@ -2689,11 +2732,15 @@ const server = http.createServer((req, res) => {
       }
       const origin = hinted === '' ? null : hinted;
       const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId : null;
+      // The model the chat has selected. It is a name, not a credential: it
+      // is kept so the panel can say which model is in play, and never leaves
+      // this machine.
+      const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : null;
       // `changed` still means "you were not already set up for this": a new
       // session counts, an origin switch counts, a repeat does not. It no
       // longer implies the stream was rebuilt — only an origin change does.
       const fresh = sessionId !== null && !watched.has(sessionId);
-      const changed = applyWatch({ origin, sessionId }) || fresh;
+      const changed = applyWatch({ origin, sessionId, model }) || fresh;
       json(res, 200, { ok: true, changed, connection, sessionId });
     }).catch((error: unknown) => {
       json(res, 400, { error: error instanceof Error ? error.message : 'Invalid request' });
@@ -2783,8 +2830,10 @@ const server = http.createServer((req, res) => {
         // sub-sessions; null until a step settles.
         cache: cacheWire(cache),
         // Gauge's own readings: Mac memory, the prompt this chat is reading and
-        // a ComfyUI render. Each is null when there is nothing to show.
-        gauge: gaugeWire(sessionIdsFor(requested), now),
+        // a ComfyUI render. Each is null when there is nothing to show. The
+        // chat's own model rides with them: it is the model in play, which is
+        // not the model the local engine holds.
+        gauge: { ...gaugeWire(sessionIdsFor(requested), now), chatModel: chatModelReading() },
         eventsSeen,
       };
     } finally {

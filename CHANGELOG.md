@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- The model row now names the model the chat is on, not the one the local
+  engine happens to hold. A cloud chat says `MiniMax-M3.1-Flash`; a local one
+  says `Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS`, with the quantization when the
+  engine holds that very model. The local engine's own reading stays on the
+  hover, so nothing is lost and nothing is misread.
+- The chat's model is taken from the session the status page watches, with the
+  model the steps actually ran as the fallback. Two names of one model are
+  recognized without a table of provider names.
+
 ## 0.2.0
 
 - A `Loaded model` fact: the model the local engine holds in memory, read from

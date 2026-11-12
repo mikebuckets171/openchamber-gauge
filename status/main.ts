@@ -1,5 +1,6 @@
 import { connectHost, HostRequestError } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
+import { sameModelId } from '../shared/models';
 import { clearSpark as clearSparkPaths, drawSpark, makeSparkSvg, nextScale, type SparkFrame } from '../shared/spark';
 
 type Live = {
@@ -78,6 +79,17 @@ type GaugeWire = {
     id: string;
     at: number;
   } | null;
+  /**
+   * The model the chat itself is on, as the page knows it.
+   *
+   * This is the model in play: a cloud chat is on a cloud model while the Mac
+   * keeps a local one in memory, so the row names this one and keeps the
+   * engine's own reading for the hover.
+   */
+  chatModel: {
+    id: string;
+    name: string;
+  } | null;
 };
 
 type RateResponse = {
@@ -109,7 +121,7 @@ type RateResponse = {
   eventsSeen: number;
 };
 
-type HostSession = { id: string; title: string; busy: boolean } | null;
+type HostSession = { id: string; title: string; busy: boolean; model?: string } | null;
 
 const COPY = {
   zh: {
@@ -138,7 +150,8 @@ const COPY = {
     cacheHit: '缓存命中',
     step: '单步',
     total: '累计',
-    loadedModel: '已载模型',
+    model: '模型',
+    engineHolds: '本地引擎载有',
     ago: '前',
   },
   en: {
@@ -167,7 +180,8 @@ const COPY = {
     cacheHit: 'Cache hit',
     step: 'step',
     total: 'total',
-    loadedModel: 'Loaded model',
+    model: 'Model',
+    engineHolds: 'the local engine holds',
     ago: 'ago',
   },
 } as const;
@@ -427,26 +441,48 @@ const paintWork = (gauge: GaugeWire | null | undefined): void => {
 };
 
 /**
- * The loaded model: what the local engine holds in memory right now, which is
- * not always the model the chat is talking to. A reading that grew old is
- * labelled with its age instead of being dropped.
+ * The model fact: the model in play, and the local engine's own reading.
+ *
+ * The row never names a model the chat is not using. When the local engine
+ * holds the very model the chat is on, its quantization is part of the name
+ * and the reading's age is shown; when the engine holds another one, that
+ * reading waits on the hover.
  */
 const paintModel = (gauge: GaugeWire | null | undefined): void => {
+  const chat = gauge?.chatModel ?? null;
   const loaded = gauge?.model ?? null;
-  factModel.label.textContent = copy.loadedModel;
-  if (!loaded) {
+  factModel.label.textContent = copy.model;
+  if (!chat && !loaded) {
     factModel.value.textContent = '—';
     factModel.root.removeAttribute('title');
     factModel.root.className = 'fact full';
     return;
   }
-  const parts = [loaded.name];
-  if (loaded.quant) parts.push(loaded.quant);
-  const age = Date.now() - loaded.at;
-  if (age > 10_000) parts.push(`${Math.round(age / 1000)}s ${copy.ago}`);
+  // The engine holds the chat's model when the two identifiers name one model.
+  const same = !!(chat && loaded && sameModelId(chat.id, loaded.id));
+  const parts: string[] = [];
+  if (chat) parts.push(chat.name);
+  else parts.push(loaded!.name);
+  if (chat && same) {
+    if (loaded!.quant) parts.push(loaded!.quant);
+  } else if (!chat && loaded!.quant) {
+    parts.push(loaded!.quant);
+  }
+  // How old the engine's reading is. It belongs to the engine, so it is shown
+  // with the engine's own model, and kept for the hover when the row names
+  // the chat's model instead.
+  const age = loaded ? Date.now() - loaded.at : 0;
+  const ageText = age > 10_000 ? `${Math.round(age / 1000)}s ${copy.ago}` : '';
+  if (ageText && (!chat || same)) parts.push(ageText);
   factModel.value.textContent = parts.join(' · ');
-  // The full identifier stays reachable when the name has to be cut short.
-  factModel.root.setAttribute('title', loaded.id);
+  // The full identifiers stay reachable when the name has to be cut short.
+  const engineText = loaded
+    ? `${copy.engineHolds} ${loaded.name}${loaded.quant ? ' · ' + loaded.quant : ''}${ageText ? ' · ' + ageText : ''}`
+    : '';
+  const title = chat
+    ? [chat.id, engineText].filter(Boolean).join(' · ')
+    : loaded!.id;
+  factModel.root.setAttribute('title', title);
   factModel.root.className = 'fact full';
 };
 
@@ -653,14 +689,17 @@ const poll = async (): Promise<void> => {
 };
 
 const configure = async (sessionId: string | null): Promise<void> => {
-  const key = `${origin ?? ''}|${sessionId ?? ''}`;
+  // The model the chat is on rides with the watch: the service needs it to
+  // say which model is in play, which is not the model the local engine holds.
+  const model = session?.model ?? null;
+  const key = `${origin ?? ''}|${sessionId ?? ''}|${model ?? ''}`;
   if (key === configuredKey || configuring) return;
   configuring = true;
   try {
     await host.serviceRequest({
       method: 'POST',
       path: '/watch',
-      body: JSON.stringify(origin ? { origin, sessionId } : { sessionId }),
+      body: JSON.stringify({ ...(origin ? { origin } : {}), sessionId, model }),
     });
     configuredKey = key;
   } catch (error) {
@@ -696,7 +735,7 @@ const mount = (): void => {
 host.onReady((next) => {
   copy = next.locale.toLowerCase().startsWith('zh') ? COPY.zh : COPY.en;
   applyHostReady(next, document.documentElement);
-  session = next.session ? { id: next.session.id, title: next.session.title, busy: next.session.busy } : null;
+  session = next.session ? { id: next.session.id, title: next.session.title, busy: next.session.busy, model: next.session.model } : null;
   origin = resolveOrigin();
   unitEl.textContent = copy.unit;
   if (!mounted) {
@@ -708,6 +747,6 @@ host.onReady((next) => {
 });
 
 host.onSession((next) => {
-  session = next ? { id: next.id, title: next.title, busy: next.busy } : null;
+  session = next ? { id: next.id, title: next.title, busy: next.busy, model: next.model } : null;
   void configure(session?.id ?? null);
 });
