@@ -45,6 +45,8 @@ class El {
     this._text = '';
     this.hidden = false;
     this.attrs = {};
+    // The width the headline's state slot has, when the harness gives it one.
+    this._slotWidth = 0;
   }
   append(...nodes) { for (const node of nodes) this.children.push(node); }
   appendChild(node) { this.children.push(node); return node; }
@@ -82,6 +84,21 @@ class El {
     };
     walk(this);
     return 150 + open * 80;
+  }
+  /**
+   * A layout small enough for the page's own fit check: the headline's state
+   * slot has the width the harness gives it, and a text wants about as much
+   * room as it has characters (a full-width one counts double).
+   */
+  get clientWidth() {
+    return String(this.className).split(/\s+/).includes('state') ? this._slotWidth : 0;
+  }
+  get scrollWidth() {
+    const units = [...this._text].reduce(
+      (n, ch) => n + (/[\u2e80-\u9fff\uff00-\uffef]/.test(ch) ? 2 : 1),
+      0,
+    );
+    return units * 7;
   }
   set textContent(value) { this._text = String(value); this.children = []; }
   get textContent() { return this._text + this.children.map((child) => child.textContent).join(''); }
@@ -150,7 +167,7 @@ const RATE = {
 };
 
 /** Run one built bundle in a fake frame and collect what it posts to its host. */
-const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE, locale = 'zh', serviceDenied = false } = {}) => {
+const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE, locale = 'zh', serviceDenied = false, slotWidth = 0 } = {}) => {
   const source = fs.readFileSync(path.join(ROOT, bundle), 'utf8');
   const posted = [];
   const listeners = [];
@@ -241,6 +258,15 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
       theme: { mode: 'dark', tokens: TOKENS },
     },
   });
+
+  // The headline's state slot is as wide as the harness says it is: the page
+  // measures it to decide whether a wording fits there or is read in full
+  // below. Zero means the frame has no layout, and the page falls back to the
+  // count of characters.
+  if (slotWidth > 0) {
+    const state = findByClass(root, 'state');
+    if (state) state._slotWidth = slotWidth;
+  }
 
   // Answer the page the way the host proxy would. `/watch` is accepted without
   // an origin: that is what a relay surface has to send.
@@ -895,6 +921,57 @@ for (const surface of SURFACES) {
         && findByClass(longLine, 'sub').textContent === '5.0s waiting · 2m writing'
         && longLine.textContent.includes('First word1m 1s'),
       JSON.stringify(longLine && longLine.textContent),
+    );
+
+    // The number names itself only when it is really the last reply's. A turn
+    // that is running shows its own average, so it is not called the last
+    // reply's.
+    const pausedTurn = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: {
+        ...RATE,
+        busy: true,
+        live: { ...RATE.live, tps: 0 },
+        running: { tps: 38.6, source: 'estimate', tokens: 100, durationMs: 1000 },
+        lastTurn: LAST_TURN,
+      },
+    });
+    await settle();
+    check(
+      `${surface.name}: a running turn's number is not named as the last reply's`,
+      String(findByClass(pausedTurn.rootEl, 'cap').hidden) === 'true'
+        && findByClass(pausedTurn.rootEl, 'value').className.includes('stale'),
+      `${findByClass(pausedTurn.rootEl, 'value').className} / ${findByClass(pausedTurn.rootEl, 'cap').textContent}`,
+    );
+
+    // The headline's slot is narrow: a wording that does not fit there whole
+    // is read in full in the curve's spot instead of being cut off.
+    const promptState = {
+      ...RATE,
+      busy: true,
+      running: { tps: 38.6, source: 'estimate', tokens: 100, durationMs: 1000 },
+      gauge: {
+        mac: { pressure: 'normal', usedBytes: 34 * 1024 ** 3, totalBytes: 48 * 1024 ** 3, swapUsedBytes: 0, at: Date.now() },
+        prompt: { kind: 'primary', total: 1000, cache: 100, processed: 400, timeMs: 4000, observedAt: Date.now() },
+        render: null,
+      },
+    };
+    const narrow = runGuest(surface.bundle, surface.url, { locale: 'en', slotWidth: 100, rate: promptState });
+    await settle();
+    check(
+      `${surface.name}: a state that does not fit the headline is read in full below`,
+      findByClass(narrow.rootEl, 'notice').textContent === 'reading prompt 40% · 6.0s left'
+        && String(findByClass(narrow.rootEl, 'notice').hidden) === 'false'
+        && findByClass(narrow.rootEl, 'state').textContent === '',
+      JSON.stringify(findByClass(narrow.rootEl, 'notice').textContent),
+    );
+    const wide = runGuest(surface.bundle, surface.url, { locale: 'en', slotWidth: 300, rate: promptState });
+    await settle();
+    check(
+      `${surface.name}: a state that fits the headline stays in the headline`,
+      findByClass(wide.rootEl, 'state').textContent === 'reading prompt 40% · 6.0s left'
+        && String(findByClass(wide.rootEl, 'notice').hidden) === 'true',
+      JSON.stringify(findByClass(wide.rootEl, 'state').textContent),
     );
   }
 

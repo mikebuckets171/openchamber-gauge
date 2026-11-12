@@ -1,11 +1,13 @@
 // Scratch harness (not part of the package): mount the real built status page
 // in frames, answer like a host, and let a headless browser photograph it.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
-const OUT = process.argv[2] || '/private/var/folders/c9/xrbndp2n5w121gcl9ths4k_h0000gn/T/opencode/gauge-preview.html';
+const OUT = process.argv[2] || path.join(os.tmpdir(), 'gauge-preview.html');
 
 const DARK = { mode: 'dark', tokens: { background: '#101114', elevated: '#1b1d21', foreground: '#f4f4f5', muted: '#9a9aa0', subtle: '#2a2c31', border: '#3a3d42', hover: '#3a3a3a', active: '#4a4a4a', selection: '#555', selectionForeground: '#fff', focus: '#6af', primary: '#6af', primaryForeground: '#08111a', primaryText: '#cfe3ff', successText: '#4ade80', warningText: '#eab308', errorText: '#f87171', infoText: '#60a5fa', success: '#4ade80', warning: '#eab308', error: '#f87171', info: '#60a5fa', font: 'system-ui', mono: 'ui-monospace', radius: '9px' } };
 const LIGHT = { ...DARK, mode: 'light', tokens: { ...DARK.tokens, background: '#fbfbfc', elevated: '#f2f2f4', foreground: '#18181b', muted: '#6b7280', subtle: '#e5e7eb', border: '#d4d4d8', primary: '#b42318' } };

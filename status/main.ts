@@ -600,14 +600,47 @@ const showNotice = (text: string): void => {
   sparkEl.className = text.length > 0 ? 'sparkrow tight' : 'sparkrow';
 };
 
+/** A notice this long or shorter is a label; a longer one is a sentence. */
+const NOTICE_MAX = 28;
+
 /**
- * Where a notice belongs. A short one fits beside the number; a long one is
- * read in full in the curve's spot, which is also what clears the state the
- * headline no longer carries.
+ * Whether the headline's state slot can hold this text whole.
+ *
+ * The slot is narrow and the room it has depends on the number and the
+ * caption beside it, so the fit is measured rather than counted: a wording
+ * that does not fit is read in full in the curve's spot instead of being cut
+ * off with an ellipsis.
+ */
+const fitsState = (text: string): boolean => {
+  // Put the text in the slot and ask the browser how much room it wants.
+  setState(text);
+  const slot = stateEl.clientWidth;
+  // A DOM with no layout (a test harness) has no widths to compare, so there
+  // the caller decides.
+  if (!Number.isFinite(slot) || slot <= 0) return true;
+  return stateEl.scrollWidth <= slot + 1;
+};
+
+/**
+ * Where a state belongs: beside the number when the slot holds it whole, in
+ * the curve's spot when it does not.
+ */
+const placeState = (text: string): void => {
+  if (fitsState(text)) {
+    showNotice('');
+  } else {
+    setState('');
+    showNotice(text);
+  }
+};
+
+/**
+ * Where a notice belongs. A short one is a label and fits beside the number;
+ * a longer one is a sentence, and is read in full in the curve's spot, which
+ * is also what clears the state the headline no longer carries.
  */
 const placeNotice = (text: string): void => {
-  if (text.length <= 28) {
-    setState(text);
+  if (text.length <= NOTICE_MAX && fitsState(text)) {
     showNotice('');
   } else {
     setState('');
@@ -823,8 +856,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     if (notice) {
       placeNotice(notice);
     } else {
-      setState(copy.connecting);
-      showNotice('');
+      placeNotice(copy.connecting);
     }
     ruleFill.style.width = '0%';
     paintReply(null);
@@ -839,58 +871,10 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     return;
   }
   const job = jobFrom(rate.gauge);
-  if (rate.connection === 'error') {
-    dot.className = 'dot wait';
-    // A network failure is a wrong address, not a bad response: name the
-    // condition rather than leak the runtime's `fetch failed`.
-    if (rate.errorKind === 'network') {
-      placeNotice(copy.unreachable);
-    } else if ((rate.error ?? '').length > 28) {
-      // The runtime's own words are rarely short: keep the headline quiet and
-      // read the detail where there is room for it.
-      setState(copy.reconnecting);
-      showNotice(rate.error ?? '');
-    } else {
-      setState(rate.error ?? copy.reconnecting);
-      showNotice('');
-    }
-  } else if (rate.connection !== 'live') {
-    dot.className = 'dot idle';
-    setState(copy.connecting);
-    showNotice('');
-  } else if (rate.waiting === 'permission') {
-    dot.className = 'dot wait';
-    setState(copy.waitingPermission);
-    showNotice('');
-  } else if (rate.waiting === 'question') {
-    dot.className = 'dot wait';
-    setState(copy.waitingQuestion);
-    showNotice('');
-  } else if (job?.kind === 'prompt') {
-    // The chat is waiting on this, so it outranks everything but a question.
-    dot.className = 'dot live';
-    setState(job.text);
-    showNotice('');
-  } else if (rate.toolActive) {
-    dot.className = 'dot live';
-    setState(copy.toolRunning);
-    showNotice('');
-  } else {
-    // "generating" and "idle" say nothing the dot and the headline do not
-    // already say. A render is the Mac's job, not the chat's, so it is said
-    // only when the chat has nothing of its own to say. A watched chat with
-    // nothing to report says so once, instead of a row of dashes.
-    dot.className = rate.busy ? 'dot live' : 'dot idle';
-    const empty = !rate.busy && !rate.toolActive && !job && !rate.lastTurn && rate.sessionId !== null;
-    setState(job ? job.text : (empty ? copy.noReplyYet : ''));
-    showNotice('');
-  }
-  // A caller-supplied notice is the loudest thing on screen: it replaces the
-  // state it displaced, in the headline when it fits and in the curve's spot
-  // when it does not.
-  if (notice) placeNotice(notice);
-  ruleFill.style.width = barWidth(job?.percent);
 
+  // The headline's number, its unit and its caption come first: they decide
+  // how much room the state has beside them, and the state is placed after
+  // them so that fit is judged on the room there really is.
   const live = rate.live.tps;
   const streaming = rate.busy && rate.waiting === null && live > 0.05;
   // Headline is the running turn average: stable across network jitter and
@@ -902,7 +886,56 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   // live rate next to a curve that has already decayed towards zero — and
   // named, so a kept value is plainly the last reply's.
   valueEl.className = hasValue && !streaming ? 'value stale' : 'value';
-  setCaption(hasValue && !streaming && rate.lastTurn ? copy.lastReply : '');
+  // The caption names a kept number: the last reply's own rate. A turn that is
+  // still running shows its own average, which is not the last reply's, so it
+  // is not named as one.
+  const kept = hasValue && !streaming && !rate.running && !!rate.lastTurn;
+  setCaption(kept ? copy.lastReply : '');
+
+  if (rate.connection === 'error') {
+    dot.className = 'dot wait';
+    // A network failure is a wrong address, not a bad response: name the
+    // condition rather than leak the runtime's `fetch failed`.
+    if (rate.errorKind === 'network') {
+      placeNotice(copy.unreachable);
+    } else if ((rate.error ?? '').length > NOTICE_MAX) {
+      // The runtime's own words are rarely short: keep the headline quiet and
+      // read the detail where there is room for it.
+      setState(copy.reconnecting);
+      showNotice(rate.error ?? '');
+    } else {
+      placeNotice(rate.error ?? copy.reconnecting);
+    }
+  } else if (rate.connection !== 'live') {
+    dot.className = 'dot idle';
+    placeState(copy.connecting);
+  } else if (rate.waiting === 'permission') {
+    dot.className = 'dot wait';
+    placeState(copy.waitingPermission);
+  } else if (rate.waiting === 'question') {
+    dot.className = 'dot wait';
+    placeState(copy.waitingQuestion);
+  } else if (job?.kind === 'prompt') {
+    // The chat is waiting on this, so it outranks everything but a question.
+    dot.className = 'dot live';
+    placeState(job.text);
+  } else if (rate.toolActive) {
+    dot.className = 'dot live';
+    placeState(copy.toolRunning);
+  } else {
+    // "generating" and "idle" say nothing the dot and the headline do not
+    // already say. A render is the Mac's job, not the chat's, so it is said
+    // only when the chat has nothing of its own to say. A watched chat with
+    // nothing to report says so once, instead of a row of dashes.
+    dot.className = rate.busy ? 'dot live' : 'dot idle';
+    const empty = !rate.busy && !rate.toolActive && !job && !rate.lastTurn && rate.sessionId !== null;
+    placeState(job ? job.text : (empty ? copy.noReplyYet : ''));
+  }
+  // A caller-supplied notice is the loudest thing on screen: it replaces the
+  // state it displaced, in the headline when it fits and in the curve's spot
+  // when it does not.
+  if (notice) placeNotice(notice);
+  ruleFill.style.width = barWidth(job?.percent);
 
   // The curve is owned by the service: it survives iframe remounts and
   // session switches, and is a rolling rate window rather than turn history.

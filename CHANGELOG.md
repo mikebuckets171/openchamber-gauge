@@ -9,16 +9,19 @@
   closes up instead of leaving a blank strip, and it opens again when a reply
   starts.
 - The number says what it is: an idle headline is greyed *and* labelled
-  `Last reply`, and its dot is coloured only while tokens are arriving.
+  `Last reply`, and the dot goes quiet when the chat has nothing to say.
 - A watched chat with nothing to report says `no reply yet` once, in the
   headline, rather than a row of dashes.
 - A turn longer than a minute reads as minutes: `2m 5s`, not `250s` — in the
   reply line, the receipt and the time left of a prompt read.
 - The prompt reading is called `compacting` when the chat is rewriting its own
   history.
-- A long notice (an unapproved local service, an unreachable stream) is read
-  in full in the curve's spot, wrapped over its own lines, instead of being
-  cut off beside the number.
+- A wording too long for the headline is read in full in the curve's spot,
+  wrapped over its own lines, instead of being cut off beside the number: a
+  notice such as an unapproved local service or an unreachable stream, and a
+  state that does not fit beside the number.
+- The `Last reply` label names only a number that really is the last reply's;
+  a turn that is still running shows its own average.
 - A too-long model name is what gives way: the line keeps its quantization and
   its cost, which the ellipsis used to eat.
 
