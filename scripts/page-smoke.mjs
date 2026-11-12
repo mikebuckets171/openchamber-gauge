@@ -1062,6 +1062,30 @@ for (const surface of SURFACES) {
     );
   }
 
+  // A reply of hours reads in hours, and one that mostly sat on a question or a
+  // permission says whose time that was.
+  {
+    const turn = { tokensPerSecond: 40, source: 'tokens', tokens: 900, ttftMs: 500, hasReasoning: true, endedAt: Date.now() - 5_000 };
+    const hours = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { ...RATE, lastTurn: { ...turn, split: { totalMs: 20_460_000, readMs: 0, waitMs: 60_000, writeMs: 400_000, toolMs: 20_000_000 } } },
+    });
+    await settle();
+    check(`${surface.name}: a reply of hours reads in hours`, hours.root().includes('5h 41m · mostly tools') && !hours.root().includes('341m'), JSON.stringify(hours.root()));
+    const asked = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { ...RATE, lastTurn: { ...turn, askMs: 3_600_000, split: { totalMs: 300_000, readMs: 0, waitMs: 60_000, writeMs: 200_000, toolMs: 40_000 } } },
+    });
+    await settle();
+    check(`${surface.name}: a reply that mostly waited on the person says so`, asked.root().includes('1h 5m · mostly waiting on you') && asked.root().includes('1h waiting on you'), JSON.stringify(asked.root()));
+    const brief = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { ...RATE, lastTurn: { ...turn, askMs: 20_000, split: { totalMs: 300_000, readMs: 0, waitMs: 60_000, writeMs: 200_000, toolMs: 40_000 } } },
+    });
+    await settle();
+    check(`${surface.name}: a short wait on the person stays out of the headline wording`, brief.root().includes('5m · mostly writing'), JSON.stringify(brief.root()));
+  }
+
   // The service tells a page whether this host takes what it posts. Told no, the
   // page asks on every tick; told yes, a reading it has heard is not asked for
   // again while it is fresh.

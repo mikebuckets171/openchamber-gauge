@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.1
+
+- A reply of an hour or more reads in hours: `5h 41m`, not `341m`.
+- Time a permission or a question sat open is timed as the person's. It was
+  never counted as a wait, and a question's own open tool call counted it as
+  tools running, so a reply that sat on a question read `mostly tools`. It is now
+  outside the receipt, listed after it as `waiting on you`, and when it outweighs
+  every slice the line says `mostly waiting on you` over the whole stretch.
+
 ## 1.0.0
 
 - Gauge now runs on OpenChamber's own plumbing for extensions. The manifest says

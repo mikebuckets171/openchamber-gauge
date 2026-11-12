@@ -354,8 +354,12 @@ const freePort = async () => {
   feed.running(['ses_short']);
   feed.emit('session.execution.started', { sessionID: 'ses_short' });
   feed.emit('session.step.started', { sessionID: 'ses_short', assistantMessageID: 'msgShort' });
-  feed.emit('session.text.delta', { sessionID: 'ses_short', assistantMessageID: 'msgShort', ordinal: 0, delta: 'c'.repeat(400) });
-  await sleep(300);
+  // Words arriving over a second, as a reply's do: one burst in one instant is
+  // not a rate anyone could have measured, and is rightly not recorded as one.
+  for (let i = 0; i < 5; i += 1) {
+    feed.emit('session.text.delta', { sessionID: 'ses_short', assistantMessageID: 'msgShort', ordinal: 0, delta: 'c'.repeat(80) });
+    await sleep(200);
+  }
   const midTurn = await svc.rate('ses_short');
   check('the turn is live before the cut', midTurn.busy === true && midTurn.turn.active === true, JSON.stringify({ busy: midTurn.busy, turn: midTurn.turn }));
   const cutAt = Date.now();
@@ -518,6 +522,34 @@ const freePort = async () => {
   feed.cut();
   feed.server.close();
   fs.rmSync(legacy, { force: true });
+}
+
+// --- time a question sat open is the person's, not the tool's ---------------
+// The question tool is an open tool call for as long as the form waits. That
+// stretch used to be counted as tools running, and never as a wait.
+{
+  const feed = await makeFeed();
+  const svc = await startService({ port: await freePort(), dataDir: path.join(root, 'ask-data'), feedUrl: feed.origin });
+  await svc.watch({ sessionId: 'ses_ask' });
+  check('the ask feed attaches', await svc.live());
+  feed.emit('session.execution.started', { sessionID: 'ses_ask' });
+  feed.emit('session.step.started', { sessionID: 'ses_ask', assistantMessageID: 'msgAsk' });
+  feed.emit('session.text.delta', { sessionID: 'ses_ask', assistantMessageID: 'msgAsk', ordinal: 0, delta: 'q'.repeat(200) });
+  await sleep(200);
+  feed.emit('session.tool.called', { sessionID: 'ses_ask', assistantMessageID: 'msgAsk', id: 'toolAsk' });
+  feed.emit('form.created', { form: { id: 'form1', sessionID: 'ses_ask' } });
+  await sleep(1_500);
+  feed.emit('form.replied', { sessionID: 'ses_ask', id: 'form1' });
+  feed.emit('session.tool.success', { sessionID: 'ses_ask', assistantMessageID: 'msgAsk', id: 'toolAsk' });
+  feed.emit('session.step.ended', { sessionID: 'ses_ask', assistantMessageID: 'msgAsk', tokens: { input: 5, output: 50, reasoning: 0 }, cost: 0 });
+  feed.emit('session.execution.succeeded', { sessionID: 'ses_ask' });
+  await sleep(300);
+  const turn = (await svc.rate('ses_ask')).lastTurn;
+  check('the wait on the person is timed', turn?.askMs >= 1_300 && turn?.askMs <= 2_500, JSON.stringify(turn));
+  check('and is neither tool time nor part of the reply', turn?.split?.toolMs < 300 && turn?.split?.totalMs < 1_000, JSON.stringify(turn?.split));
+  await svc.stop();
+  feed.cut();
+  feed.server.close();
 }
 
 // --- what a page may name in a watch -----------------------------------------

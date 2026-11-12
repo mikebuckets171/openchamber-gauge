@@ -80,6 +80,12 @@ panel was open to take the reading; `waiting` is what is left, the model before
 its first word and between steps. A cloud reply has no `reading` slice: that time
 is inside `waiting`.
 
+The time a permission or a question sat open is yours, so it is outside the
+receipt and listed after it as `waiting on you`. When it outweighs every slice,
+the line says so over the whole stretch: `1h 5m · mostly waiting on you`. A
+question's own tool call is not counted as a tool running while the form is
+open.
+
 **The cost** is the sum of what each step's event reported. A provider that
 reports none, such as a local engine or a subscription, shows a dash.
 

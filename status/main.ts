@@ -16,6 +16,8 @@ type TurnResult = {
   endedAt: number;
   /** Where the turn's time went; absent from an older service. */
   split?: TurnSplit;
+  /** Time the turn waited on a person; outside `split`, absent from an older service. */
+  askMs?: number;
 };
 
 type CachePoint = {
@@ -136,6 +138,7 @@ const COPY = {
     inProgress: '进行中',
     lastReply: '上轮',
     mostly: '主要是',
+    askYou: '等你',
     read: '读取提示',
     wait: '等待',
     write: '生成',
@@ -179,6 +182,7 @@ const COPY = {
     inProgress: 'in progress',
     lastReply: 'Last reply',
     mostly: 'mostly',
+    askYou: 'waiting on you',
     read: 'reading',
     wait: 'waiting',
     write: 'writing',
@@ -457,7 +461,10 @@ const formatSecs = (ms: number | null): string => {
   const whole = Math.round(s);
   const mins = Math.floor(whole / 60);
   const secs = whole % 60;
-  return secs === 0 ? `${mins}m` : `${mins}m ${secs}s`;
+  if (mins < 60) return secs === 0 ? `${mins}m` : `${mins}m ${secs}s`;
+  // Past an hour the seconds say nothing: `5h 41m`, not `341m`.
+  const total = Math.round(s / 60);
+  return total % 60 === 0 ? `${Math.floor(total / 60)}h` : `${Math.floor(total / 60)}h ${total % 60}m`;
 };
 
 const formatGb = (bytes: number | null | undefined): string => {
@@ -692,13 +699,22 @@ const paintReply = (rate: RateResponse | null): void => {
 
   if (lt && split) {
     const top = biggestSlice(split);
-    lineReply.value.textContent = top
-      ? `${formatSecs(split.totalMs)} · ${copy.mostly} ${copy[top]}`
-      : formatSecs(split.totalMs);
-    receiptCaption.textContent = SLICES
-      .filter((name) => sliceMs(split, name) >= 50)
-      .map((name) => `${formatSecs(sliceMs(split, name))} ${copy[name]}`)
-      .join(' · ') || '—';
+    // The time a permission or a question sat open is the person's, so it is
+    // outside the receipt; when it outweighs everything in it, the line says so
+    // over the whole stretch instead of blaming the largest slice of the rest.
+    const ask = typeof lt.askMs === 'number' && Number.isFinite(lt.askMs) && lt.askMs >= 1000 ? lt.askMs : 0;
+    const askMost = ask > 0 && (!top || ask > sliceMs(split, top));
+    lineReply.value.textContent = askMost
+      ? `${formatSecs(split.totalMs + ask)} · ${copy.mostly} ${copy.askYou}`
+      : top
+        ? `${formatSecs(split.totalMs)} · ${copy.mostly} ${copy[top]}`
+        : formatSecs(split.totalMs);
+    receiptCaption.textContent = [
+      ...SLICES
+        .filter((name) => sliceMs(split, name) >= 50)
+        .map((name) => `${formatSecs(sliceMs(split, name))} ${copy[name]}`),
+      ...(ask > 0 ? [`${formatSecs(ask)} ${copy.askYou}`] : []),
+    ].join(' · ') || '—';
   } else if (lt) {
     // A turn an older service recorded: its speed is all there is.
     lineReply.value.textContent = `${formatTps(lt.tokensPerSecond)} ${copy.unit}`;

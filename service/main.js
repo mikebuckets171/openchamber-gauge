@@ -1389,13 +1389,17 @@ var noteWaiting = (now) => {
 };
 var toolActive = () => activeToolIds.size > 0;
 var noteTools = (now) => {
-  if (toolActive()) {
+  if (toolActive() && waitingKind() === null) {
     if (toolStartAt === null)
       toolStartAt = now;
   } else if (toolStartAt !== null) {
     turnToolMs += now - toolStartAt;
     toolStartAt = null;
   }
+};
+var noteAsk = (now) => {
+  noteWaiting(now);
+  noteTools(now);
 };
 var stepFor = (messageID, now) => {
   let step = steps2.get(messageID);
@@ -1581,7 +1585,8 @@ var finalizeTurn = (now) => {
       hasReasoning: turnReasoningChars > 0 || [...steps2.values()].some((s) => s.reasoning > 0),
       endedAt: now,
       cache: turnCache,
-      split: turnSplit(now, sum.netMs)
+      split: turnSplit(now, sum.netMs),
+      askMs: Math.round(turnWaitMs)
     };
     schedulePersist();
     clearTurn();
@@ -1607,7 +1612,8 @@ var finalizeTurn = (now) => {
     hasReasoning: turnReasoningChars > 0,
     endedAt: now,
     cache: turnCache,
-    split: turnSplit(now, activeMs)
+    split: turnSplit(now, activeMs),
+    askMs: Math.round(turnWaitMs)
   };
   schedulePersist();
   clearTurn();
@@ -2018,6 +2024,7 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.id);
     if (requestId)
       pendingPermissions.add(requestId);
+    noteAsk(now);
     return;
   }
   if (type === "permission.replied" || type === "permission.v2.replied") {
@@ -2026,6 +2033,7 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.requestID);
     if (requestId)
       pendingPermissions.delete(requestId);
+    noteAsk(now);
     return;
   }
   if (type === "form.created") {
@@ -2035,6 +2043,7 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(form.id);
     if (requestId)
       pendingQuestions.add(requestId);
+    noteAsk(now);
     return;
   }
   if (type === "form.replied" || type === "form.cancelled") {
@@ -2043,6 +2052,7 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.id);
     if (requestId)
       pendingQuestions.delete(requestId);
+    noteAsk(now);
     return;
   }
   if (type === "question.asked" || type === "question.v2.asked") {
@@ -2051,6 +2061,7 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.id);
     if (requestId)
       pendingQuestions.add(requestId);
+    noteAsk(now);
     return;
   }
   if (type === "question.replied" || type === "question.rejected" || type === "question.v2.replied" || type === "question.v2.rejected") {
@@ -2059,6 +2070,7 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.requestID);
     if (requestId)
       pendingQuestions.delete(requestId);
+    noteAsk(now);
     return;
   }
   if (type === "session.status") {

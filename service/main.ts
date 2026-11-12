@@ -186,6 +186,8 @@ type TurnResult = {
   cache: TurnCache | null;
   /** Where the turn's time went; absent from a turn an older service recorded. */
   split?: TurnSplit;
+  /** Time the turn sat waiting on a person (a permission, a question); not part of `split`. */
+  askMs?: number;
 };
 
 type WaitingKind = 'permission' | 'question';
@@ -1154,12 +1156,20 @@ const toolActive = (): boolean => activeToolIds.size > 0;
 
 /** Accumulate tool-execution time this turn. Open while a tool runs. */
 const noteTools = (now: number): void => {
-  if (toolActive()) {
+  // A tool that is open while the chat waits on a person (the question tool is
+  // one) is not running: that stretch is the person's, not the tool's.
+  if (toolActive() && waitingKind() === null) {
     if (toolStartAt === null) toolStartAt = now;
   } else if (toolStartAt !== null) {
     turnToolMs += now - toolStartAt;
     toolStartAt = null;
   }
+};
+
+/** A request to the person opened or closed: both clocks move together. */
+const noteAsk = (now: number): void => {
+  noteWaiting(now);
+  noteTools(now);
 };
 
 /** Get or create this turn's record for an assistant message. */
@@ -1424,6 +1434,7 @@ const finalizeTurn = (now: number): void => {
       endedAt: now,
       cache: turnCache,
       split: turnSplit(now, sum.netMs),
+      askMs: Math.round(turnWaitMs),
     };
     schedulePersist();
     clearTurn();
@@ -1457,6 +1468,7 @@ const finalizeTurn = (now: number): void => {
     endedAt: now,
     cache: turnCache,
     split: turnSplit(now, activeMs),
+    askMs: Math.round(turnWaitMs),
   };
   schedulePersist();
   clearTurn();
@@ -1974,6 +1986,7 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.id);
     if (requestId) pendingPermissions.add(requestId);
+    noteAsk(now);
     return;
   }
 
@@ -1981,6 +1994,7 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.requestID);
     if (requestId) pendingPermissions.delete(requestId);
+    noteAsk(now);
     return;
   }
 
@@ -1990,6 +2004,7 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!form || !isWatchedSession(form.sessionID)) return;
     const requestId = readString(form.id);
     if (requestId) pendingQuestions.add(requestId);
+    noteAsk(now);
     return;
   }
 
@@ -1997,6 +2012,7 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.id);
     if (requestId) pendingQuestions.delete(requestId);
+    noteAsk(now);
     return;
   }
 
@@ -2004,6 +2020,7 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.id);
     if (requestId) pendingQuestions.add(requestId);
+    noteAsk(now);
     return;
   }
 
@@ -2011,6 +2028,7 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.requestID);
     if (requestId) pendingQuestions.delete(requestId);
+    noteAsk(now);
     return;
   }
 
