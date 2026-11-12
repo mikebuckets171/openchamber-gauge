@@ -67,9 +67,11 @@
     display: block;
     margin: .375rem 0 .5rem;
     color: var(--oc-primary, #888);
-    /* Collapsed, the band takes no room: its height and margins slide shut.
-       A frameless curve already draws nothing, so only the space moves. */
+    /* Collapsed, the band takes no room: its height and margins slide shut,
+       and the curve inside is clipped rather than left to overflow onto the
+       lines below. A frameless curve draws nothing, so only the space moves. */
     max-height: 1.75rem;
+    overflow: hidden;
     transition: max-height .18s ease, margin .18s ease;
   }
   .sparkrow.tight { max-height: 0; margin-top: 0; margin-bottom: 0; }
@@ -136,8 +138,9 @@
     text-overflow: ellipsis;
   }
   /* A value made of parts: the name gives way first, the readings at its end
-     are never what gets cut. The joiner keeps the text the same as before. */
-  .v.pieces { display: flex; align-items: baseline; gap: 0; white-space: nowrap; }
+     are never what gets cut. The joiner carries the space, so a short value
+     still ends at the same edge as every other line. */
+  .v.pieces { display: flex; align-items: baseline; justify-content: flex-end; gap: 0; white-space: nowrap; }
   .v.pieces .part { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .v.pieces .part.keep { flex: none; }
   .v.pieces .join { flex: none; padding: 0 .2rem; }

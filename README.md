@@ -130,6 +130,12 @@ section's own CSS around the markup the page builds, for checking a layout
 change in a browser without OpenChamber. It is a development aid: nothing in
 the shipped section uses it.
 
+`node scripts/mount-preview.mjs` goes further: it copies the real built page
+into frames of a fake host that answers the way OpenChamber's proxy does — idle,
+writing, compacting, an empty chat, a refused service — so a headless browser
+photographs what the shipped section really paints, including the parts only a
+real host can trigger. Same development aid, same exemption.
+
 ## Credits and licence
 
 Gauge's speed measurement, its curve, its calibration and its cache accounting

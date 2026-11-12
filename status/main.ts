@@ -517,8 +517,11 @@ const setHero = (target: number | null): void => {
     heroShown = null;
     heroTarget = null;
     valueEl.textContent = '—';
+    // A dash is not a rate, so it does not wear the unit.
+    unitEl.hidden = true;
     return;
   }
+  unitEl.hidden = false;
   heroTarget = target;
   if (heroShown === null || reducedMotion()) {
     heroShown = target;
@@ -595,6 +598,21 @@ const showNotice = (text: string): void => {
   noticeEl.textContent = text;
   noticeEl.hidden = text.length === 0;
   sparkEl.className = text.length > 0 ? 'sparkrow tight' : 'sparkrow';
+};
+
+/**
+ * Where a notice belongs. A short one fits beside the number; a long one is
+ * read in full in the curve's spot, which is also what clears the state the
+ * headline no longer carries.
+ */
+const placeNotice = (text: string): void => {
+  if (text.length <= 28) {
+    setState(text);
+    showNotice('');
+  } else {
+    setState('');
+    showNotice(text);
+  }
 };
 
 /**
@@ -800,14 +818,23 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     setHero(null);
     setCaption('');
     valueEl.className = 'value';
-    setState(notice ?? copy.connecting);
-    showNotice('');
+    // A refused or failing service is the common long notice: it goes where a
+    // whole sentence fits, not beside the number.
+    if (notice) {
+      placeNotice(notice);
+    } else {
+      setState(copy.connecting);
+      showNotice('');
+    }
     ruleFill.style.width = '0%';
     paintReply(null);
     paintModel(null, null);
     paintMemory(null);
     dropSpark();
     sparkMoving = false;
+    sparkNeedsStatic = false;
+    // Nothing is being measured, so the band has nothing to hold open.
+    sparkEl.className = 'sparkrow tight';
     fitHeight();
     return;
   }
@@ -817,10 +844,15 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     // A network failure is a wrong address, not a bad response: name the
     // condition rather than leak the runtime's `fetch failed`.
     if (rate.errorKind === 'network') {
-      showNotice(copy.unreachable);
-    } else {
+      placeNotice(copy.unreachable);
+    } else if ((rate.error ?? '').length > 28) {
+      // The runtime's own words are rarely short: keep the headline quiet and
+      // read the detail where there is room for it.
       setState(copy.reconnecting);
-      showNotice(rate.error ?? copy.reconnecting);
+      showNotice(rate.error ?? '');
+    } else {
+      setState(rate.error ?? copy.reconnecting);
+      showNotice('');
     }
   } else if (rate.connection !== 'live') {
     dot.className = 'dot idle';
@@ -853,6 +885,10 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     setState(job ? job.text : (empty ? copy.noReplyYet : ''));
     showNotice('');
   }
+  // A caller-supplied notice is the loudest thing on screen: it replaces the
+  // state it displaced, in the headline when it fits and in the curve's spot
+  // when it does not.
+  if (notice) placeNotice(notice);
   ruleFill.style.width = barWidth(job?.percent);
 
   const live = rate.live.tps;
@@ -870,37 +906,31 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
 
   // The curve is owned by the service: it survives iframe remounts and
   // session switches, and is a rolling rate window rather than turn history.
-  // An empty curve means the answer belongs to no session, so nothing is drawn
-  // rather than the previous session's shape being left on screen. A band with
-  // nothing to draw closes up, so an idle section is shorter.
+  // Its length is fixed at 24 buckets, quiet ones included, so "nothing to
+  // draw" is a window with no point above the floor, not an empty list: an
+  // empty list is what a page with no session of its own gets. A band with
+  // nothing in it closes up, so an idle section is shorter; a decaying tail
+  // keeps it open until its last live bucket leaves the window.
   const nextFrame = sparkFrameFrom(rate);
   const moving = nextFrame.values.some((value) => value > 0.05);
   if (nextFrame.values.length === 0) {
     dropSpark();
     sparkMoving = false;
     sparkNeedsStatic = false;
-    if (noticeEl.hidden) sparkEl.className = 'sparkrow tight';
   } else {
     sparkFrame = nextFrame;
     sparkFrameAt = performance.now();
-    sparkEl.className = 'sparkrow';
     // A nonzero curve keeps panning at any time; all zeros flatten once and
     // then hold, so a quiet session shows no motion at all.
     sparkNeedsStatic = sparkMoving && !moving;
     sparkMoving = moving;
   }
+  // A notice read in the curve's spot and the band cannot both have the space.
+  sparkEl.className = moving && noticeEl.hidden ? 'sparkrow' : 'sparkrow tight';
 
   paintReply(rate);
   paintModel(rate.gauge, rate.cache);
   paintMemory(rate.gauge);
-
-  // A caller-supplied notice is the loudest thing on screen: the whole line
-  // when it is short, otherwise the curve's spot.
-  if (notice) {
-    const short = notice.length <= 28;
-    setState(short ? notice : '');
-    showNotice(short ? '' : notice);
-  }
   fitHeight();
 };
 

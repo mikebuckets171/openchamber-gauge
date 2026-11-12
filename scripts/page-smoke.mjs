@@ -150,7 +150,7 @@ const RATE = {
 };
 
 /** Run one built bundle in a fake frame and collect what it posts to its host. */
-const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE, locale = 'zh' } = {}) => {
+const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE, locale = 'zh', serviceDenied = false } = {}) => {
   const source = fs.readFileSync(path.join(ROOT, bundle), 'utf8');
   const posted = [];
   const listeners = [];
@@ -246,6 +246,20 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
   // an origin: that is what a relay surface has to send.
   const requests = posted.filter((message) => message && message.type === 'service-request');
   for (const request of requests) {
+    // A service the user has not allowed: the host answers the way its proxy
+    // does, with a code rather than a body.
+    if (serviceDenied) {
+      dispatch({
+        channel,
+        v: version,
+        type: 'result',
+        id: request.id,
+        ok: false,
+        code: 'NO_SERVICE',
+        error: 'The local service is not allowed for this extension',
+      });
+      continue;
+    }
     if (request.payload?.path === '/watch') {
       reply(request, { status: 200, body: JSON.stringify({ ok: true, changed: true, connection: 'live', sessionId: SESSION }) });
     } else if (request.payload?.path?.startsWith('/rate')) {
@@ -801,6 +815,54 @@ for (const surface of SURFACES) {
       `${surface.name}: the headline keeps a short state beside the number`,
       String(longState.hidden) === 'true' || longState.textContent.length <= 28,
       JSON.stringify(longState.textContent),
+    );
+
+    // What the service actually answers when a chat is quiet: all 24 buckets
+    // present and zero, not an empty list. The band must still close.
+    const quiet = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { ...RATE, running: null, curve: new Array(24).fill(0), lastTurn: LAST_TURN },
+    });
+    await settle();
+    check(
+      `${surface.name}: a window of zero buckets closes the band`,
+      String(findByClass(quiet.rootEl, 'sparkrow').className).split(/\s+/).includes('tight'),
+      findByClass(quiet.rootEl, 'sparkrow').className,
+    );
+
+    // A notice read in the curve's spot and the band cannot both have it.
+    const quietWithError = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { ...RATE, connection: 'error', error: 'cannot reach the server stream', errorKind: 'http', running: null, curve: [12, 14, 11] },
+    });
+    await settle();
+    check(
+      `${surface.name}: a notice in the curve's spot closes the band`,
+      String(findByClass(quietWithError.rootEl, 'sparkrow').className).split(/\s+/).includes('tight'),
+      findByClass(quietWithError.rootEl, 'sparkrow').className,
+    );
+
+    // The common real failure: the user never allowed the local service, so
+    // every request is refused. Its whole sentence has to be readable.
+    const denied = runGuest(surface.bundle, surface.url, { locale: 'en', serviceDenied: true });
+    await settle();
+    const deniedNotice = findByClass(denied.rootEl, 'notice');
+    const deniedState = findByClass(denied.rootEl, 'state');
+    check(
+      `${surface.name}: a refused service is said in full, not cut off`,
+      deniedNotice !== null && deniedNotice.textContent === 'Allow the local service in Settings → Extensions'
+        && String(deniedNotice.hidden) === 'false',
+      JSON.stringify(deniedNotice && deniedNotice.textContent),
+    );
+    check(
+      `${surface.name}: the long copy leaves the headline clear`,
+      String(deniedState.hidden) === 'true' || deniedState.textContent.length <= 28,
+      JSON.stringify(deniedState && deniedState.textContent),
+    );
+    check(
+      `${surface.name}: a refused service also closes the band`,
+      String(findByClass(denied.rootEl, 'sparkrow').className).split(/\s+/).includes('tight'),
+      findByClass(denied.rootEl, 'sparkrow').className,
     );
 
     const compact = runGuest(surface.bundle, surface.url, {
