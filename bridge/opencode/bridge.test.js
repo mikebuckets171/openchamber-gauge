@@ -43,6 +43,34 @@ for (const version of ['2.0.25', '2.0.27', '2.0.28', '2.0.29', '2.0.32', '2.0.33
   await reader.read(); assert.equal(plugin.store.entries.size, 0); await reader.cancel(); await plugin.dispose();
 });
 
+// A llama.cpp prefill, as its server writes it: a chunk carrying no content and
+// the four documented counters, one per prompt chunk. These numbers are the ones
+// llama.cpp's own progress report measured on a 22,056 token prompt.
+const llamaCppChunk = (processed, time_ms) => `data: ${JSON.stringify({
+  id: 'chatcmpl-1', object: 'chat.completion.chunk', created: 1, model: 'qwen', choices: [],
+  prompt_progress: { total: 22056, cache: 0, processed, time_ms },
+})}\r\n\r\n`;
+
+test('a llama.cpp prefill is read as its server writes it', async () => {
+  const plugin = await setup(memory());
+  const input = event();
+  await plugin.hooks.get('http.request')(input);
+  input.response = source([encode(llamaCppChunk(8192, 3728)), encode(llamaCppChunk(16384, 5731)),
+    encode(`data: ${JSON.stringify({ id: 'chatcmpl-1', object: 'chat.completion.chunk', model: 'qwen', choices: [{ index: 0, delta: { content: 'Hi' } }] })}\r\n\r\n`),
+    encode('data: [DONE]\n\n')]).response;
+  plugin.hooks.get('http.response')(input);
+  const reader = input.response.body.getReader();
+  await reader.read(); await reader.read();
+  const saved = [...plugin.store.entries.values()][0];
+  assert.equal(saved.total, 22056);
+  assert.equal(saved.processed, 16384);
+  assert.equal(saved.cache, 0);
+  assert.equal(saved.timeMs, 5731);
+  await reader.read(); await reader.read();
+  assert.equal(plugin.store.entries.size, 0, 'output started, so the reading was released');
+  await plugin.dispose();
+});
+
 test('versions outside the accepted OpenCode 2 releases never install prompt request mutation or alter a request', async () => {
   for (const version of ['2.0.24', '3.0.0', '2.0.25-custom', undefined]) {
     const plugin = await setup(memory(), {}, version ?? 'unknown'), input = event(), original = input.request;

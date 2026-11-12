@@ -1,6 +1,5 @@
-// Tiny SVG sparkline helpers shared by the status section and the rail panel.
+// Tiny SVG sparkline helpers for the status section.
 // No dependencies; the guest bundler inlines this into each entry.
-export const SPARK_N = 24;
 
 /**
  * One drawn curve: a rate per fixed slice of the rolling window.

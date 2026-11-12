@@ -133,7 +133,7 @@ const RATE = {
   busy: false,
   waiting: null,
   toolActive: false,
-  live: { tps: GAUGE_TPS, spanMs: 1000, chars: 12, textChars: 12, reasoningChars: 0, toolChars: 0 },
+  live: { tps: GAUGE_TPS },
   running: { tps: GAUGE_TPS, tokens: 12, durationMs: 1000 },
   curve: [],
   curveStart: Date.now(),
@@ -163,11 +163,10 @@ const RATE = {
     },
     prevHitRate: 92.9,
   },
-  eventsSeen: 0,
 };
 
 /** Run one built bundle in a fake frame and collect what it posts to its host. */
-const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE, locale = 'zh', serviceDenied = false, slotWidth = 0 } = {}) => {
+const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false, model: 'page-model' }, rate = RATE, locale = 'zh', serviceDenied = false, slotWidth = 0 } = {}) => {
   const source = fs.readFileSync(path.join(ROOT, bundle), 'utf8');
   const posted = [];
   const listeners = [];
@@ -287,13 +286,19 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
       continue;
     }
     if (request.payload?.path === '/watch') {
-      reply(request, { status: 200, body: JSON.stringify({ ok: true, changed: true, connection: 'live', sessionId: SESSION }) });
+      reply(request, { status: 200, body: JSON.stringify({ ok: true, changed: true, connection: 'live', sessionId: SESSION, push: true }) });
     } else if (request.payload?.path?.startsWith('/rate')) {
       reply(request, { status: 200, body: JSON.stringify(rate) });
     }
   }
 
-  return { posted, rootEl: root, root: () => root.textContent };
+  return {
+    posted,
+    rootEl: root,
+    root: () => root.textContent,
+    /** What the host does when the service posts a reading to the open frames. */
+    push: (topic, data) => dispatch({ channel, v: version, type: 'service-event', payload: { topic, data } }),
+  };
 };
 
 const settle = async () => {
@@ -356,7 +361,9 @@ for (const surface of SURFACES) {
     (message) => message.type === 'service-request' && message.payload?.path === '/watch',
   );
   const directBody = directWatch ? JSON.parse(directWatch.payload.body) : null;
-  check(`${surface.name}: an http page names its origin`, directBody?.origin === 'http://127.0.0.1:28888', JSON.stringify(directBody));
+  check(`${surface.name}: the watch names the session and the model it is on`,
+    directBody?.sessionId === SESSION && directBody?.model === 'page-model', JSON.stringify(directBody));
+  check(`${surface.name}: a watch carries no origin any more`, directBody !== null && !('origin' in directBody), JSON.stringify(directBody));
   check(`${surface.name}: an http page still shows the live number`, direct.root().includes(String(GAUGE_TPS)), JSON.stringify(direct.root()));
   check(`${surface.name}: an http page never says it cannot reach the server`, !NO_ORIGIN_COPY.some((copy) => direct.root().includes(copy)), JSON.stringify(direct.root()));
   const settledValue = findByText(direct.rootEl, String(GAUGE_TPS));
@@ -376,11 +383,11 @@ for (const surface of SURFACES) {
   const relayBody = relayWatch ? JSON.parse(relayWatch.payload.body) : null;
   check(`${surface.name}: a relay srcDoc still asks the service to watch`, relayWatch !== undefined);
   check(
-    `${surface.name}: the origin-less watch carries no bogus origin`,
-    relayBody !== null && relayBody.origin === undefined,
+    `${surface.name}: a relay watch carries no origin either`,
+    relayBody !== null && !('origin' in relayBody),
     JSON.stringify(relayBody),
   );
-  check(`${surface.name}: the origin-less watch still names its session`, relayBody?.sessionId === SESSION, JSON.stringify(relayBody));
+  check(`${surface.name}: the relay watch still names its session`, relayBody?.sessionId === SESSION, JSON.stringify(relayBody));
   check(
     `${surface.name}: a relay srcDoc still polls /rate`,
     relay.posted.some((message) => message.type === 'service-request' && message.payload?.path?.startsWith('/rate')),
@@ -496,7 +503,7 @@ for (const surface of SURFACES) {
   // was; behind the line, the slices add up to the whole bar.
   const SPLIT = { totalMs: 48_000, readMs: 0, waitMs: 6_000, writeMs: 33_000, toolMs: 9_000 };
   const LAST_TURN = {
-    tokensPerSecond: 38.2, source: 'tokens', tokens: 1260, activeMs: 33_000, wallMs: 47_000,
+    tokensPerSecond: 38.2, source: 'tokens', tokens: 1260, activeMs: 33_000,
     ttftMs: 6_100, hasReasoning: true, endedAt: Date.now() - 5_000, split: SPLIT,
   };
   const receipt = runGuest(surface.bundle, surface.url, { locale: 'en', rate: { ...RATE, running: null, lastTurn: LAST_TURN } });
@@ -827,7 +834,7 @@ for (const surface of SURFACES) {
 
     const longError = runGuest(surface.bundle, surface.url, {
       locale: 'en',
-      rate: { connection: 'error', error: 'Allow the local service in Settings → Extensions', errorKind: 'http', sessionId: null, busy: false, waiting: null, toolActive: false, live: { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 }, running: null, curve: [], turn: { active: false, ttftMs: null }, lastTurn: null, cache: null, eventsSeen: 0 },
+      rate: { connection: 'error', error: 'Allow the local service in Settings → Extensions', errorKind: 'http', sessionId: null, busy: false, waiting: null, toolActive: false, live: { tps: 0 }, running: null, curve: [], turn: { active: false, ttftMs: null }, lastTurn: null, cache: null },
     });
     await settle();
     check(
@@ -910,7 +917,7 @@ for (const surface of SURFACES) {
         ...RATE,
         running: null,
         turn: { active: false, ttftMs: null },
-        lastTurn: { ...LAST_TURN, wallMs: 125_000, ttftMs: 61_000, split: { totalMs: 125_000, readMs: 0, waitMs: 5_000, writeMs: 120_000, toolMs: 0 } },
+        lastTurn: { ...LAST_TURN, ttftMs: 61_000, split: { totalMs: 125_000, readMs: 0, waitMs: 5_000, writeMs: 120_000, toolMs: 0 } },
       },
     });
     await settle();
@@ -972,6 +979,110 @@ for (const surface of SURFACES) {
       findByClass(wide.rootEl, 'state').textContent === 'reading prompt 40% · 6.0s left'
         && String(findByClass(wide.rootEl, 'notice').hidden) === 'true',
       JSON.stringify(findByClass(wide.rootEl, 'state').textContent),
+    );
+  }
+
+  // The service sends readings; the page takes its own session's and ignores
+  // another session's.
+  //
+  // What is read here is what the page writes verbatim — the cost, the cache
+  // line, the dot — not the headline: that number glides from one reading to
+  // the next through the frame loop, and this harness runs no frames.
+  {
+    const polls = (guest) => guest.posted.filter(
+      (message) => message.type === 'service-request' && String(message.payload?.path ?? '').startsWith('/rate'),
+    ).length;
+    const pushed = runGuest(surface.bundle, surface.url, { locale: 'en' });
+    await settle();
+    const asked = polls(pushed);
+    const dot = findByClass(pushed.rootEl, 'dot');
+    check(`${surface.name}: the page shows what it read first`, pushed.root().includes('42.5'), JSON.stringify(pushed.root()));
+    check(`${surface.name}: an idle reading leaves the dot dark`, dot.className.includes('idle'), dot.className);
+    pushed.push('rate', {
+      session: SESSION,
+      rate: {
+        ...RATE,
+        busy: true,
+        live: { tps: 77.5 },
+        running: { tps: 77.5, tokens: 10, durationMs: 1000 },
+        cache: { ...RATE.cache, hitRate: 66.6, cost: 0.99 },
+      },
+    });
+    await settle();
+    check(
+      `${surface.name}: a pushed reading is painted`,
+      pushed.root().includes('$0.99') && pushed.root().includes('66.6') && dot.className.includes('live'),
+      `${dot.className} ${JSON.stringify(pushed.root())}`,
+    );
+    check(`${surface.name}: and the page asked for nothing to get it`, polls(pushed) === asked, `polls=${polls(pushed)} after ${asked}`);
+    pushed.push('rate', {
+      session: 'ses_someother_chat',
+      rate: { ...RATE, busy: false, live: { tps: 99.9 }, cache: { ...RATE.cache, hitRate: 11.1, cost: 5.55 } },
+    });
+    await settle();
+    check(
+      `${surface.name}: another session's push is not shown here`,
+      !pushed.root().includes('$5.55') && !pushed.root().includes('11.1') && pushed.root().includes('$0.99'),
+      JSON.stringify(pushed.root()),
+    );
+    pushed.push('something-else', { whatever: true });
+    await settle();
+    check(
+      `${surface.name}: an unrelated topic leaves the reading alone`,
+      pushed.root().includes('$0.99') && !pushed.root().includes('Cannot reach'),
+      JSON.stringify(pushed.root()),
+    );
+  }
+
+  // A machine with no memory reading (any non-Mac) does not get a Memory line.
+  {
+    const offMac = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: {
+        ...RATE,
+        gauge: {
+          macSupported: false,
+          mac: { pressure: 'normal', usedBytes: 34 * 1024 ** 3, totalBytes: 48 * 1024 ** 3, swapUsedBytes: 0, at: Date.now() },
+          prompt: null,
+          render: null,
+        },
+      },
+    });
+    await settle();
+    check(
+      `${surface.name}: no memory line is drawn off a Mac`,
+      findLine(offMac.rootEl, 'Memory') === null && !offMac.root().includes('Memory'),
+      JSON.stringify(offMac.root()),
+    );
+    check(`${surface.name}: nothing waits for a memory number off a Mac`, !offMac.root().includes('34.0 / 48.0 GB'), JSON.stringify(offMac.root()));
+    const onMac = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: {
+        ...RATE,
+        gauge: {
+          macSupported: true,
+          mac: { pressure: 'normal', usedBytes: 34 * 1024 ** 3, totalBytes: 48 * 1024 ** 3, swapUsedBytes: 0, at: Date.now() },
+          prompt: null,
+          render: null,
+        },
+      },
+    });
+    await settle();
+    check(`${surface.name}: a Mac keeps its memory line`, String(findLine(onMac.rootEl, 'Memory')?.hidden) === 'false', JSON.stringify(onMac.root()));
+  }
+
+  // The approval that lets Gauge read sessions is a different problem from a
+  // service that is not running, and says so.
+  {
+    const denied = runGuest(surface.bundle, surface.url, {
+      locale: 'en',
+      rate: { ...RATE, connection: 'error', error: null, errorKind: 'access', sessionId: null, busy: false, live: { tps: 0 }, running: null, curve: [], turn: { active: false, ttftMs: null }, lastTurn: null, cache: null, gauge: null },
+    });
+    await settle();
+    check(
+      `${surface.name}: a refused read names the permission, not the network`,
+      denied.root().includes('Allow Gauge to read your sessions'),
+      JSON.stringify(denied.root()),
     );
   }
 

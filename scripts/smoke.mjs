@@ -1,8 +1,10 @@
-// Smoke test: mock OpenChamber SSE stream + the built service, feed synthetic
-// OpenCode 2 events, assert instant live rate, TTFT, last-turn average,
-// reasoning split, and session filtering.
+// Smoke test: mock OpenCode event feed + the built service.
 //
-// Run: node scripts/smoke.mjs  (from the package root, after `bun run build`)
+// Feed synthetic OpenCode 2 events through the read-only connection an approved
+// service is given (OPENCHAMBER_OPENCODE_URL), and assert instant live rate,
+// TTFT, last-turn average, reasoning split, session filtering, and what the
+// service does when that connection is missing, refused, or cut.
+//
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -13,16 +15,12 @@ import { once } from 'node:events';
 const SERVICE_TOKEN = 'smoke-test-token';
 const SESSION = 'ses_smoke';
 const OTHER = 'ses_other';
-// The service writes last turn and curve beside itself so a restarted process
-// still shows numbers. Point it at a scratch file so runs cannot leak into each
-// other, and so nothing lands in the repo.
+// The service keeps its durable numbers, so a restarted process still shows
+// them. Point it at a scratch file so runs cannot leak into each other, and so
+// nothing lands in the repo. (Where the file lands when nothing overrides it is
+// regressions.mjs's question.)
 const STATE_FILE = path.join(os.tmpdir(), `gauge-smoke-state-${process.pid}.json`);
 fs.rmSync(STATE_FILE, { force: true });
-// A data dir without a desktop port keeps discovery on the scanning path and
-// away from any real OpenChamber running on this machine.
-const SMOKE_DATA_DIR = path.join(os.tmpdir(), `gauge-data-${process.pid}`);
-fs.mkdirSync(SMOKE_DATA_DIR, { recursive: true });
-fs.writeFileSync(path.join(SMOKE_DATA_DIR, 'settings.json'), '{}');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -35,11 +33,20 @@ const check = (name, cond, extra = '') => {
   }
 };
 
-// --- mock OpenChamber event stream -----------------------------------------
+// --- the mock feed ----------------------------------------------------------
+// What OpenChamber hands an approved `opencode` service: OpenCode's own event
+// stream, authenticated with the service token, at the address it names.
 const clients = new Set();
-const sseServer = http.createServer((req, res) => {
-  if (req.url !== '/api/global/event') {
+const feedPath = (url) => (url ?? '').split('?')[0];
+const feedSeen = [];
+const feedServer = http.createServer((req, res) => {
+  if (feedPath(req.url) !== '/api/event') {
     res.writeHead(404).end();
+    return;
+  }
+  feedSeen.push({ authorization: req.headers.authorization ?? null, url: req.url });
+  if (req.headers.authorization !== `Bearer ${SERVICE_TOKEN}`) {
+    res.writeHead(401, { 'Content-Type': 'application/json' }).end('{"error":{"message":"nope"}}');
     return;
   }
   res.writeHead(200, {
@@ -47,30 +54,19 @@ const sseServer = http.createServer((req, res) => {
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
   });
-  // A real SSE server pushes its status line before the first event (curl
-  // proves the OpenChamber one does), and origin discovery identifies a server
-  // by those headers. Without this the mock withholds them until emit().
+  // A real SSE server pushes its status line before the first event, and the
+  // service treats a connection that answered as a healthy one.
   res.flushHeaders();
   clients.add(res);
   req.on('close', () => clients.delete(res));
 });
-await new Promise((r) => sseServer.listen(0, '127.0.0.1', r));
-const sseOrigin = `http://127.0.0.1:${sseServer.address().port}`;
+await new Promise((r) => feedServer.listen(0, '127.0.0.1', r));
+const FEED_URL = `http://127.0.0.1:${feedServer.address().port}`;
 
-// Origin discovery scans the parent process's listening ports. A restricted
-// token or AppContainer can leave `netstat -ano` unable to name a PID for this
-// process's sockets, so there is nothing to find: an environment limit, not a
-// regression. Only Windows has this trap; `ss`/`lsof`/`/proc` still cover the
-// other platforms, where the scan assertions always run.
-const canScanParentListeners = (() => {
-  if (process.platform !== 'win32') return true;
-  try {
-    const out = execFileSync('netstat', ['-ano'], { encoding: 'latin1', maxBuffer: 16 * 1024 * 1024 });
-    return out.split(/\r?\n/).some((line) => line.includes(`:${sseServer.address().port}`) && line.includes('LISTENING'));
-  } catch {
-    return false;
-  }
-})();
+/** Anything else listening on this machine must never be dialled. */
+const decoyHits = [];
+const decoy = http.createServer((req, res) => { decoyHits.push(req.url); res.writeHead(200).end(); });
+await new Promise((r) => decoy.listen(0, '127.0.0.1', r));
 
 const emit = (event) => {
   const frame = `data: ${JSON.stringify(event)}\n\n`;
@@ -86,7 +82,7 @@ const svc = spawn(process.execPath, ['service/main.js'], {
     OPENCHAMBER_SERVICE_PORT: String(svcPort),
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
     OPENCHAMBER_GAUGE_STATE: STATE_FILE,
-    OPENCHAMBER_DATA_DIR: SMOKE_DATA_DIR,
+    OPENCHAMBER_OPENCODE_URL: FEED_URL,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -113,9 +109,9 @@ if (!ready) {
 
 await svcFetch('/watch', {
   method: 'POST',
-  body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }),
+  body: JSON.stringify({ sessionId: SESSION }),
 });
-await sleep(300); // let the SSE subscription establish
+await sleep(300); // let the stream subscription establish
 
 // --- turn 1: text + reasoning, instant rate ----------------------------------
 const t0 = Date.now();
@@ -147,14 +143,20 @@ check(
 );
 let rate = await (await svcFetch('/rate')).json();
 check('live rate is instant, not climbing from 0', rate.live.tps > 80, `tps=${rate.live.tps}`);
-check('reasoning chars tracked separately', rate.live.reasoningChars === 40, JSON.stringify(rate.live));
+// The wire carries one live number: reasoning streams are counted as generated
+// work in the same window as text, and only the finished turn separates them.
+check('the wire reports one live number', Object.keys(rate.live).length === 1 && rate.live.tps > 0, JSON.stringify(rate.live));
 check('turn TTFT observed (~400ms)', rate.turn.ttftMs !== null && rate.turn.ttftMs >= 300 && rate.turn.ttftMs < 1500, `ttft=${rate.turn.ttftMs}`);
 
 // Other sessions must not leak in.
 ev('session.text.delta', { sessionID: OTHER, assistantMessageID: 'msgX', ordinal: 0, delta: 'z'.repeat(5000) });
 await sleep(150);
 const rate2 = await (await svcFetch('/rate')).json();
-check('other sessions ignored', rate2.live.chars < rate.live.chars + 2000, `chars=${rate2.live.chars}`);
+check(
+  'other sessions ignored',
+  rate2.live.tps <= rate.live.tps + 50,
+  `tps=${rate2.live.tps} instead of ${rate.live.tps}`,
+);
 
 // Settle with real token counts, then end the turn.
 ev('session.step.ended', {
@@ -276,7 +278,7 @@ await sleep(150);
 rate = await (await svcFetch('/rate')).json();
 check(
   'final average excludes tool time',
-  rate.lastTurn?.activeMs < rate.lastTurn?.wallMs - 500,
+  rate.lastTurn?.activeMs < (rate.lastTurn?.split?.totalMs ?? 0) - 500,
   JSON.stringify(rate.lastTurn),
 );
 
@@ -484,7 +486,7 @@ check('unobserved step never becomes measured', rate.lastTurn?.source === 'estim
 
 // --- session switch: memory survives -----------------------------------------
 const firstTurnTps = (await (await svcFetch('/rate')).json()).lastTurn?.tokensPerSecond;
-await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: OTHER }) });
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ sessionId: OTHER }) });
 await sleep(200);
 ev('session.execution.started', { sessionID: OTHER });
 ev('session.step.started', { sessionID: OTHER, assistantMessageID: 'msgO' });
@@ -495,7 +497,7 @@ ev('session.execution.succeeded', { sessionID: OTHER });
 await sleep(150);
 let otherRate = await (await svcFetch('/rate')).json();
 check('other session has its own last turn', otherRate.lastTurn?.tokens === 25, JSON.stringify(otherRate.lastTurn));
-await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }) });
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ sessionId: SESSION }) });
 await sleep(200);
 rate = await (await svcFetch('/rate')).json();
 check('switching back restores last turn', rate.lastTurn?.tokensPerSecond === firstTurnTps, JSON.stringify(rate.lastTurn));
@@ -513,7 +515,7 @@ ev('session.step.started', { sessionID: SESSION, assistantMessageID: 'msgBoth' }
 await sleep(150);
 ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgBoth', ordinal: 0, delta: 'b'.repeat(120) });
 await sleep(150);
-await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: OTHER }) });
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ sessionId: OTHER }) });
 await sleep(150);
 const mineMidTurn = await (await svcFetch(`/rate?sessionId=${SESSION}`)).json();
 check(
@@ -529,7 +531,7 @@ check('bare /rate still answers for the last watch', bareRate.sessionId === OTHE
 ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgBoth', tokens: { output: 40, reasoning: 0 } });
 ev('session.execution.succeeded', { sessionID: SESSION });
 await sleep(150);
-await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }) });
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ sessionId: SESSION }) });
 await sleep(200);
 
 // --- a new conversation must never read another session's numbers ------------
@@ -545,12 +547,12 @@ for (let i = 0; i < 3; i += 1) {
   ev('session.text.delta', { sessionID: OTHER, assistantMessageID: 'msgNew', ordinal: 0, delta: 'n'.repeat(50) });
   await sleep(60);
 }
-await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: null }) });
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ sessionId: null }) });
 await sleep(120);
 const newChat = await (await svcFetch('/rate')).json();
 check(
   'a new conversation reads no live numbers',
-  newChat.sessionId === null && newChat.busy === false && newChat.live.chars === 0 && newChat.live.tps === 0,
+  newChat.sessionId === null && newChat.busy === false && newChat.live.tps === 0,
   JSON.stringify({ sessionId: newChat.sessionId, busy: newChat.busy, live: newChat.live }),
 );
 check(
@@ -561,7 +563,7 @@ check(
 const otherStreaming = await (await svcFetch(`/rate?sessionId=${OTHER}`)).json();
 check(
   'the streaming session still reads its own live numbers',
-  otherStreaming.sessionId === OTHER && otherStreaming.busy === true && otherStreaming.live.chars > 0,
+  otherStreaming.sessionId === OTHER && otherStreaming.busy === true && otherStreaming.live.tps > 0,
   JSON.stringify({ sessionId: otherStreaming.sessionId, busy: otherStreaming.busy, live: otherStreaming.live }),
 );
 // Settle OTHER while the new conversation is still the latest watch: a
@@ -576,7 +578,7 @@ check(
   JSON.stringify({ lastTurn: newChatSettled.lastTurn, busy: newChatSettled.busy }),
 );
 // Registering a session again brings the numbers back.
-await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }) });
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ sessionId: SESSION }) });
 await sleep(200);
 const backOnSession = await (await svcFetch('/rate')).json();
 check('re-watching a session brings its numbers back', backOnSession.sessionId === SESSION, `sessionId=${backOnSession.sessionId}`);
@@ -597,7 +599,7 @@ await sleep(150);
 rate = await (await svcFetch('/rate')).json();
 check('missed start still shows busy', rate.busy === true, JSON.stringify({ busy: rate.busy }));
 check('tool execution detected without started', rate.toolActive === true, JSON.stringify({ toolActive: rate.toolActive }));
-check('tool input counted live', rate.live.toolChars > 0, JSON.stringify(rate.live));
+check('tool input counted live', rate.live.tps > 0 && rate.toolActive === true, JSON.stringify({ live: rate.live, toolActive: rate.toolActive }));
 check('running exists during tool input', rate.running !== null && rate.running.tps > 0, JSON.stringify(rate.running));
 ev('session.tool.success', { sessionID: SESSION, assistantMessageID: 'msgLate', id: 'toolLate' });
 ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgLate', ordinal: 0, delta: 'z'.repeat(60) });
@@ -614,7 +616,7 @@ ev('session.next.step.started', { sessionID: SESSION, assistantMessageID: 'msgNe
 ev('session.next.tool.input.delta', { sessionID: SESSION, assistantMessageID: 'msgNext', callID: 'callNext', delta: '{"a":1}' });
 await sleep(150);
 rate = await (await svcFetch('/rate')).json();
-check('next-prefixed input delta counted', rate.live.toolChars > 0 && rate.busy === true, JSON.stringify({ live: rate.live, busy: rate.busy }));
+check('next-prefixed input delta counted', rate.live.tps > 0 && rate.busy === true, JSON.stringify({ live: rate.live, busy: rate.busy }));
 ev('session.next.step.ended', { sessionID: SESSION, assistantMessageID: 'msgNext', tokens: { output: 12, reasoning: 0 } });
 ev('session.next.execution.succeeded', { sessionID: SESSION });
 await sleep(150);
@@ -639,7 +641,8 @@ rate = await (await svcFetch('/rate')).json();
 check('input-streaming turn stays tokens-based', rate.lastTurn?.source === 'tokens' && rate.lastTurn?.tokens === 50, JSON.stringify(rate.lastTurn));
 check(
   'execution silence excluded but input time kept',
-  (rate.lastTurn?.activeMs ?? 0) >= 200 && (rate.lastTurn?.activeMs ?? 0) < (rate.lastTurn?.wallMs ?? 0) - 300,
+  (rate.lastTurn?.activeMs ?? 0) >= 200
+    && (rate.lastTurn?.activeMs ?? 0) < (rate.lastTurn?.split?.totalMs ?? 0) - 300,
   JSON.stringify(rate.lastTurn),
 );
 
@@ -789,330 +792,244 @@ check(
   `tps=${rate.lastTurn?.tokensPerSecond}`,
 );
 
-// --- origin discovery: a port forward's loopback does not exist here ---------
-// Reproduces the remote/SSH-tunnel failure. The page hands the service an
-// origin that is refused on this machine (the forward exists only on the
-// client), so the service has to find the server on its own parent's
-// listening ports instead of sitting on `fetch failed`.
-const dead = http.createServer();
-await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve));
-const deadOrigin = `http://127.0.0.1:${dead.address().port}`;
-await new Promise((resolve) => dead.close(resolve));
-if (canScanParentListeners) {
-  await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: deadOrigin, sessionId: SESSION }) });
-  let rediscovered = null;
-  for (let i = 0; i < 30 && (!rediscovered || rediscovered.connection !== 'live'); i += 1) {
-    await sleep(100);
-    rediscovered = await (await svcFetch('/rate')).json();
-  }
-  check(
-    'unreachable page origin falls back to origin discovery',
-    rediscovered?.connection === 'live',
-    JSON.stringify(rediscovered && { connection: rediscovered.connection, error: rediscovered.error, errorKind: rediscovered.errorKind }),
-  );
-  check('error kind cleared once connected', rediscovered?.errorKind === null, JSON.stringify(rediscovered?.errorKind));
-  ev('session.execution.started', { sessionID: SESSION });
-  await sleep(150);
-  const afterDiscovery = await (await svcFetch('/rate')).json();
-  check('events flow after discovery', afterDiscovery.busy === true, JSON.stringify({ busy: afterDiscovery.busy }));
-  ev('session.execution.succeeded', { sessionID: SESSION });
-} else {
-  console.log('skip origin discovery: this shell cannot name its own listening sockets (netstat shows no PID)');
-}
+// --- the feed is the only thing the service dials ---------------------------
+// No borrowed client token, no scanning a parent's listening ports, no guessing
+// a desktop port: everything read goes to the address OpenChamber named, with
+// the service's own token.
+check('the service dialled nothing else on this machine', decoyHits.length === 0, JSON.stringify(decoyHits));
+check(
+  'every feed request carries the service token',
+  feedSeen.length > 0 && feedSeen.every((entry) => entry.authorization === `Bearer ${SERVICE_TOKEN}`),
+  JSON.stringify(feedSeen.slice(0, 2)),
+);
 
-// --- origin discovery without ss/lsof ----------------------------------------
-// Minimal containers ship neither helper. An empty PATH forces the service
-// down the /proc path while the parent still owns the event-stream listener.
-if (process.platform === 'linux' && fs.existsSync('/proc/net/tcp') && fs.existsSync('/proc/self/fd')) {
-  const procPort = svcPort + 10;
-  const procSvc = spawn(process.execPath, ['service/main.js'], {
-    env: {
-      ...process.env,
-      PATH: '',
-      OPENCHAMBER_SERVICE_PORT: String(procPort),
-      OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-      OPENCHAMBER_GAUGE_STATE: `${STATE_FILE}.proc`,
-      OPENCHAMBER_DATA_DIR: path.join(os.tmpdir(), `gauge-proc-${process.pid}`),
-    },
+const startService = async (label, port, env) => {
+  const child = spawn(process.execPath, ['service/main.js'], {
+    env: { ...process.env, OPENCHAMBER_SERVICE_PORT: String(port), ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  procSvc.stderr.on('data', (d) => process.stderr.write(`[service-proc] ${d}`));
-  const procFetch = (p, init) => fetch(`http://127.0.0.1:${procPort}${p}`, {
+  child.stderr.on('data', (d) => process.stderr.write(`[${label}] ${d}`));
+  const call = (route, init) => fetch(`http://127.0.0.1:${port}${route}`, {
     ...init,
-    headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
+    headers: { Authorization: `Bearer ${env.OPENCHAMBER_SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
   });
-  let procReady = false;
-  for (let i = 0; i < 50 && !procReady; i += 1) {
-    try { procReady = (await procFetch('/health')).ok; } catch { /* not up yet */ }
-    if (!procReady) await sleep(100);
+  let ready = false;
+  for (let i = 0; i < 50 && !ready; i += 1) {
+    try { ready = (await call('/health')).ok; } catch { /* not up yet */ }
+    if (!ready) await sleep(100);
   }
-  check('service starts without ss/lsof on PATH', procReady);
-  if (procReady) {
-    await procFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: deadOrigin, sessionId: SESSION }) });
-    let procRate = null;
-    for (let i = 0; i < 30 && (!procRate || procRate.connection !== 'live'); i += 1) {
-      await sleep(100);
-      procRate = await (await procFetch('/rate')).json();
-    }
-    check(
-      'origin discovery falls back to /proc without ss/lsof',
-      procRate?.connection === 'live',
-      JSON.stringify(procRate && { connection: procRate.connection, error: procRate.error }),
-    );
-  }
-  procSvc.kill();
-  await once(procSvc, 'exit');
-  fs.rmSync(`${STATE_FILE}.proc`, { force: true });
-  fs.rmSync(path.join(os.tmpdir(), `gauge-proc-${process.pid}`), { recursive: true, force: true });
-}
-
-// --- persistence: a restarted service still answers --------------------------
-// Closing OpenChamber kills this process. The numbers already measured are on
-// disk, so the panel shows the last turn straight away instead of sitting
-// empty until the next conversation finishes.
-await sleep(1800); // let the debounced write land
-const beforeRestart = (await (await svcFetch(`/rate?sessionId=${SESSION}`)).json()).lastTurn;
-check('last turn present before restart', Boolean(beforeRestart), JSON.stringify(beforeRestart));
-// The model id arrives as an object, so a plain string read returned '' and
-// every model shared one wildcard calibration entry.
-const persistedModels = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')).models ?? {};
-check(
-  'calibration is learned under the real model id',
-  typeof persistedModels['smoke-model'] === 'number',
-  JSON.stringify(persistedModels),
-);
-svc.kill();
-await once(svc, 'exit');
-await sleep(300);
-
-const svc2 = spawn(process.execPath, ['service/main.js'], {
-  env: {
-    ...process.env,
-    OPENCHAMBER_SERVICE_PORT: String(svcPort),
-    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-    OPENCHAMBER_GAUGE_STATE: STATE_FILE,
-    OPENCHAMBER_DATA_DIR: SMOKE_DATA_DIR,
-  },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-svc2.stderr.on('data', (d) => process.stderr.write(`[service2] ${d}`));
-const svc2Fetch = (p, init) => fetch(`http://127.0.0.1:${svcPort}${p}`, {
-  ...init,
-  headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
-});
-let ready2 = false;
-for (let i = 0; i < 50 && !ready2; i += 1) {
-  try {
-    ready2 = (await svc2Fetch('/health')).ok;
-  } catch { /* not up yet */ }
-  if (!ready2) await sleep(100);
-}
-check('service comes back after restart', ready2);
-
-const cold = ready2 ? await (await svc2Fetch(`/rate?sessionId=${SESSION}`)).json() : null;
-check(
-  'restart: reported unwatched until a page asks again',
-  cold !== null && cold.sessionId === null,
-  `sessionId=${cold?.sessionId}`,
-);
-check(
-  'restart: last turn restored from disk',
-  cold?.lastTurn?.tokensPerSecond === beforeRestart?.tokensPerSecond && cold?.lastTurn != null,
-  JSON.stringify(cold?.lastTurn),
-);
-check(
-  'restart: the curve keeps its shape instead of vanishing',
-  Array.isArray(cold?.curve) && cold.curve.length === 24 && cold.curve.every((v) => v === 0),
-  JSON.stringify(cold?.curve),
-);
-await svc2Fetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }) });
-await sleep(300);
-const warm = await (await svc2Fetch(`/rate?sessionId=${SESSION}`)).json();
-check('restart: watching again marks it live', warm.sessionId === SESSION, `sessionId=${warm.sessionId}`);
-svc2.kill();
-await once(svc2, 'exit');
-
-// --- a UI password locks the service out; the local client token lets it in -
-// The SDK keeps host secrets out of the service environment, so when the user
-// sets a UI password every /api/* route answers 401 and this service has no
-// credentialed channel left. OpenChamber's own CLI solves the same problem by
-// reading desktopLocalClientToken out of the data directory's settings.json;
-// the service does the same and sends it as a bearer.
-const seenAuth = [];
-const authSse = http.createServer((req, res) => {
-  seenAuth.push(req.headers.authorization ?? null);
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-  res.flushHeaders();
-  req.on('close', () => undefined);
-});
-await new Promise((r) => authSse.listen(0, '127.0.0.1', r));
-const authOrigin = `http://127.0.0.1:${authSse.address().port}`;
-const fakeDataDir = path.join(os.tmpdir(), `gauge-auth-${process.pid}`);
-fs.mkdirSync(fakeDataDir, { recursive: true });
-fs.writeFileSync(path.join(fakeDataDir, 'settings.json'), JSON.stringify({
-  desktopLocalPort: authSse.address().port,
-  desktopLocalClientToken: 'oc_client_smoke',
-}));
-const svc3 = spawn(process.execPath, ['service/main.js'], {
-  env: {
-    ...process.env,
-    OPENCHAMBER_SERVICE_PORT: String(svcPort),
-    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-    OPENCHAMBER_GAUGE_STATE: STATE_FILE,
-    OPENCHAMBER_DATA_DIR: fakeDataDir,
-  },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-svc3.stderr.on('data', (d) => process.stderr.write(`[service3] ${d}`));
-const svc3Fetch = (p, init) => fetch(`http://127.0.0.1:${svcPort}${p}`, {
-  ...init,
-  headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
-});
-let ready3 = false;
-for (let i = 0; i < 50 && !ready3; i += 1) {
-  try { ready3 = (await svc3Fetch('/health')).ok; } catch { /* not yet */ }
-  if (!ready3) await sleep(100);
-}
-await svc3Fetch('/watch', { method: 'POST', body: JSON.stringify({ origin: authOrigin, sessionId: SESSION }) });
-for (let i = 0; i < 80 && !seenAuth.some((v) => v === 'Bearer oc_client_smoke'); i += 1) {
-  await sleep(100);
-}
-check(
-  'the local client token is sent to the event stream',
-  seenAuth.some((v) => v === 'Bearer oc_client_smoke'),
-  JSON.stringify(seenAuth),
-);
-svc3.kill();
-await once(svc3, 'exit');
-fs.rmSync(fakeDataDir, { recursive: true, force: true });
-authSse.close();
-
-// An explicit override wins over the file, and a missing file is not an error.
-const svc4 = spawn(process.execPath, ['service/main.js'], {
-  env: {
-    ...process.env,
-    OPENCHAMBER_SERVICE_PORT: String(svcPort),
-    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-    OPENCHAMBER_GAUGE_STATE: STATE_FILE,
-    OPENCHAMBER_DATA_DIR: path.join(os.tmpdir(), `gauge-nope-${process.pid}`),
-    OPENCHAMBER_GAUGE_CLIENT_TOKEN: 'oc_client_override',
-  },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-const svc4Fetch = (p, init) => fetch(`http://127.0.0.1:${svcPort}${p}`, {
-  ...init,
-  headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
-});
-let ready4 = false;
-for (let i = 0; i < 50 && !ready4; i += 1) {
-  try { ready4 = (await svc4Fetch('/health')).ok; } catch { /* not yet */ }
-  if (!ready4) await sleep(100);
-}
-check('a missing settings file still starts the service', ready4);
-svc4.kill();
-await once(svc4, 'exit');
-
-// --- relay guest: the page has no origin at all ------------------------------
-// A Private Relay client mounts a guest as a self-contained `srcDoc`, so
-// `window.location` is `about:srcdoc` and the page cannot name the server.
-// The watch must still be accepted, and the service must find the server on
-// this machine instead of rejecting the request. A fresh process proves the
-// finding is what connects it, not an origin discovered earlier.
-// The desktop writes its own listener's port into settings.json. Pointing a
-// scratch data dir at the mock keeps the run hermetic: without it a fixed
-// service would dial the real OpenChamber running on this machine.
-const relayDataDir = path.join(os.tmpdir(), `gauge-relay-${process.pid}`);
-fs.mkdirSync(relayDataDir, { recursive: true });
-fs.writeFileSync(
-  path.join(relayDataDir, 'settings.json'),
-  JSON.stringify({ desktopLocalPort: sseServer.address().port, desktopLocalClientToken: 'oc_client_smoke' }),
-);
-const svc5 = spawn(process.execPath, ['service/main.js'], {
-  env: {
-    ...process.env,
-    OPENCHAMBER_SERVICE_PORT: String(svcPort),
-    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
-    OPENCHAMBER_GAUGE_STATE: STATE_FILE,
-    OPENCHAMBER_DATA_DIR: relayDataDir,
-  },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-svc5.stderr.on('data', (d) => process.stderr.write(`[service5] ${d}`));
-const svc5Fetch = (p, init) => fetch(`http://127.0.0.1:${svcPort}${p}`, {
-  ...init,
-  headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
-});
-let ready5 = false;
-for (let i = 0; i < 50 && !ready5; i += 1) {
-  try { ready5 = (await svc5Fetch('/health')).ok; } catch { /* not yet */ }
-  if (!ready5) await sleep(100);
-}
-check('relay: a fresh service starts', ready5);
-const postWatch = async (body) => {
-  const response = await svc5Fetch('/watch', { method: 'POST', body: JSON.stringify(body) });
-  return { status: response.status, text: await response.text() };
+  check(`${label}: starts`, ready);
+  return { child, call };
 };
-const nakedWatch = await postWatch({ sessionId: SESSION });
-check(
-  'relay: a watch without any origin is accepted',
-  nakedWatch.status === 200,
-  `status=${nakedWatch.status} ${nakedWatch.text}`,
-);
-let relayRate = null;
-for (let i = 0; i < 60 && (!relayRate || relayRate.connection !== 'live'); i += 1) {
-  await sleep(100);
-  relayRate = await (await svc5Fetch('/rate')).json();
-}
-check(
-  'relay: an origin-less watch finds the server on this machine',
-  relayRate?.connection === 'live',
-  JSON.stringify(relayRate && { connection: relayRate.connection, error: relayRate.error, errorKind: relayRate.errorKind }),
-);
-ev('session.execution.started', { sessionID: SESSION });
-await sleep(200);
-const relayBusy = await (await svc5Fetch('/rate')).json();
-check('relay: events flow after an origin-less watch', relayBusy.busy === true, JSON.stringify({ busy: relayBusy.busy }));
-ev('session.execution.succeeded', { sessionID: SESSION });
+const stopService = async (handle) => {
+  handle.child.kill();
+  await once(handle.child, 'exit');
+};
 
-const nullWatch = await postWatch({ origin: null, sessionId: SESSION });
-check('relay: an explicit null origin is accepted', nullWatch.status === 200, `status=${nullWatch.status} ${nullWatch.text}`);
-const emptyWatch = await postWatch({ origin: '', sessionId: SESSION });
-check('relay: an empty origin means none', emptyWatch.status === 200, `status=${emptyWatch.status} ${emptyWatch.text}`);
-for (const [label, origin] of [
-  ['a non-http scheme', 'ftp://127.0.0.1:1'],
-  ['credentials in the origin', 'http://user:pass@127.0.0.1:1'],
-  ['a value that is not an origin', 'not an origin'],
-  ['an origin that is not a string', 5],
-]) {
-  const rejected = await postWatch({ origin, sessionId: SESSION });
-  check(`relay: ${label} is still refused`, rejected.status === 400, `status=${rejected.status} ${rejected.text}`);
+// --- without the approval there is nothing to measure -----------------------
+// `provides: ["opencode"]` is what makes OpenChamber hand the service its
+// OpenCode. Without that address the service has no second source to fall back
+// on, and the panel has to say what is missing.
+{
+  const svc6 = await startService('no-feed', svcPort + 20, {
+    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+    OPENCHAMBER_GAUGE_STATE: `${STATE_FILE}.nofeed`,
+  });
+  await sleep(300);
+  const rate = await (await svc6.call('/rate')).json();
+  check(
+    'no feed address answers as a missing permission, not as a broken network',
+    rate.connection === 'error' && rate.errorKind === 'access',
+    JSON.stringify({ connection: rate.connection, errorKind: rate.errorKind, error: rate.error }),
+  );
+  await stopService(svc6);
+  fs.rmSync(`${STATE_FILE}.nofeed`, { force: true });
 }
 
-// A local window and a relay client can watch together. Once the service knows
-// the server's own address, the second surface's origin hint must not restart
-// the stream the first one is relying on.
-const flip = await postWatch({ origin: 'http://127.0.0.1:9', sessionId: SESSION });
-check(
-  'relay: a second surface does not tear the stream down',
-  flip.status === 200 && JSON.parse(flip.text).connection === 'live',
-  `status=${flip.status} ${flip.text}`,
-);
-ev('session.execution.started', { sessionID: SESSION });
-await sleep(200);
-const acrossFlip = await (await svc5Fetch('/rate')).json();
-check(
-  'relay: events keep flowing across a surface switch',
-  acrossFlip.busy === true,
-  JSON.stringify({ busy: acrossFlip.busy }),
-);
-ev('session.execution.succeeded', { sessionID: SESSION });
-svc5.kill();
-await once(svc5, 'exit');
-fs.rmSync(relayDataDir, { recursive: true, force: true });
+// --- a feed that refuses the token says so ----------------------------------
+{
+  const svc7 = await startService('refused', svcPort + 21, {
+    OPENCHAMBER_SERVICE_TOKEN: 'not-the-feed-token',
+    OPENCHAMBER_GAUGE_STATE: `${STATE_FILE}.refused`,
+    OPENCHAMBER_OPENCODE_URL: FEED_URL,
+  });
+  let refused = null;
+  for (let i = 0; i < 40 && refused?.errorKind !== 'access'; i += 1) {
+    await sleep(100);
+    refused = await (await svc7.call('/rate')).json();
+  }
+  check(
+    'a refused feed is reported as a permission problem',
+    refused?.connection === 'error' && refused?.errorKind === 'access',
+    JSON.stringify({ connection: refused?.connection, errorKind: refused?.errorKind, error: refused?.error }),
+  );
+  await stopService(svc7);
+  fs.rmSync(`${STATE_FILE}.refused`, { force: true });
+}
+
+// --- an OpenCode that does not know the type list reads the whole stream ----
+// Gauge asks for the event types it uses so a busy afternoon does not spend the
+// host's response limit on traffic it never reads. An OpenCode that refuses the
+// list must not leave the panel without numbers.
+{
+  const plain = new Set();
+  const filtered = http.createServer((req, res) => {
+    if (feedPath(req.url) !== '/api/event') { res.writeHead(404).end(); return; }
+    if (new URL(req.url, 'http://127.0.0.1').searchParams.has('types')) {
+      res.writeHead(400, { 'Content-Type': 'application/json' }).end('{"error":{"message":"unknown event type"}}');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+    res.flushHeaders();
+    plain.add(res);
+    req.on('close', () => plain.delete(res));
+  });
+  await new Promise((resolve) => filtered.listen(0, '127.0.0.1', resolve));
+  const svc8 = await startService('unfiltered', svcPort + 22, {
+    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+    OPENCHAMBER_GAUGE_STATE: `${STATE_FILE}.unfiltered`,
+    OPENCHAMBER_OPENCODE_URL: `http://127.0.0.1:${filtered.address().port}`,
+  });
+  let plainLive = null;
+  for (let i = 0; i < 60; i += 1) {
+    await sleep(100);
+    plainLive = await (await svc8.call('/rate')).json();
+    if (plain.size > 0 && plainLive?.connection === 'live') break;
+  }
+  check(
+    'a refused type list falls back to the whole stream',
+    plain.size > 0 && plainLive?.connection === 'live',
+    JSON.stringify(plainLive && { connection: plainLive.connection, error: plainLive.error }),
+  );
+  for (const res of plain) res.destroy();
+  filtered.close();
+  await stopService(svc8);
+  fs.rmSync(`${STATE_FILE}.unfiltered`, { force: true });
+}
+
+// --- the stream is cut in the middle of a reply -----------------------------
+// The host ends every transfer at 8 MB and OpenCode drops a consumer that falls
+// behind, so a cut mid-reply is ordinary, not an outage: the turn in flight
+// keeps its measurement, and the numbers continue from the next event.
+{
+  ev('session.execution.started', { sessionID: SESSION });
+  ev('session.step.started', { sessionID: SESSION, assistantMessageID: 'msgCut' });
+  ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgCut', ordinal: 0, delta: 'a'.repeat(400) });
+  await sleep(200);
+  const beforeCut = await (await svcFetch('/rate')).json();
+  check('the turn is live before the cut', beforeCut.busy === true && beforeCut.live.tps > 0, JSON.stringify({ busy: beforeCut.busy, tps: beforeCut.live.tps }));
+  for (const res of clients) res.destroy();
+  await sleep(400); // the reconnect is immediate; this is the round trip
+  const afterCut = await (await svcFetch('/rate')).json();
+  check('the service reconnected', afterCut.connection === 'live', JSON.stringify({ connection: afterCut.connection, error: afterCut.error }));
+  check(
+    'a cut that was healthy keeps the turn in flight',
+    afterCut.busy === true && afterCut.turn.active === true,
+    JSON.stringify({ busy: afterCut.busy, turn: afterCut.turn }),
+  );
+  ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgCut', ordinal: 1, delta: 'b'.repeat(400) });
+  ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgCut', tokens: { input: 0, output: 200, reasoning: 0 }, cost: 0 });
+  ev('session.execution.succeeded', { sessionID: SESSION });
+  await sleep(200);
+  const settled = await (await svcFetch('/rate')).json();
+  check(
+    'the turn settles with the tokens it reported',
+    settled.lastTurn?.tokens === 200 && settled.turn.active === false,
+    JSON.stringify(settled.lastTurn),
+  );
+  check('the live rate keeps counting after the cut', settled.live.tps >= 0, JSON.stringify(settled.live));
+}
+
+// --- the service sends its readings to the open pages -----------------------
+// A page used to ask four times a second whether anything had changed. Now the
+// service posts each watched session's reading to the host, which delivers it to
+// the section's frame. The mock callback is what an OpenChamber does.
+{
+  const calls = [];
+  const callback = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      if (req.url !== '/service/call') { res.writeHead(404).end(); return; }
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch { /* not a call */ }
+      calls.push(parsed);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ result: { delivered: true } }));
+    });
+  });
+  await new Promise((resolve) => callback.listen(0, '127.0.0.1', resolve));
+  const svc9 = await startService('pushing', svcPort + 23, {
+    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+    OPENCHAMBER_GAUGE_STATE: `${STATE_FILE}.push`,
+    OPENCHAMBER_OPENCODE_URL: FEED_URL,
+    OPENCHAMBER_HOST_CALLBACK_URL: `http://127.0.0.1:${callback.address().port}`,
+  });
+  const watched = await (await svc9.call('/watch', { method: 'POST', body: JSON.stringify({ sessionId: SESSION, model: 'smoke-model' }) })).json();
+  check('a watch reports that this host takes events', watched.push === true, JSON.stringify(watched));
+  ev('session.execution.started', { sessionID: SESSION });
+  ev('session.step.started', { sessionID: SESSION, assistantMessageID: 'msgPush' });
+  ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgPush', ordinal: 0, delta: 'c'.repeat(600) });
+  let pushed = null;
+  for (let i = 0; i < 40 && !pushed; i += 1) {
+    await sleep(100);
+    const call = calls.find((entry) => entry?.method === 'panels.emit');
+    pushed = call?.input?.topic === 'rate' ? call.input.data : null;
+  }
+  check(
+    'a watched session gets its reading pushed',
+    pushed !== null && pushed.session === SESSION && pushed.rate?.connection === 'live',
+    JSON.stringify(pushed && { session: pushed.session, connection: pushed.rate?.connection }),
+  );
+  check(
+    'a push carries the same body a page reads',
+    pushed !== null && ['live', 'curve', 'turn', 'lastTurn', 'cache', 'gauge'].every((field) => field in (pushed?.rate ?? {})),
+    JSON.stringify(pushed && Object.keys(pushed.rate)),
+  );
+  const quiet = calls.filter((entry) => entry?.method === 'panels.emit').length;
+  check('an unchanged reading is sent at most once every couple of seconds', quiet <= 6, `emits=${quiet}`);
+  ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgPush', ordinal: 1, delta: 'd'.repeat(600) });
+  let moved = false;
+  for (let i = 0; i < 40 && !moved; i += 1) {
+    await sleep(100);
+    moved = calls.filter((entry) => entry?.method === 'panels.emit').length > quiet;
+  }
+  check('a changed reading is pushed at once', moved, `emits=${calls.filter((entry) => entry?.method === 'panels.emit').length}`);
+  ev('session.execution.succeeded', { sessionID: SESSION });
+  await stopService(svc9);
+  callback.close();
+  fs.rmSync(`${STATE_FILE}.push`, { force: true });
+}
+
+// --- a host that does not deliver events is not a broken service ------------
+{
+  const refusing = http.createServer((req, res) => { res.writeHead(502).end(); });
+  await new Promise((resolve) => refusing.listen(0, '127.0.0.1', resolve));
+  const svc10 = await startService('no-push', svcPort + 24, {
+    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+    OPENCHAMBER_GAUGE_STATE: `${STATE_FILE}.nopush`,
+    OPENCHAMBER_OPENCODE_URL: FEED_URL,
+    OPENCHAMBER_HOST_CALLBACK_URL: `http://127.0.0.1:${refusing.address().port}`,
+  });
+  const answered = await (await svc10.call('/watch', { method: 'POST', body: JSON.stringify({ sessionId: SESSION }) })).json();
+  let told = answered;
+  for (let i = 0; i < 20 && told.push !== false; i += 1) {
+    await sleep(100);
+    told = await (await svc10.call('/watch', { method: 'POST', body: JSON.stringify({ sessionId: SESSION }) })).json();
+  }
+  check('a host that will not take events says so to the page', told.push === false, JSON.stringify(told));
+  const stillReading = await (await svc10.call(`/rate?sessionId=${SESSION}`)).json();
+  check('and the page can still ask for numbers itself', stillReading.connection === 'live', JSON.stringify(stillReading.connection));
+  await stopService(svc10);
+  refusing.close();
+  fs.rmSync(`${STATE_FILE}.nopush`, { force: true });
+}
 
 console.log(failures === 0 ? '\nALL SMOKE TESTS PASSED' : `\n${failures} FAILURES`);
 svc.kill();
-sseServer.close();
+for (const res of clients) res.destroy();
+feedServer.closeAllConnections();
+feedServer.close();
+decoy.close();
 fs.rmSync(STATE_FILE, { force: true });
-fs.rmSync(SMOKE_DATA_DIR, { recursive: true, force: true });
 process.exit(failures === 0 ? 0 : 1);

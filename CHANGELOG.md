@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.0.0
+
+- Gauge now runs on OpenChamber's own plumbing for extensions. The manifest says
+  `provides: ["opencode"]`, and OpenChamber hands the service the address of its
+  OpenCode plus a token that names this extension. The service no longer reads a
+  desktop client token or a UI password out of OpenChamber's settings, no longer
+  scans listening ports to guess where the app is, and sends nothing to an
+  address the host did not name. Approving Gauge in **Settings → Extensions** is
+  what lets it read your sessions.
+- The readings are pushed. The service posts each watched chat's reading to the
+  open pages; a page that has heard none for a while renews its watch and asks
+  for one itself. The same numbers either way, and a host that will not take the
+  posts is not a broken Gauge.
+- The numbers Gauge keeps live in the data folder OpenChamber creates for this
+  extension, which survives restarts and updates and is deleted with the
+  extension. It used to write beside the service, inside the installed package: a
+  1.0 service finds such a file, reads it once and removes it, so an existing
+  install keeps its last turns, its cache totals and its learned calibration.
+- The prompt reading works with any llama.cpp engine, not only Splash. A provider
+  named for `llama.cpp`, `llama-server`, `llama-swap` or Splash is asked for
+  `return_progress` at once; any other provider on a loopback `/v1` is asked only
+  after its own `GET /props` answers with llama.cpp's server properties. The
+  probe runs behind the request and never waits for one, it uses no credential
+  and never reads one, and LM Studio and Ollama are never asked.
+- The Memory line is drawn only where a memory reading exists: off a Mac the line
+  is not there at all, rather than a row of dashes.
+- A read that was not allowed says what is missing — `Allow Gauge to read your
+  sessions in Settings → Extensions` — in its own words, apart from a service
+  that cannot be reached.
+- The wire carries less: the live reading is one number (`tps`), a finished turn
+  keeps `activeMs` and its time split instead of that plus a wall span, and the
+  event counter, the per-turn history route, the stored turn list and the unused
+  reasoning-exclusion field are gone. A retry's cost is now unwound from the step
+  that reported it.
+- Removed: the borrowed-token authentication module, `/history`, and the fields
+  nothing read any more.
+
 ## 0.5.0
 
 - The section carries its own icon: the Work Status header draws a dial with

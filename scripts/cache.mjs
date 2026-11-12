@@ -1,4 +1,4 @@
-// Cache accounting tests: mock OpenChamber SSE stream + the built service.
+// Cache accounting tests: mock OpenCode event feed + the built service.
 //
 // Covers the two hit rates the status/panel surfaces draw (last settled step
 // and the conversation total, sub-sessions included), retry overwrites, steps
@@ -23,9 +23,6 @@ const OTHER = 'ses_cache_other';
 const SERVICE_TOKEN = 'cache-test-token';
 const STATE_FILE = path.join(os.tmpdir(), `gauge-cache-state-${process.pid}.json`);
 fs.rmSync(STATE_FILE, { force: true });
-const DATA_DIR = path.join(os.tmpdir(), `gauge-cache-data-${process.pid}`);
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.writeFileSync(path.join(DATA_DIR, 'settings.json'), '{}');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let failures = 0;
@@ -37,13 +34,13 @@ const check = (name, cond, extra = '') => {
   };
 };
 
-// --- mock OpenChamber: global event stream + session lookup -----------------
+// --- the mock feed: OpenCode's event stream plus the session lookup ---------
 const clients = new Set();
 /** Parent links the server knows but did not announce in a `session.created`. */
 const knownParents = new Map([[GRAND, CHILD], [CHILD, ROOT], [ROOT, null], [OTHER, null]]);
 let sessionLookups = 0;
 const sseServer = http.createServer((req, res) => {
-  if (req.url === '/api/global/event') {
+  if ((req.url ?? '').split('?')[0] === '/api/event') {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -70,7 +67,7 @@ const sseServer = http.createServer((req, res) => {
   res.writeHead(404).end();
 });
 await new Promise((resolve) => sseServer.listen(0, '127.0.0.1', resolve));
-const sseOrigin = `http://127.0.0.1:${sseServer.address().port}`;
+const FEED_URL = `http://127.0.0.1:${sseServer.address().port}`;
 
 const emit = (type, data) => {
   const frame = `data: ${JSON.stringify({ id: 'e', created: Date.now(), type, data })}\n\n`;
@@ -106,7 +103,7 @@ const watch = async (sessionId) => {
   const response = await fetch(`http://127.0.0.1:${servicePort}/watch`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ origin: sseOrigin, sessionId }),
+    body: JSON.stringify({ sessionId }),
     signal: AbortSignal.timeout(5_000),
   });
   assert.equal(response.status, 200);
@@ -119,7 +116,7 @@ const startService = async () => {
       OPENCHAMBER_SERVICE_PORT: String(servicePort),
       OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
       OPENCHAMBER_GAUGE_STATE: STATE_FILE,
-      OPENCHAMBER_DATA_DIR: DATA_DIR,
+      OPENCHAMBER_OPENCODE_URL: FEED_URL,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -295,18 +292,16 @@ try {
   // --- per-turn history snapshot ------------------------------------------
   emit('session.execution.succeeded', { sessionID: ROOT });
   await until(async () => (await request('/rate')).turn.active === false);
-  let history = await request('/history');
-
-  const lastTurn = history.turns.at(-1);
+  const finished = await request('/rate');
   check(
     'the finished turn stores its own cache totals',
-    lastTurn?.cache?.hit === 21000 && lastTurn?.cache?.miss === 4000,
-    JSON.stringify(lastTurn),
+    finished.lastTurn?.cache?.hit === 21000 && finished.lastTurn?.cache?.miss === 4000,
+    JSON.stringify(finished.lastTurn?.cache),
   );
   check(
-    'history exposes the conversation aggregate',
-    history.cache?.hit === 21000 && history.cache?.steps === 7,
-    JSON.stringify(history.cache),
+    'the reading carries the conversation aggregate beside it',
+    finished.cache?.hit === 21000 && finished.cache?.steps === 7,
+    JSON.stringify(finished.cache),
   );
 
   // --- restart keeps the numbers ------------------------------------------
@@ -351,10 +346,6 @@ try {
   const BG_ROOT = 'ses_cache_bg';
   await stopService();
   fs.rmSync(STATE_FILE, { force: true });
-  fs.writeFileSync(
-    path.join(DATA_DIR, 'settings.json'),
-    JSON.stringify({ desktopLocalPort: sseServer.address().port }),
-  );
   await startService();
   const postSessionEvent = (event) => fetch(`http://127.0.0.1:${servicePort}/session-events`, {
     method: 'POST',
@@ -378,15 +369,12 @@ try {
   check('session-events: an unknown type is refused', eventReply.status === 400, `status=${eventReply.status}`);
   await until(async () => (await request('/rate')).connection === 'live');
   step(BG_ROOT, 'msg_bg', { input: 500, output: 20, reasoning: 0, cache: { read: 5000, write: 0 } });
-  await until(async () => {
-    const h = await request(`/history?sessionId=${encodeURIComponent(BG_ROOT)}`);
-    return h.cache?.hit === 5000;
-  });
-  const bgHistory = await request(`/history?sessionId=${encodeURIComponent(BG_ROOT)}`);
+  await until(async () => (await request(`/rate?sessionId=${encodeURIComponent(BG_ROOT)}`)).cache?.hit === 5000);
+  const bgReading = await request(`/rate?sessionId=${encodeURIComponent(BG_ROOT)}`);
   check(
     'session-events: steps are counted with no page watching',
-    bgHistory.cache?.hit === 5000 && bgHistory.cache?.steps === 1,
-    JSON.stringify(bgHistory.cache),
+    bgReading.cache?.hit === 5000 && bgReading.cache?.steps === 1,
+    JSON.stringify(bgReading.cache),
   );
   await watch(BG_ROOT);
   const bgRate = await request('/rate');
@@ -411,15 +399,12 @@ try {
   await until(async () => (await request('/rate')).connection === 'live');
   emit('session.created', { sessionID: BG_STREAM, parentID: null });
   step(BG_STREAM, 'msg_bg_stream', { input: 400, output: 10, reasoning: 0, cache: { read: 3600, write: 0 } });
-  await until(async () => {
-    const h = await request(`/history?sessionId=${encodeURIComponent(BG_STREAM)}`);
-    return h.cache?.hit === 3600;
-  });
-  const streamHistory = await request(`/history?sessionId=${encodeURIComponent(BG_STREAM)}`);
+  await until(async () => (await request(`/rate?sessionId=${encodeURIComponent(BG_STREAM)}`)).cache?.hit === 3600);
+  const streamReading = await request(`/rate?sessionId=${encodeURIComponent(BG_STREAM)}`);
   check(
     'a root announced on the stream is counted without session events',
-    streamHistory.cache?.hit === 3600 && streamHistory.cache?.steps === 1,
-    JSON.stringify(streamHistory.cache),
+    streamReading.cache?.hit === 3600 && streamReading.cache?.steps === 1,
+    JSON.stringify(streamReading.cache),
   );
 } finally {
   await stopService();
@@ -427,7 +412,6 @@ try {
   sseServer.closeAllConnections();
   await new Promise((resolve) => sseServer.close(resolve));
   fs.rmSync(STATE_FILE, { force: true });
-  fs.rmSync(DATA_DIR, { recursive: true, force: true });
 }
 
 console.log(failures === 0 ? '\nALL CACHE TESTS PASSED' : `\n${failures} FAILURES`);

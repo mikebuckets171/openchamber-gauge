@@ -1,15 +1,17 @@
-// Gauge's OpenCode helper: Splash prompt progress, nothing else.
+// Gauge's OpenCode helper: prompt progress from a llama.cpp engine, nothing else.
 //
 // Ported from MLX Scope 6.0's helper (bridge/opencode, MIT) with its chat-delivery
-// observer removed. On a streaming Splash request it adds Splash's documented
-// `return_progress: true` option, watches the same response for `prompt_progress`
-// frames until output starts, and writes `{ total, cache, processed }` per request
-// to ~/.cache/gauge/prompt-progress. Gauge's service reads that file. No prompt,
+// observer removed. On a streaming request to a local llama.cpp engine it adds the
+// engine's own documented `return_progress: true` option, watches the same response
+// for `prompt_progress` frames until output starts, and writes `{ total, cache,
+// processed }` per request to ~/.cache/gauge/prompt-progress. Gauge's service reads
+// that file. Which engines may be asked is `providers.js`'s question: a name that
+// says llama.cpp or Splash, or an engine whose own `/props` says so. No prompt,
 // reply, header, key or raw session id is saved.
 import { randomUUID } from 'node:crypto';
 import { createStore, key } from './store.js';
 import { observeStream } from './stream.js';
-import { createSplashLookup, splashOptions } from './providers.js';
+import { createProgressLookup, progressEndpoint } from './providers.js';
 
 const SHARED = Symbol.for('gauge.prompt-progress.1');
 const PATHS = new Set(['/v1/chat/completions', '/v1/responses', '/v1/messages']);
@@ -57,7 +59,7 @@ async function jsonBody(request) {
   } catch { return null; } finally { reader.releaseLock(); }
 }
 
-export function makePlugin({ storeFactory = createStore, shared = globalThis, warn = message => console.warn(message) } = {}) {
+export function makePlugin({ storeFactory = createStore, shared = globalThis, warn = message => console.warn(message), probe } = {}) {
   return {
     id: 'gauge-prompt-progress',
     async setup(ctx) {
@@ -69,13 +71,14 @@ export function makePlugin({ storeFactory = createStore, shared = globalThis, wa
       let config = null, lookup = null;
       const named = ctx.options?.providerID !== undefined || ctx.options?.baseURL !== undefined;
       if (!named && typeof ctx.provider?.list === 'function') {
-        lookup = createSplashLookup({ list: async () => {
+        lookup = createProgressLookup({ probe, list: async () => {
           const value = await ctx.provider.list();
           return Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
         } });
       } else {
-        try { config = splashOptions(ctx.options); }
-        catch { warn('Gauge prompt progress options are not a loopback Splash /v1 endpoint.'); return async () => {}; }
+        // A copy added by hand names its engine, so it is asked at once.
+        try { config = { ...progressEndpoint(ctx.options), named: true, progress: true }; }
+        catch { warn('Gauge prompt progress options are not a loopback /v1 endpoint.'); return async () => {}; }
       }
       const holder = shared[SHARED] ??= { store: storeFactory({ warn }), refs: 0 };
       holder.refs += 1;
@@ -96,7 +99,7 @@ export function makePlugin({ storeFactory = createStore, shared = globalThis, wa
         await hook('http.request', async event => {
           if (released) return;
           const target = config ?? await lookup(event.model?.providerID);
-          if (!target || !eligible(event, target) || event.request.signal.aborted) return;
+          if (!target?.progress || !eligible(event, target) || event.request.signal.aborted) return;
           const body = await jsonBody(event.request);
           if (!body || body.stream !== true || event.request.signal.aborted) return;
           const headers = new Headers(event.request.headers); headers.delete('content-length');
@@ -106,7 +109,7 @@ export function makePlugin({ storeFactory = createStore, shared = globalThis, wa
         await hook('http.response', event => {
           if (released) return;
           const target = prepared.get(event.request);
-          if (!target || !eligible(event, target)) return;
+          if (!target?.progress || !eligible(event, target)) return;
           const requestID = randomUUID();
           const metadata = { requestID, sessionKey: key('session', event.sessionID), providerID: target.providerID,
             endpointKey: target.endpointKey, modelKey: key('model', event.model.id), kind: event.kind };

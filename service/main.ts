@@ -1,111 +1,73 @@
 // Gauge service for the `gauge` OpenChamber extension.
 //
 // Runs as the extension's local process (manifest `contributes.service`) on
-// 127.0.0.1, reachable only through the host proxy. It subscribes to the
-// OpenChamber event stream (`GET /api/global/event`, the same SSE the UI reads)
-// and derives an instant generation rate for one watched session.
+// 127.0.0.1, reachable only through the host proxy. It reads OpenCode's own
+// event stream through the read-only connection OpenChamber hands an approved
+// `opencode` service (`OPENCHAMBER_OPENCODE_URL`, `GET /api/event`), and
+// derives an instant generation rate per watched session.
 //
 // Differences from a naive rolling average: the live rate divides the buffered
 // characters by the span they actually cover (up to the window), so the number
 // is correct ~200 ms after streaming starts instead of climbing from 0 while
-// the window fills. Text and reasoning deltas are counted separately so the
-// panel can show the reasoning share and say so when a model reports none.
+// the window fills.
 //
 // The stream carries the OpenCode 2 wire events: `session.text.delta` and
 // `session.reasoning.delta` fragments, per-step token settlements
 // (`session.step.ended`), and execution status (`session.execution.*`).
 //
-// The status page hands it the OpenChamber origin and the session to watch via
-// `POST /watch`, then polls `GET /rate`. The service never reaches the browser
-// and the page never dials this process directly.
+// The status page names the session it shows with `POST /watch`. The service
+// pushes each watched session's reading to the open pages (`emit`), and still
+// answers `GET /rate` for a host that does not deliver those events. The
+// service never reaches the browser and the page never dials this process
+// directly.
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { createServiceHost } from '@openchamber/sdk';
 import { modelDisplayName } from '../shared/models';
 import { splitTurn, type TurnSplit } from '../shared/receipt';
 import { tokensFromChars } from '../shared/tokens';
-import { passwordAuthHeaders, trustedClientOrigin } from './auth';
 import { gaugeWire, noteDemand, takeReadMs } from './gauge';
 
-const execFileAsync = promisify(execFile);
+/**
+ * The read-only OpenCode connection OpenChamber gives an approved service.
+ *
+ * Its bearer is this service's own token, and the host forwards only the
+ * listed reads (sessions, projects, the event stream) to the OpenCode it is
+ * using now. Without it there is nothing to measure: the SDK is explicit that
+ * a service must not go looking for another OpenCode server instead.
+ */
+const OPENCODE_URL = (process.env.OPENCHAMBER_OPENCODE_URL ?? '').replace(/\/+$/, '');
+
+const opencodeHeaders = (accept: string): Record<string, string> => ({
+  Accept: accept,
+  Authorization: `Bearer ${process.env.OPENCHAMBER_SERVICE_TOKEN ?? ''}`,
+});
 
 /**
- * OpenChamber's data directory, and the loopback client token inside it.
- *
- * The SDK is explicit that a service never inherits the host environment:
- * "API keys, the UI password, and other host secrets never reach it". That
- * leaves a service with no credentialed channel to the server API, which does
- * not matter until the user sets a UI password - at which point every /api/*
- * route answers 401 and this service goes dark with nothing in the panel but
- * an error string.
- *
- * desktopLocalClientToken is the local-only credential the OpenChamber CLI
- * itself reads from the same file to make desktop-local API calls. It is not
- * the UI password, and it only means anything to an OpenChamber running on
- * this machine. A headless install has no desktop token, so a 401 also falls
- * back to the instance file's UI password in `passwordAuthHeaders()`.
- * OPENCHAMBER_GAUGE_CLIENT_TOKEN overrides the token lookup, and
- * OPENCHAMBER_GAUGE_UI_PASSWORD overrides the instance-file password.
+ * The event types the measurement reads. Asking for these alone keeps the
+ * stream small: the host ends a transfer at 8 MB, and the rest of OpenCode's
+ * traffic would only bring that reconnect sooner. An OpenCode that does not
+ * know one of these names refuses the list, and then the stream is read whole.
  */
-const dataDir = (): string => {
-  const override = process.env.OPENCHAMBER_DATA_DIR;
-  if (override && override.trim()) return path.resolve(override.trim());
-  return path.join(os.homedir(), '.config', 'openchamber');
-};
+const EVENT_TYPES = [
+  'session.created',
+  'session.text.delta', 'session.text.ended',
+  'session.reasoning.delta', 'session.reasoning.ended',
+  'session.tool.input.started', 'session.tool.input.delta', 'session.tool.input.ended',
+  'session.tool.called', 'session.tool.success', 'session.tool.failed',
+  'session.shell.started', 'session.shell.ended',
+  'session.step.started', 'session.step.ended', 'session.step.failed',
+  'session.execution.started', 'session.execution.succeeded',
+  'session.execution.failed', 'session.execution.interrupted',
+  'permission.asked', 'permission.replied',
+  'form.created', 'form.replied', 'form.cancelled',
+];
+let filterTypes = true;
 
-const readClientToken = (): string => {
-  const override = process.env.OPENCHAMBER_GAUGE_CLIENT_TOKEN;
-  if (override && override.trim()) return override.trim();
-  try {
-    const raw = JSON.parse(fs.readFileSync(path.join(dataDir(), 'settings.json'), 'utf8')) as {
-      desktopLocalClientToken?: unknown;
-    };
-    const value = raw?.desktopLocalClientToken;
-    if (typeof value === 'string' && value.trim()) return value.trim();
-  } catch {
-    // No desktop settings here: a headless server has no UI password either,
-    // so an empty token is the right answer rather than a failure.
-  }
-  return '';
-};
-
-/** Never send the local bearer to an unverified page-provided address. */
-const serverHeaders = async (origin: string): Promise<Record<string, string>> => {
-  const own = desktopOrigin();
-  let endpoints: ListenEndpoint[] = [];
-  if (!own) {
-    try { endpoints = await parentListenEndpoints(); } catch { return {}; }
-  }
-  if (!trustedClientOrigin(origin, own, endpoints)) return {};
-  const token = readClientToken();
-  return token ? { Authorization: `Bearer ${token}` } : {};
-};
-
-/**
- * The loopback origin of the desktop's own server, from the same settings file.
- *
- * A relay client hands the guest over as a self-contained `srcDoc`, so the page
- * has no origin to report. The desktop knows the port it listens on, and this
- * process is its child, so that port is the server beside us. Reading it beats
- * scanning the process's listeners: on Windows the socket may belong to another
- * token or compartment and name no PID, and headless installs have no desktop
- * port at all, which is why discovery still runs as the last resort.
- */
-const desktopOrigin = (): string | null => {
-  try {
-    const raw = JSON.parse(fs.readFileSync(path.join(dataDir(), 'settings.json'), 'utf8')) as {
-      desktopLocalPort?: unknown;
-    };
-    const port = Number(raw?.desktopLocalPort);
-    if (!Number.isInteger(port) || port <= 0 || port > 65_535) return null;
-    return `http://127.0.0.1:${port}`;
-  } catch {
-    return null;
-  }
-};
+/** The way back into OpenChamber: pushes readings to the open pages. */
+const serviceHost = createServiceHost({ env: process.env });
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 const token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
@@ -132,10 +94,18 @@ const CURVE_BUCKETS = 24;
 const SAMPLE_LIMIT = 20_000;
 const RETRY_BASE_MS = 1_000;
 const RETRY_MAX_MS = 15_000;
-/** A candidate origin that accepts the connection but never answers is written off here. */
-const PROBE_TIMEOUT_MS = 2_000;
-/** Origin discovery is a handful of dials against the parent process; keep it off the hot retry path. */
-const DISCOVERY_INTERVAL_MS = 5_000;
+/** What a `/watch` may name: an OpenCode session id, and a model name. */
+const SESSION_ID_MAX = 256;
+const MODEL_NAME_MAX = 256;
+/**
+ * A stream that was live this recently resumes the turns it was measuring.
+ *
+ * The host ends every transfer at 8 MB and OpenCode drops a consumer that falls
+ * behind, so a busy afternoon reconnects many times; a reconnect takes a few
+ * milliseconds and loses a handful of deltas at most. Only a real outage, long
+ * enough that a turn may have ended unseen, clears what was in flight.
+ */
+const RESUME_GAP_MS = 15_000;
 
 // Characters are converted to tokens with the heuristic ported from
 // opencode-tps-meter (see shared/tokens.ts): ceil(chars / 4). It is an
@@ -182,18 +152,11 @@ const MAX_STREAM_GAP_MS = 1_000;
 type ConnectionState = 'idle' | 'connecting' | 'live' | 'error';
 
 /** What kind of failure `lastError` describes, so the panel can word it. */
-type ErrorKind = 'network' | 'http' | 'closed';
+type ErrorKind = 'network' | 'http' | 'closed' | 'access';
 
 type Sample = { at: number; chars: number; kind: 'text' | 'reasoning' | 'tool' };
 
 type WatchConfig = {
-  /**
-   * The origin the page was served from, or `null` when it has none: a relay
-   * client mounts a guest as a `srcDoc`, whose location is `about:srcdoc`
-   * with no http(s) origin to report. The service then finds the server on
-   * this machine instead of dialing the client's address.
-   */
-  origin: string | null;
   sessionId: string | null;
   /**
    * The model the chat has selected, as the page knows it.
@@ -214,8 +177,6 @@ type TurnResult = {
   tokens: number;
   /** Denominator of the average: summed measurable step nets (step spans minus in-step tool time minus unreported-reasoning spans). */
   activeMs: number;
-  /** First streamed character to turn end, for reference. */
-  wallMs: number;
   /** Execution start to first streamed character; null when never observed. */
   ttftMs: number | null;
   /** Whether any reasoning (deltas or settled tokens) was seen this turn. */
@@ -298,19 +259,32 @@ type CacheTotals = {
   prevHitRate: number | null;
   /** Totals already folded into a finished turn: the base of the next snapshot. */
   turnBase: { hit: number; miss: number; steps: number; output: number } | null;
+  /** What the newest step added, so a retry of it can take that back out. */
+  lastStep: StepFolded | null;
+};
+
+/** One settled step's share of the totals. */
+type StepFolded = {
+  sessionId: string;
+  messageID: string;
+  cost: number;
+  output: number;
+  reasoning: number;
+  /** Whether it reported a cache block, so its prompt split is in the totals. */
+  cached: boolean;
+  hit: number;
+  miss: number;
+  input: number;
+  write: number;
 };
 
 /** A session's durable numbers, as written to disk and read back on startup. */
-type TurnPoint = { tps: number; at: number; cache?: TurnCache | null };
 /** The persisted form of `CacheTotals`: a Set does not survive JSON. */
 type CacheMemory = Omit<CacheTotals, 'sessions'> & { sessions: string[] };
 type SessionMemory = {
   lastTurn: TurnResult | null;
-  turns: TurnPoint[];
   cache?: CacheMemory | null;
 };
-/** Finished turns kept per conversation; each carries its own cache snapshot. */
-const TURNS_CAP = 100;
 /** Sessions remembered; oldest evicted past this. */
 const SESSIONS_CAP = 20;
 /** How long a change waits before it is written, so a burst of events coalesces. */
@@ -338,6 +312,7 @@ function emptyCache(): CacheTotals {
     last: null,
     prevHitRate: null,
     turnBase: null,
+    lastStep: null,
   };
 }
 
@@ -371,15 +346,22 @@ const foldCacheStep = (
   now: number,
 ): void => {
   const last = agg.last;
-  const retrying = last !== null && last.sessionId === sessionId && last.messageID === messageID;
-  if (retrying && last) {
-    agg.hit -= last.hit;
-    agg.miss -= last.miss;
-    agg.input -= last.input;
-    agg.write -= last.write;
-    agg.output -= last.output;
-    agg.reasoning -= last.reasoning;
+  // A retry is recognized by the step it repeats, whatever that step
+  // reported. Matching on the cache point alone missed a provider that reports
+  // no cache (no point is kept for it) and left its first cost in the total.
+  const before = agg.lastStep;
+  const retrying = before !== null && before.sessionId === sessionId && before.messageID === messageID;
+  if (retrying && before) {
+    agg.output -= before.output;
+    agg.reasoning -= before.reasoning;
+    agg.cost -= before.cost;
     agg.steps = Math.max(0, agg.steps - 1);
+    if (before.cached) {
+      agg.hit -= before.hit;
+      agg.miss -= before.miss;
+      agg.input -= before.input;
+      agg.write -= before.write;
+    }
   }
   if (agg.startedAt === null) agg.startedAt = now;
   agg.sessions.add(sessionId);
@@ -387,18 +369,33 @@ const foldCacheStep = (
   agg.output += usage.output;
   agg.reasoning += usage.reasoning;
   agg.cost += usage.cost;
-  if (!usage.hasCache) {
-    // A provider that reports no cache still counts as a call, but must not
-    // move the two rates: its miss share is unknown, not zero.
-    return;
-  }
   const hit = usage.cacheRead;
   const miss = usage.input + usage.cacheWrite;
+  agg.lastStep = {
+    sessionId,
+    messageID,
+    cost: usage.cost,
+    output: usage.output,
+    reasoning: usage.reasoning,
+    cached: usage.hasCache,
+    hit,
+    miss,
+    input: usage.input,
+    write: usage.cacheWrite,
+  };
+  if (!usage.hasCache) {
+    // A provider that reports no cache still counts as a call, but must not
+    // move the two rates: its miss share is unknown, not zero. A retry that
+    // took back a cached first attempt takes its point with it.
+    if (retrying && before?.cached && last?.messageID === messageID) agg.last = null;
+    return;
+  }
   agg.hit += hit;
   agg.miss += miss;
   agg.write += usage.cacheWrite;
   agg.input += usage.input;
-  const previous = retrying ? agg.prevHitRate : (last?.hitRate ?? null);
+  const repeatsPoint = last !== null && last.sessionId === sessionId && last.messageID === messageID;
+  const previous = repeatsPoint ? agg.prevHitRate : (last?.hitRate ?? null);
   const hitRate = cacheRate(hit, miss);
   agg.last = {
     at: now,
@@ -547,6 +544,21 @@ const restoreCache = (raw: unknown): CacheTotals => {
       output: readNumber(base.output),
     };
   }
+  const step = readRecord(rec.lastStep);
+  if (step && typeof step.sessionId === 'string' && typeof step.messageID === 'string') {
+    agg.lastStep = {
+      sessionId: step.sessionId,
+      messageID: step.messageID,
+      cost: readNumber(step.cost),
+      output: readNumber(step.output),
+      reasoning: readNumber(step.reasoning),
+      cached: step.cached === true,
+      hit: readNumber(step.hit),
+      miss: readNumber(step.miss),
+      input: readNumber(step.input),
+      write: readNumber(step.write),
+    };
+  }
   return agg;
 };
 
@@ -574,23 +586,9 @@ let watch: WatchConfig | null = null;
 let connection: ConnectionState = 'idle';
 let lastError: string | null = null;
 let lastErrorKind: ErrorKind | null = null;
-/**
- * The origin the stream is actually attached to when it is not the one the
- * status page handed us.
- *
- * The page reports the URL *it* was served from, which is a port forward
- * whenever the desktop reaches a remote instance over SSH: `127.0.0.1:<tunnel>`
- * exists on the client, not here. This process is spawned by the server that
- * serves that page, so it runs beside the real listener and can dial it
- * directly. One service process talks to one server, so this sticks until the
- * page's origin changes.
- */
-let serverOrigin: string | null = null;
-/** Throttle for the port scan behind `discoverServerOrigin`. */
-let lastDiscoveryAt = 0;
+/** When the stream last went down; a short gap resumes the turns in flight. */
+let streamLostAt: number | null = null;
 let lastEventAt = 0;
-/** Every parsed event on the stream, watched session or not, for diagnosis. */
-let eventsSeen = 0;
 let busy = false;
 let controller: AbortController | null = null;
 let retryTimer: NodeJS.Timeout | null = null;
@@ -688,14 +686,6 @@ const clearTurn = (): void => {
   turnStepOrder = [];
 };
 
-/**
- * Finished turns of the watched session, oldest first.
- *
- * Kept on disk as the session's measured history and the source of `lastTurn`.
- * Not drawn: the sparkline shows the live rate window, and a point per turn
- * next to a point per bucket is two time bases on one axis.
- */
-let turns: TurnPoint[] = [];
 
 /**
  * Everything the measurement keeps for one session.
@@ -746,7 +736,6 @@ type SessionState = {
   fbChars: number;
   fbTps: number;
   lastTurn: TurnResult | null;
-  turns: TurnPoint[];
   cache: CacheTotals;
   pendingPermissions: Set<string>;
   pendingQuestions: Set<string>;
@@ -815,7 +804,6 @@ const createSessionState = (sessionId: string): SessionState => ({
   fbChars: -1,
   fbTps: NaN,
   lastTurn: null,
-  turns: [],
   cache: emptyCache(),
   pendingPermissions: new Set(),
   pendingQuestions: new Set(),
@@ -887,7 +875,6 @@ const loadState = (state: SessionState): void => {
   fbChars = state.fbChars;
   fbTps = state.fbTps;
   lastTurn = state.lastTurn;
-  turns = state.turns;
   cache = state.cache;
   pendingPermissions = state.pendingPermissions;
   pendingQuestions = state.pendingQuestions;
@@ -934,7 +921,6 @@ const leaveSession = (): void => {
   state.fbChars = fbChars;
   state.fbTps = fbTps;
   state.lastTurn = lastTurn;
-  state.turns = turns;
   state.cache = cache;
   state.pendingPermissions = pendingPermissions;
   state.pendingQuestions = pendingQuestions;
@@ -957,23 +943,34 @@ const blankSession = createSessionState('');
 /**
  * Where the durable numbers live.
  *
- * Beside the service itself so a git-installed extension keeps them across a
- * restart without writing into anything tracked (the file is gitignored), with
- * `OPENCHAMBER_GAUGE_STATE` overriding it — the smoke test points that at a
- * scratch path so runs cannot leak into each other. A directory the process
- * cannot write falls back to the temp dir instead of failing startup.
+ * In the folder OpenChamber keeps for this extension
+ * (`OPENCHAMBER_SERVICE_DATA_DIR`), which survives restarts and updates and
+ * goes when the extension is removed. A write inside the package itself can
+ * reload the extension, which is why the file no longer sits beside the
+ * service. `OPENCHAMBER_GAUGE_STATE` overrides it, so tests cannot leak into
+ * each other, and a folder that cannot be written falls back to the temp dir
+ * instead of failing startup.
  */
 const statePaths = (): string[] => {
   const override = process.env.OPENCHAMBER_GAUGE_STATE;
   if (override) return [override];
+  const dataDir = process.env.OPENCHAMBER_SERVICE_DATA_DIR;
+  const fallback = path.join(os.tmpdir(), 'openchamber-gauge-state.json');
+  return dataDir ? [path.join(dataDir, 'state.json'), fallback] : [fallback];
+};
+
+/**
+ * Where versions before 1.0 kept the numbers: beside the service, inside the
+ * package. Read once so nothing is lost on the update, then removed.
+ */
+const legacyStatePath = (): string | null => {
+  if (process.env.OPENCHAMBER_GAUGE_STATE) return null;
   const entry = process.argv[1];
-  const beside = entry ? path.dirname(entry) : process.cwd();
-  return [path.join(beside, '.gauge-state.json'), path.join(os.tmpdir(), 'openchamber-gauge-state.json')];
+  return entry ? path.join(path.dirname(entry), '.gauge-state.json') : null;
 };
 
 const memoryOf = (state: SessionState): SessionMemory => ({
   lastTurn: state.lastTurn,
-  turns: state.turns.slice(-TURNS_CAP),
   cache: cacheMemory(state.cache),
 });
 
@@ -1011,7 +1008,8 @@ const readModels = (file: string): Record<string, number> => {
 
 /** Restore durable numbers so a restarted service answers immediately. */
 const readPersisted = (): void => {
-  for (const file of statePaths()) {
+  const legacy = legacyStatePath();
+  for (const file of [...statePaths().slice(0, 1), ...(legacy ? [legacy] : []), ...statePaths().slice(1)]) {
     const sessions = readSessions(file);
     if (Object.keys(sessions).length === 0) continue;
     for (const [model, factor] of Object.entries(readModels(file))) {
@@ -1021,7 +1019,6 @@ const readPersisted = (): void => {
       const memory = raw as Partial<SessionMemory>;
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
-      state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
       state.cache = restoreCache(memory.cache);
       sessionStates.set(id, state);
     }
@@ -1052,8 +1049,13 @@ const writePersisted = (): void => {
         models: { ...readModels(file), ...Object.fromEntries(calibration) },
       });
       const tmp = `${file}.${process.pid}.tmp`;
+      fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(tmp, payload, 'utf8');
       fs.renameSync(tmp, file);
+      // The numbers are safe in their new home: the old copy inside the
+      // package goes, once.
+      const legacy = legacyStatePath();
+      if (legacy && legacy !== file) fs.rmSync(legacy, { force: true });
       return;
     } catch {
       // Read-only extension folder: try the next path, and if none works the
@@ -1086,7 +1088,7 @@ const schedulePersist = (): void => {
  *
  * A turn's closing events were sent while we were disconnected, so they are
  * gone for good: leaving `busy` or an open step behind would freeze the panel
- * on "generating" forever. Finished work — `lastTurn`, `turns` — is untouched,
+ * on "generating" forever. Finished work — `lastTurn` — is untouched,
  * which is the part worth keeping. This replaces the reset that a watch change
  * used to perform as a side effect.
  */
@@ -1206,20 +1208,6 @@ const stepToolWithinMs = (step: StepRecord, fromMs: number, toMs: number): numbe
   return total;
 };
 
-/**
- * Reasoning span excluded from a step.
- *
- * Nothing is excluded. Providers fold reasoning tokens into `output` — every
- * `session.step.ended` in a 200 s capture of three sessions reported
- * `reasoning: 0` while streaming thousands of reasoning characters, and
- * `output` matched `chars/4` for reasoning plus text plus tool input together
- * (11003 reasoning characters, no text, `output` 2861). So the reasoning span
- * is time during which the tokens being counted were produced, and removing
- * it from the divisor counts that work twice: one session read 218 tok/s
- * against the 74 its events support. A provider that reports reasoning
- * separately already gets the right answer from `output + reasoning`.
- */
-const stepReasoningExclMs = (_step: StepRecord): number => 0;
 
 /**
  * No provider streams anywhere near this fast; a rate above it means the
@@ -1272,11 +1260,14 @@ const contributeStep = (step: StepRecord): StepContribution | null => {
   // (a model thinking with no deltas) extends no denominator, so the number
   // holds instead of sagging. Tool time past that point is excluded the same
   // way. Settled steps keep their settle timestamp, matching server timing.
+  // Reasoning time stays in: providers fold reasoning tokens into `output`
+  // (a 200 s capture of three sessions reported `reasoning: 0` on every step
+  // while thousands of reasoning characters streamed), so cutting that span
+  // counted the work twice and read 218 tok/s where the events support 74.
   const genStart = generationStart(step);
   const endRef = step.endAt ?? step.lastDeltaAt ?? step.startAt;
   const netMs = Math.max(0, endRef - genStart)
-    - stepToolWithinMs(step, genStart, endRef)
-    - stepReasoningExclMs(step);
+    - stepToolWithinMs(step, genStart, endRef);
   if (!(netMs >= 1)) return null;
   let tokens: number;
   let real: boolean;
@@ -1416,15 +1407,12 @@ const finalizeTurn = (now: number): void => {
       source: sum.real ? 'tokens' : 'estimate',
       tokens: sum.tokens,
       activeMs: Math.round(sum.netMs),
-      wallMs,
       ttftMs: sum.ttftMs,
       hasReasoning: turnReasoningChars > 0 || [...steps.values()].some((s) => s.reasoning > 0),
       endedAt: now,
       cache: turnCache,
       split: turnSplit(now, sum.netMs),
     };
-    turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
-    if (turns.length > TURNS_CAP) turns.splice(0, turns.length - TURNS_CAP);
     schedulePersist();
     clearTurn();
     return;
@@ -1452,15 +1440,12 @@ const finalizeTurn = (now: number): void => {
     source: 'estimate',
     tokens: estimateTokens(turnChars),
     activeMs,
-    wallMs,
     ttftMs: turnTtftMs(),
     hasReasoning: turnReasoningChars > 0,
     endedAt: now,
     cache: turnCache,
     split: turnSplit(now, activeMs),
   };
-  turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
-  if (turns.length > TURNS_CAP) turns.splice(0, turns.length - TURNS_CAP);
   schedulePersist();
   clearTurn();
 };
@@ -1672,36 +1657,28 @@ const holdForLookup = (sessionId: string, event: RawEvent): void => {
   deferredEvents.set(sessionId, held);
 };
 
-/** `parentID` of one session, read from the server; null when it cannot be read. */
+/** `parentID` of one session, read from OpenCode; null when it cannot be read. */
 const fetchSessionParent = async (sessionId: string): Promise<string | null> => {
-  const bases: string[] = [];
-  for (const candidate of [serverOrigin, watch?.origin, desktopOrigin()]) {
-    if (candidate && !bases.includes(candidate)) bases.push(candidate);
-  }
-  for (const base of bases) {
-    let response: Response;
-    try {
-      response = await fetch(new URL(`/api/session/${encodeURIComponent(sessionId)}`, base), {
-        headers: { Accept: 'application/json', ...await serverHeaders(base) },
-        signal: AbortSignal.timeout(3_000),
-        redirect: 'manual',
-      });
-    } catch {
-      continue;
-    }
+  if (!OPENCODE_URL) return null;
+  try {
+    const response = await fetch(`${OPENCODE_URL}/api/session/${encodeURIComponent(sessionId)}`, {
+      headers: opencodeHeaders('application/json'),
+      signal: AbortSignal.timeout(3_000),
+      redirect: 'manual',
+    });
     const contentType = response.headers.get('content-type') ?? '';
-    if (!response.ok || !contentType.includes('application/json')) {
+    if (!response.ok || !contentType.includes('json')) {
       await response.body?.cancel().catch(() => undefined);
-      continue;
-    }
-    try {
-      const body = await response.json() as Record<string, unknown>;
-      return readString(body.parentID);
-    } catch {
       return null;
     }
+    const body = readRecord(await response.json());
+    if (!body) return null;
+    // OpenCode answers the session itself, or wraps it in `data`.
+    const record = readRecord(body.data) ?? body;
+    return readString(record.parentID) || readString(record.parentId);
+  } catch {
+    return null;
   }
-  return null;
 };
 
 const resolveSessionParent = async (sessionId: string): Promise<void> => {
@@ -1847,7 +1824,7 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
   if (type === 'session.shell.started') {
     if (!isWatchedSession(payload.sessionID)) return;
     markActive(now);
-    const key = `shell:${readString(payload.id) || String(eventsSeen)}`;
+    const key = `shell:${readString(payload.id) || `at${now}`}`;
     activeToolIds.add(key);
     if (toolStartAt === null && turnExecAt !== null) toolStartAt = now;
     const openId = latestOpenStepId();
@@ -2083,253 +2060,38 @@ const handleSseChunk = (chunk: string): void => {
   // `{ payload, directory, eventId }` is unwrapped here.
   const envelope = parsed as { payload?: unknown };
   const event = (envelope.payload && typeof envelope.payload === 'object' ? envelope.payload : parsed) as RawEvent;
-  eventsSeen += 1;
   handleEvent(event, Date.now());
 };
 
-type ListenEndpoint = { host: string; port: number };
-
-/** `127.0.0.1:57123`, `[::1]:57123`, `*:37389` -> `{ host, port }`. */
-const parseEndpoint = (value: string): ListenEndpoint | null => {
-  const bracketed = /^\[([^\]]*)\]:(\d+)$/.exec(value);
-  if (bracketed) return { host: bracketed[1], port: Number(bracketed[2]) };
-  const plain = /^([^:]+):(\d+)$/.exec(value);
-  if (plain) return { host: plain[1], port: Number(plain[2]) };
-  return null;
-};
-
-/** Build a loopback origin; wildcard binds are dialled over `127.0.0.1`. */
-const toOrigin = (scheme: string, host: string, port: number): string => {
-  const dial = host === '' || host === '*' || host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
-  return `${scheme}://${dial.includes(':') ? `[${dial}]` : dial}:${port}`;
-};
-
-/** stdout of a helper binary; anything unusable reads as "no endpoints". */
-const runFile = async (file: string, args: string[]): Promise<string> => {
-  const { stdout } = await execFileAsync(file, args, {
-    encoding: 'utf8',
-    maxBuffer: 16 * 1024 * 1024,
-    windowsHide: true,
-  });
-  return String(stdout);
-};
-
-/** Windows: `netstat -ano`, one socket per line with the owning PID last. */
-const windowsListenEndpoints = async (pid: number): Promise<ListenEndpoint[]> => {
-  const out = await runFile('netstat', ['-ano']);
-  const found: ListenEndpoint[] = [];
-  for (const line of out.split(/\r?\n/)) {
-    const cols = line.trim().split(/\s+/);
-    if (cols.length < 5 || cols[0] !== 'TCP') continue;
-    if (Number(cols[4]) !== pid) continue;
-    // A listener reports a wildcard peer. The state word is localized on some
-    // Windows builds, so the peer is the primary test and the state a fallback.
-    const listening = cols[2] === '0.0.0.0:0' || cols[2] === '[::]:0' || cols[2] === '*:*' || cols[3] === 'LISTENING';
-    if (!listening) continue;
-    const endpoint = parseEndpoint(cols[1]);
-    if (endpoint) found.push(endpoint);
-  }
-  return found;
-};
-
-/** Linux: `ss -ltnp`, whose last column carries `pid=<n>` for our own sockets. */
-const ssListenEndpoints = async (pid: number): Promise<ListenEndpoint[]> => {
-  const out = await runFile('ss', ['-ltnp']);
-  const found: ListenEndpoint[] = [];
-  for (const line of out.split(/\r?\n/)) {
-    const cols = line.trim().split(/\s+/);
-    if (cols.length < 6 || cols[0] !== 'LISTEN') continue;
-    if (!new RegExp(`\\bpid=${pid}\\b`).test(cols.slice(5).join(' '))) continue;
-    const endpoint = parseEndpoint(cols[3]);
-    if (endpoint) found.push(endpoint);
-  }
-  return found;
-};
-
-/** macOS: `lsof`, where the NAME column reads `127.0.0.1:37389 (LISTEN)`. */
-const lsofListenEndpoints = async (pid: number): Promise<ListenEndpoint[]> => {
-  const out = await runFile('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-p', String(pid)]);
-  const found: ListenEndpoint[] = [];
-  for (const line of out.split(/\r?\n/)) {
-    const match = /\bTCP\s+(\S+)/.exec(line);
-    if (!match) continue;
-    const endpoint = parseEndpoint(match[1]);
-    if (endpoint) found.push(endpoint);
-  }
-  return found;
-};
-
-/** `/proc/net/tcp{,6}` local address (`0100007F:A857`) -> loopback-safe endpoint. */
-const LITTLE_ENDIAN = os.endianness() === 'LE';
-
-const procEndpoint = (value: string, ipv6: boolean): ListenEndpoint | null => {
-  const [address, portHex] = value.split(':');
-  if (!address || !portHex) return null;
-  const port = Number.parseInt(portHex, 16);
-  if (!Number.isInteger(port) || port <= 0) return null;
-  if (ipv6) {
-    // Only the loopback listener matters here. `/proc` prints ::1 in host byte
-    // order, and a wildcard bind answers on ::1 too; any other IPv6 bind is
-    // left to `ss`/`lsof`.
-    const loopback = `${'0'.repeat(24)}${LITTLE_ENDIAN ? '01000000' : '00000001'}`;
-    return address === loopback || address === '0'.repeat(32) ? { host: '::1', port } : null;
-  }
-  if (address === '00000000') return { host: '', port };
-  const bytes = address.match(/../g);
-  if (!bytes || bytes.length !== 4) return null;
-  // The kernel prints the IPv4 address in host byte order; read it back.
-  const ordered = LITTLE_ENDIAN ? [...bytes].reverse() : bytes;
-  const host = ordered.map((byte) => Number.parseInt(byte, 16)).join('.');
-  return { host, port };
-};
-
-/**
- * Linux without iproute2 (`ss`) or `lsof`, as in a minimal container. The
- * parent's `/proc/<pid>/fd` names every socket it owns, and `/proc/net/tcp{,6}`
- * maps those inodes to listening endpoints — the same answer `ss -ltnp` gives,
- * read straight from the kernel.
- */
-const procListenEndpoints = async (pid: number): Promise<ListenEndpoint[]> => {
-  const fdDir = `/proc/${pid}/fd`;
-  const inodes = new Set<string>();
-  for (const entry of await fs.promises.readdir(fdDir)) {
-    try {
-      const target = await fs.promises.readlink(path.join(fdDir, entry));
-      const match = /^socket:\[(\d+)\]$/.exec(target);
-      if (match) inodes.add(match[1]);
-    } catch {
-      // A descriptor closed while we scanned is simply not a listener.
-    }
-  }
-  if (inodes.size === 0) return [];
-  const found: ListenEndpoint[] = [];
-  for (const [file, ipv6] of [
-    ['/proc/net/tcp', false],
-    ['/proc/net/tcp6', true],
-  ] as const) {
-    let text: string;
-    try {
-      text = await fs.promises.readFile(file, 'utf8');
-    } catch {
-      continue;
-    }
-    for (const line of text.split('\n').slice(1)) {
-      const cols = line.trim().split(/\s+/);
-      // State 0A is LISTEN, and column 9 is the socket inode.
-      if (cols.length < 10 || cols[3] !== '0A' || !inodes.has(cols[9])) continue;
-      const endpoint = procEndpoint(cols[1], ipv6);
-      if (endpoint) found.push(endpoint);
-    }
-  }
-  return found;
-};
-
-/**
- * Ports the parent process listens on. The parent *is* the OpenChamber server
- * that spawned this service, so its listeners are the only ones worth dialling:
- * that keeps the scan inside our own process tree instead of the whole machine.
- */
-const parentListenEndpoints = async (): Promise<ListenEndpoint[]> => {
-  const pid = process.ppid;
-  if (!Number.isInteger(pid) || pid <= 1) return [];
-  if (process.platform === 'win32') {
-    try {
-      return await windowsListenEndpoints(pid);
-    } catch {
-      return [];
-    }
-  }
-  try {
-    const found = await ssListenEndpoints(pid);
-    if (found.length > 0) return found;
-  } catch {
-    // `ss` belongs to iproute2 and is absent on macOS, which ships `lsof`.
-  }
-  try {
-    const found = await lsofListenEndpoints(pid);
-    if (found.length > 0) return found;
-  } catch {
-    // Neither helper is guaranteed on a minimal Linux host; /proc always is.
-  }
-  try {
-    return await procListenEndpoints(pid);
-  } catch {
-    return [];
-  }
-};
-
-/**
- * What an origin answers on `/api/global/event`: `stream` when it is the event
- * stream, `refused` when the endpoint exists but rejects us (a 401/403 still
- * identifies the server, and a real stream error beats a dead connection),
- * `null` when it is not OpenChamber at all.
- */
-const probeEventStream = async (origin: string, signal: AbortSignal): Promise<'stream' | 'refused' | null> => {
-  try {
-    const response = await fetch(new URL('/api/global/event', origin), {
-      headers: { Accept: 'text/event-stream', ...await serverHeaders(origin) },
-      signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
-      redirect: 'manual',
-    });
-    const body = response.body;
-    if (body) void body.cancel().catch(() => undefined);
-    if (response.status === 401 || response.status === 403) return 'refused';
-    if (response.ok && (response.headers.get('content-type') ?? '').includes('text/event-stream')) return 'stream';
-    return null;
-  } catch {
-    return null;
-  }
-};
-
-/**
- * Find the server on this machine, for when the page's origin is a port
- * forward: its loopback exists only on the client, so the dial dies with
- * `fetch failed` while the real listener is one process away.
- */
-const discoverServerOrigin = async (signal: AbortSignal): Promise<string | null> => {
-  const now = Date.now();
-  if (now - lastDiscoveryAt < DISCOVERY_INTERVAL_MS) return null;
-  lastDiscoveryAt = now;
-  let endpoints: ListenEndpoint[];
-  try {
-    endpoints = await parentListenEndpoints();
-  } catch {
-    return null;
-  }
-  let refused: string | null = null;
-  for (const { host, port: candidate } of endpoints) {
-    if (signal.aborted) return null;
-    for (const scheme of ['http', 'https']) {
-      const origin = toOrigin(scheme, host, candidate);
-      const probe = await probeEventStream(origin, signal);
-      if (probe === 'stream') {
-        console.log(`[gauge] event stream origin is ${origin}; the page's origin was unreachable here`);
-        return origin;
-      }
-      if (probe === 'refused' && refused === null) refused = origin;
-    }
-  }
-  return refused;
-};
-
-const scheduleReconnect = (message: string, kind: ErrorKind): void => {
+const scheduleReconnect = (message: string, kind: ErrorKind, delay = retryDelay): void => {
   lastError = message;
   lastErrorKind = kind;
   connection = 'error';
-  if (!watch || retryTimer) return;
-  const delay = retryDelay;
-  retryDelay = Math.min(RETRY_MAX_MS, retryDelay * 2);
+  if (streamLostAt === null) streamLostAt = Date.now();
+  if (retryTimer) return;
+  retryDelay = Math.min(RETRY_MAX_MS, Math.max(RETRY_BASE_MS, retryDelay * 2));
   retryTimer = setTimeout(() => {
     retryTimer = null;
     beginStream();
   }, delay);
+  retryTimer.unref?.();
 };
 
-const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void> => {
-  // A background service (`sessionEvents`) has no page watch. The stream still
-  // starts: the server's own address is discovered below, and the events
-  // carry every session at once.
-  const current = watch;
+const eventUrl = (): string => {
+  const url = new URL(`${OPENCODE_URL}/api/event`);
+  if (filterTypes) for (const type of EVENT_TYPES) url.searchParams.append('types', type);
+  return url.toString();
+};
+
+/**
+ * Read OpenCode's event stream until it ends, then come back.
+ *
+ * One stream carries every session in every project. It ends on its own every
+ * so often (the host's 8 MB limit, an idle socket, a consumer OpenCode found
+ * too slow), so an end after a healthy read reconnects at once and keeps the
+ * turns in flight; a failure to connect backs off.
+ */
+const startStream = async (): Promise<void> => {
   if (retryTimer) {
     clearTimeout(retryTimer);
     retryTimer = null;
@@ -2337,116 +2099,89 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
   controller?.abort();
   const local = new AbortController();
   controller = local;
-  connection = 'connecting';
+  if (!OPENCODE_URL) {
+    // The host starts an approved service with this address. Without it the
+    // approval is missing or the host is too old, and nothing else may stand in.
+    lastError = null;
+    lastErrorKind = 'access';
+    connection = 'error';
+    return;
+  }
+  if (connection !== 'live') connection = 'connecting';
+
+  let response: Response;
+  try {
+    response = await fetch(eventUrl(), {
+      headers: opencodeHeaders('text/event-stream'),
+      signal: local.signal,
+      redirect: 'manual',
+    });
+  } catch (error) {
+    if (local.signal.aborted) return;
+    scheduleReconnect(error instanceof Error ? error.message : String(error), 'network');
+    return;
+  }
+  if (response.status === 400 && filterTypes) {
+    // An OpenCode that does not know one of the names: read everything.
+    await response.body?.cancel().catch(() => undefined);
+    filterTypes = false;
+    scheduleReconnect('Event stream refused the type list', 'http', 0);
+    return;
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.body?.cancel().catch(() => undefined);
+    scheduleReconnect(`Event stream answered HTTP ${response.status}`, 'access');
+    return;
+  }
+  if (!response.ok || !response.body) {
+    await response.body?.cancel().catch(() => undefined);
+    scheduleReconnect(`Event stream answered HTTP ${response.status}`, 'http');
+    return;
+  }
+
+  const lostFor = streamLostAt === null ? 0 : Date.now() - streamLostAt;
+  if (lostFor > RESUME_GAP_MS) {
+    // Long enough for a turn's closing events to have gone by unseen.
+    resetInFlight();
+  }
+  streamLostAt = null;
+  connection = 'live';
   lastError = null;
   lastErrorKind = null;
+  retryDelay = RETRY_BASE_MS;
+  lastEventAt = Date.now();
 
-  // The page's origin is right whenever this process runs beside the server
-  // that serves it, and stops being right behind a port forward. A previously
-  // discovered origin goes first so a reconnect skips the known-dead dial.
-  // The desktop's own port is next: a relay page has no origin at all, and
-  // the server it is talking to is the one this process was spawned beside.
-  const own = desktopOrigin();
-  const seen = new Set(tried);
-  const candidates: string[] = [];
-  for (const candidate of [serverOrigin, current?.origin, own]) {
-    if (!candidate || seen.has(candidate)) continue;
-    seen.add(candidate);
-    candidates.push(candidate);
-  }
-
-  for (const origin of candidates) {
-    let response: Response;
-    try {
-      // The global stream is not directory scoped. `/api/event` silently carries
-      // only the server's default directory, which is why an open project would
-      // never see its own session events there.
-      response = await fetch(new URL('/api/global/event', origin), {
-        headers: { Accept: 'text/event-stream', ...await serverHeaders(origin) },
-        signal: local.signal,
-        redirect: 'manual',
-      });
-      // A desktop-local token is tried first above. A headless host has no such
-      // token, so its instance password is the only credential available.
-      if (response.status === 401 || response.status === 403) {
-        await response.body?.cancel();
-        const endpoints = await parentListenEndpoints();
-        if (local.signal.aborted) return;
-        const headers = await passwordAuthHeaders(
-          origin,
-          dataDir(),
-          new Set(endpoints.map((endpoint) => endpoint.port)),
-          local.signal,
-        );
-        if (local.signal.aborted) return;
-        if (Object.keys(headers).length > 0) {
-          response = await fetch(new URL('/api/global/event', origin), {
-            headers: { Accept: 'text/event-stream', ...headers },
-            signal: local.signal,
-            redirect: 'manual',
-          });
-        }
+  let healthy = false;
+  try {
+    const decoder = new TextDecoder();
+    const reader = response.body.getReader();
+    let buffer = '';
+    while (!local.signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      healthy = true;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary !== -1) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        handleSseChunk(chunk);
+        boundary = buffer.indexOf('\n\n');
       }
-    } catch (error) {
-      if (local.signal.aborted) return;
-      lastError = error instanceof Error ? error.message : String(error);
-      lastErrorKind = 'network';
-      continue;
     }
-    if (!response.ok || !response.body) {
-      lastError = `Event stream answered HTTP ${response.status}`;
-      lastErrorKind = 'http';
-      await response.body?.cancel();
-      continue;
-    }
-    if (origin === own) serverOrigin = own;
-    connection = 'live';
-    retryDelay = RETRY_BASE_MS;
-    lastEventAt = Date.now();
-    eventsSeen = 0;
-    resetInFlight();
-
-    try {
-      const decoder = new TextDecoder();
-      const reader = response.body.getReader();
-      let buffer = '';
-      while (!local.signal.aborted) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let boundary = buffer.indexOf('\n\n');
-        while (boundary !== -1) {
-          const chunk = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          handleSseChunk(chunk);
-          boundary = buffer.indexOf('\n\n');
-        }
-      }
-      if (!local.signal.aborted) scheduleReconnect('Event stream closed', 'closed');
-    } catch (error) {
-      // A watch switch or shutdown aborts the reader; that is not a failure.
-      if (local.signal.aborted) return;
-      scheduleReconnect(error instanceof Error ? error.message : String(error), 'network');
-    }
+  } catch (error) {
+    if (local.signal.aborted) return;
+    scheduleReconnect(error instanceof Error ? error.message : String(error), 'closed', healthy ? 0 : retryDelay);
     return;
   }
-
   if (local.signal.aborted) return;
-  // Nothing we know about is dialable from here: ask the machine, not the page.
-  const discovered = await discoverServerOrigin(local.signal);
-  if (local.signal.aborted) return;
-  if (discovered && !seen.has(discovered)) {
-    serverOrigin = discovered;
-    await startStream(seen);
-    return;
-  }
-  scheduleReconnect(lastError ?? 'Event stream unreachable', lastErrorKind ?? 'network');
+  scheduleReconnect('Event stream closed', 'closed', healthy ? 0 : retryDelay);
 };
 
 /**
  * The only entry point: a rejection here would take the process down and leave
- * the panel with nothing to poll, so it lands in the same state the panel
- * already knows how to render.
+ * the panel with nothing to read, so it lands in the same state the panel
+ * already knows how to show.
  */
 const beginStream = (): void => {
   void startStream().catch((error: unknown) => {
@@ -2454,24 +2189,10 @@ const beginStream = (): void => {
   });
 };
 
-/**
- * Make sure the background stream is running.
- *
- * The service can be spawned by a session event rather than by a page, so no
- * `/watch` has named an origin yet. `startStream` falls back to the desktop's
- * own port and then to listener discovery.
- */
-let streamPending = false;
+/** Start the stream once; it then keeps itself running. */
 const ensureStream = (): void => {
-  if (controller !== null || streamPending) return;
-  streamPending = true;
-  void startStream()
-    .catch((error: unknown) => {
-      scheduleReconnect(error instanceof Error ? error.message : String(error), 'network');
-    })
-    .finally(() => {
-      streamPending = false;
-    });
+  if (controller !== null || retryTimer !== null) return;
+  beginStream();
 };
 
 const stopStream = (): void => {
@@ -2484,45 +2205,23 @@ const stopStream = (): void => {
   connection = 'idle';
 };
 
-const computeLive = (now: number): {
-  tps: number;
-  spanMs: number;
-  chars: number;
-  textChars: number;
-  reasoningChars: number;
-  toolChars: number;
-} => {
+/** The rate of about the last second, which says whether tokens are arriving now. */
+const computeLive = (now: number): number => {
   const from = now - WINDOW_MS;
   let chars = 0;
-  let textChars = 0;
-  let reasoningChars = 0;
-  let toolChars = 0;
   let oldest = now;
   for (const sample of samples) {
     if (sample.at < from) continue;
     chars += sample.chars;
-    if (sample.kind === 'reasoning') reasoningChars += sample.chars;
-    else if (sample.kind === 'tool') toolChars += sample.chars;
-    else textChars += sample.chars;
     if (sample.at < oldest) oldest = sample.at;
   }
-  if (chars === 0) {
-    return { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 };
-  }
+  if (chars === 0) return 0;
   // Divide by the span the samples actually cover, so the number is correct
-  // as soon as streaming starts instead of climbing while the window fills.
+  // as soon as streaming starts instead of climbing while the window fills. A
+  // window whose samples all landed in one millisecond is capped rather than
+  // reported as a broken rate.
   const spanMs = Math.max(1, Math.min(WINDOW_MS, now - oldest));
-  return {
-    // Not the headline, but a published field: a window whose samples all
-    // landed in the same millisecond would otherwise report the same broken
-    // rate the estimate path used to.
-    tps: Math.min(estimateTokens(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND),
-    spanMs,
-    chars,
-    textChars,
-    reasoningChars,
-    toolChars,
-  };
+  return Math.min(estimateTokens(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND);
 };
 
 /**
@@ -2582,34 +2281,17 @@ const computeCurve = (now: number): { values: number[]; startAt: number; stepMs:
   return { values, startAt: oldest, stepMs: width };
 };
 
-const isHttpOrigin = (value: string): boolean => {
-  try {
-    const parsed = new URL(value);
-    return (parsed.protocol === 'http:' || parsed.protocol === 'https:')
-      && parsed.username === ''
-      && parsed.password === '';
-  } catch {
-    return false;
-  }
-};
-
 /**
  * Record what a page asked to watch.
  *
  * Registering a session never touches the measurement: its record either
  * already exists or starts empty, and nothing belonging to another session is
- * reset or dropped. Only a change of origin restarts the stream — the endpoint
- * is the server's global one, so swapping sessions needs no reconnect, and
- * reconnecting on every watch is what used to tear down a connection another
- * page was relying on.
+ * reset or dropped. The stream is OpenCode's global one, so a new session
+ * needs no reconnect.
  */
-const applyWatch = (next: WatchConfig): boolean => {
-  // This service was spawned by the server it serves, so once that server's
-  // own address is known, a page origin change only means another surface is
-  // talking (a local window and a relay client together, say): the stream must
-  // survive it. Without a known address the hint still decides.
-  const originChanged = watch === null || (serverOrigin === null && watch.origin !== next.origin);
+const applyWatch = (next: WatchConfig, now: number): void => {
   watch = next;
+  leases.set(next.sessionId ?? '', now + LEASE_MS);
   if (next.sessionId) {
     watched.add(next.sessionId);
     const state = trackSession(next.sessionId);
@@ -2617,12 +2299,70 @@ const applyWatch = (next: WatchConfig): boolean => {
     // still says which model the chat is on.
     if (next.model) state.chatModel = next.model;
   }
-  if (!originChanged) return false;
-  retryDelay = RETRY_BASE_MS;
-  stopStream();
-  beginStream();
-  return true;
+  ensureStream();
 };
+
+// --- push ---------------------------------------------------------------------
+//
+// A page used to ask for its reading four times a second whether or not
+// anything had changed. Now each page holds a lease on the session it shows
+// (its `/watch`, renewed every few seconds), and the service sends that
+// session's reading to the open pages when it changes, plus a short sign of
+// life while it does not. A host that does not deliver the events leaves the
+// page hearing nothing, and the page then asks for itself.
+
+/** How long one `/watch` keeps a session's reading coming. */
+const LEASE_MS = 12_000;
+/** Fastest a reading is sent, and how often an unchanged one is sent anyway. */
+const PUSH_EVERY_MS = 250;
+const PUSH_KEEPALIVE_MS = 2_000;
+/** The host takes 30 events a second; four a second each leaves room. */
+const PUSH_SESSIONS_MAX = 6;
+
+/** Session shown by a page (`''` for a page with no session yet) -> lease end. */
+const leases = new Map<string, number>();
+const lastPushed = new Map<string, { sig: string; at: number }>();
+/** Off once the host says it takes no events from this process. */
+let pushing = true;
+
+/** Fields that change on every reading without the picture changing. */
+const VOLATILE = new Set(['curveAt', 'at', 'observedAt']);
+
+const signature = (body: Record<string, unknown>): string => {
+  const quiet = Array.isArray(body.curve) && (body.curve as number[]).every((value) => value <= 0.05);
+  return JSON.stringify(body, (key, value) => (
+    VOLATILE.has(key) || (quiet && key === 'curveStart') ? undefined : value
+  ));
+};
+
+const pushTick = (): void => {
+  const now = Date.now();
+  for (const [key, until] of leases) {
+    if (until <= now) {
+      leases.delete(key);
+      lastPushed.delete(key);
+    }
+  }
+  if (leases.size === 0) return;
+  // A page is looking: keep the Mac, prompt and render readers warm.
+  noteDemand(now);
+  if (!pushing) return;
+  for (const key of [...leases.keys()].slice(0, PUSH_SESSIONS_MAX)) {
+    const body = rateBody(key || null, now);
+    const sig = signature(body);
+    const previous = lastPushed.get(key);
+    if (previous && previous.sig === sig && now - previous.at < PUSH_KEEPALIVE_MS) continue;
+    lastPushed.set(key, { sig, at: now });
+    void serviceHost.emit('rate', { session: key || null, rate: body as never }).catch((error: unknown) => {
+      // No callback address: this host was not told to take events from us.
+      if ((error as { code?: unknown })?.code === 'HOST_UNAVAILABLE') pushing = false;
+      // Anything else (a busy second, a frame closing) is simply skipped.
+      lastPushed.delete(key);
+    });
+  }
+};
+const pushTimer = setInterval(pushTick, PUSH_EVERY_MS);
+pushTimer.unref?.();
 
 const json = (res: http.ServerResponse, status: number, body: unknown): void => {
   res.writeHead(status, {
@@ -2719,6 +2459,52 @@ const chatModelReading = (): { id: string; name: string } | null => {
   return { id, name: modelDisplayName(id) };
 };
 
+/** One session's reading, as `/rate` answers it and a push carries it. */
+const rateBody = (requested: string | null, now: number): Record<string, unknown> => {
+  if (requested !== null) enterSession(requested);
+  else loadState(blankSession);
+  try {
+    const curve = computeCurve(now);
+    return {
+      connection,
+      error: lastError,
+      errorKind: lastErrorKind,
+      // Nothing has watched this session in this process, so say so and the
+      // page re-asserts — that is how a service that just came back up learns
+      // which sessions are on screen. The numbers are still answered from
+      // disk, so the panel shows the last reply straight away.
+      sessionId: requested !== null && watched.has(requested) ? requested : null,
+      busy,
+      waiting: waitingKind(),
+      toolActive: toolActive(),
+      live: { tps: computeLive(now) },
+      running: turnStartedAt !== null ? computeRunning() : null,
+      // The buckets' own clock travels with them: without it a guest can
+      // only place them on an index axis, which is what made the curve
+      // deform instead of slide. `curveAt` is the window's right edge.
+      curve: curve.values,
+      curveStart: curve.startAt,
+      curveStep: curve.stepMs,
+      curveAt: now,
+      turn: {
+        active: turnStartedAt !== null,
+        ttftMs: liveTtftMs(),
+      },
+      lastTurn,
+      // Conversation-wide cache accounting of the watched session and its
+      // sub-sessions; null until a step settles.
+      cache: cacheWire(cache),
+      // Gauge's own readings: Mac memory, the prompt this chat is reading and
+      // a ComfyUI render. Each is null when there is nothing to show. The
+      // chat's own model rides with them: it is the model in play, which is
+      // not the model the local engine holds.
+      gauge: { ...gaugeWire(sessionIdsFor(requested), now), chatModel: chatModelReading() },
+    };
+  } finally {
+    leaveSession();
+  }
+};
+
 const server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     json(res, 401, { error: 'unauthorized' });
@@ -2734,33 +2520,24 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/watch' && req.method === 'POST') {
     void readJsonBody(req).then((raw) => {
-      const body = (raw && typeof raw === 'object' ? raw : {}) as { origin?: unknown; sessionId?: unknown; model?: unknown };
-      // A relay surface has no origin to report: its document is a srcDoc and
-      // its location is `about:srcdoc`. An absent/empty origin is therefore
-      // valid, and the service finds the server on this machine itself. A
-      // value that is present still has to be a usable http(s) origin.
-      const rawOrigin = body.origin;
-      if (rawOrigin !== undefined && rawOrigin !== null && typeof rawOrigin !== 'string') {
-        json(res, 400, { error: 'origin must be an http(s) origin from the OpenChamber server' });
+      const body = (raw && typeof raw === 'object' ? raw : {}) as { sessionId?: unknown; model?: unknown };
+      // A session id longer than OpenCode's own is not a session: refuse rather
+      // than keep a key nothing can ever produce.
+      if (typeof body.sessionId === 'string' && body.sessionId.trim().length > SESSION_ID_MAX) {
+        json(res, 400, { error: 'session id too long' });
         return;
       }
-      const hinted = (rawOrigin ?? '').trim();
-      if (hinted !== '' && !isHttpOrigin(hinted)) {
-        json(res, 400, { error: 'origin must be an http(s) origin from the OpenChamber server' });
-        return;
-      }
-      const origin = hinted === '' ? null : hinted;
-      const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId : null;
+      const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId.trim() : null;
       // The model the chat has selected. It is a name, not a credential: it
       // is kept so the panel can say which model is in play, and never leaves
-      // this machine.
-      const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : null;
-      // `changed` still means "you were not already set up for this": a new
-      // session counts, an origin switch counts, a repeat does not. It no
-      // longer implies the stream was rebuilt — only an origin change does.
-      const fresh = sessionId !== null && !watched.has(sessionId);
-      const changed = applyWatch({ origin, sessionId, model }) || fresh;
-      json(res, 200, { ok: true, changed, connection, sessionId });
+      // this machine. A name too long to be one is simply not reported.
+      const model = typeof body.model === 'string' && body.model.trim() && body.model.trim().length <= MODEL_NAME_MAX
+        ? body.model.trim()
+        : null;
+      // `changed` means "you were not already set up for this".
+      const changed = sessionId !== null && !watched.has(sessionId);
+      applyWatch({ sessionId, model }, Date.now());
+      json(res, 200, { ok: true, changed, connection, sessionId, push: pushing });
     }).catch((error: unknown) => {
       json(res, 400, { error: error instanceof Error ? error.message : 'Invalid request' });
     });
@@ -2782,27 +2559,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (url.pathname === '/history') {
-    // The durable side of the cache numbers: per-turn snapshots and the
-    // conversation aggregate. Kept off `/rate` so a 250 ms poll does not carry
-    // the whole history.
-    const requested = readString(url.searchParams.get('sessionId')) || watch?.sessionId || null;
-    if (requested !== null) enterSession(requested);
-    else loadState(blankSession);
-    let body: Record<string, unknown>;
-    try {
-      body = {
-        sessionId: requested,
-        turns,
-        cache: cacheWire(cache),
-      };
-    } finally {
-      leaveSession();
-    }
-    json(res, 200, body);
-    return;
-  }
-
   if (url.pathname === '/rate') {
     const now = Date.now();
     // A page is looking: the Mac, prompt and render readers run only while
@@ -2810,55 +2566,9 @@ const server = http.createServer((req, res) => {
     noteDemand(now);
     // A page names its own session so two pages watching different sessions
     // each read their own record. Without the parameter the most recent watch
-    // answers, which is what a one-page install has always seen; with no watch
-    // either, the blank record answers — never the register the last event
-    // left behind, which belongs to whichever session streamed most recently.
+    // answers; with no watch either, the blank record answers.
     const requested = readString(url.searchParams.get('sessionId')) || watch?.sessionId || null;
-    if (requested !== null) enterSession(requested);
-    else loadState(blankSession);
-    let body: Record<string, unknown>;
-    try {
-      const curve = computeCurve(now);
-      body = {
-        connection,
-        error: lastError,
-        errorKind: lastErrorKind,
-        // Nothing has watched this session in this process, so say so and the
-        // page re-asserts — that is how a service that just came back up gets
-        // its stream started again. The numbers are still answered from disk,
-        // so the panel shows last turn straight away instead of going blank.
-        sessionId: requested !== null && watched.has(requested) ? requested : null,
-        busy,
-        waiting: waitingKind(),
-        toolActive: toolActive(),
-        live: computeLive(now),
-        running: turnStartedAt !== null ? computeRunning() : null,
-        // The buckets' own clock travels with them: without it a guest can
-        // only place them on an index axis, which is what made the curve
-        // deform instead of slide. `curveAt` is the window's right edge.
-        curve: curve.values,
-        curveStart: curve.startAt,
-        curveStep: curve.stepMs,
-        curveAt: now,
-        turn: {
-          active: turnStartedAt !== null,
-          ttftMs: liveTtftMs(),
-        },
-        lastTurn,
-        // Conversation-wide cache accounting of the watched session and its
-        // sub-sessions; null until a step settles.
-        cache: cacheWire(cache),
-        // Gauge's own readings: Mac memory, the prompt this chat is reading and
-        // a ComfyUI render. Each is null when there is nothing to show. The
-        // chat's own model rides with them: it is the model in play, which is
-        // not the model the local engine holds.
-        gauge: { ...gaugeWire(sessionIdsFor(requested), now), chatModel: chatModelReading() },
-        eventsSeen,
-      };
-    } finally {
-      leaveSession();
-    }
-    json(res, 200, body);
+    json(res, 200, rateBody(requested, now));
     return;
   }
 
@@ -2869,7 +2579,7 @@ readPersisted();
 server.listen(port, '127.0.0.1', () => {
   // `service.keepRunning` starts this process with the host, not with a page.
   // Subscribe immediately so background counting begins before anyone opens
-  // the panel; a later `/watch` restarts the stream onto the page's origin.
+  // the panel.
   ensureStream();
 });
 

@@ -605,6 +605,8 @@ const sampleModel = async (): Promise<void> => {
 // --- the wire -----------------------------------------------------------------
 
 export type GaugeWire = {
+  /** Whether this machine has a memory reading at all; only a Mac does. */
+  macSupported: boolean;
   mac: MacReading | null;
   prompt: PromptReading | null;
   render: RenderReading | null;
@@ -630,7 +632,7 @@ export const gaugeWire = (sessionIds: string[], now: number): GaugeWire => {
     const step = steps.get(runningId);
     job.step = step && now - step.at < STEP_FRESH_MS ? step : null;
   }
-  return { mac, prompt: promptFor(sessionIds, now), render: job, model };
+  return { macSupported: process.platform === 'darwin', mac, prompt: promptFor(sessionIds, now), render: job, model };
 };
 
 /** Drop what nobody is watching: the ComfyUI socket closes when no page has asked for a while. */

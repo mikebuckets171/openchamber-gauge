@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { makePlugin } from './index.js';
 import { key } from './store.js';
-import { createSplashLookup, namesSplash, splashOptions } from './providers.js';
+import { createProgressLookup, isLlamaCppProps, namesLlamaCpp, namesSplash, probeLlamaCpp, progressEndpoint } from './providers.js';
 
 const row = (id, name, baseURL) => ({ id, name, activation: 'enabled', package: '@opencode/ai/providers/openai-compatible', settings: { baseURL, apiKey: 'sk-never-read' } });
 const SPLASH = row('splash', 'Splash', 'http://127.0.0.1:18181/v1');
@@ -14,110 +15,220 @@ test('Splash is named by id or name, with LM Studio taking precedence', () => {
   for (const [id, name] of [['splash-bionic', 'Splash via Bionic'], ['lmstudio', 'Splash'], ['omlx', 'oMLX'], ['openai', 'OpenAI'], ['ollama', 'Ollama'], ['', '']]) assert.equal(namesSplash(id, name), false, `${id}/${name}`);
 });
 
-test('only a loopback /v1 address is accepted for a Splash provider', () => {
-  assert.deepEqual(splashOptions({ providerID: 'splash', baseURL: 'http://localhost:8000/v1/' }),
-    { providerID: 'splash', origin: 'http://localhost:8000', endpointKey: key('endpoint', 'http://127.0.0.1:8000') });
-  for (const baseURL of ['https://example.com/v1', 'http://splash.example.com:8000/v1', 'http://127.0.0.1:8000', 'http://127.0.0.1:8000/v1?x=1', 'http://user:pass@127.0.0.1:8000/v1', undefined]) {
-    if (baseURL === undefined) { assert.equal(splashOptions({}).origin, 'http://127.0.0.1:8000'); continue; }
-    assert.throws(() => splashOptions({ providerID: 'splash', baseURL }), /loopback Splash/);
+test('a llama.cpp engine is named by id or name, with LM Studio and Ollama refused', () => {
+  for (const [id, name] of [['llama', 'llama.cpp'], ['local', 'llama-server'], ['llama-cpp', 'Local'], ['llamacpp', ''], ['swap', 'llama-swap'], ['cpp', 'llama.cpp router']]) assert.equal(namesLlamaCpp(id, name), true, `${id}/${name}`);
+  // Ollama runs llama.cpp inside and answers with its own API; LM Studio is the
+  // rule MLX Scope already refused first.
+  for (const [id, name] of [['ollama', 'Ollama'], ['ollama-local', 'llama.cpp through Ollama'], ['lmstudio', 'llama.cpp'], ['local', 'Bionic llama.cpp'], ['splash', 'Splash'], ['openai', 'OpenAI'], ['', '']]) assert.equal(namesLlamaCpp(id, name), false, `${id}/${name}`);
+});
+
+test('a loopback /v1 endpoint is canonicalized; anything else is refused', () => {
+  assert.deepEqual(progressEndpoint({ providerID: 'splash', baseURL: 'http://localhost:8000/v1/' }),
+    { providerID: 'splash', origin: 'http://127.0.0.1:8000', endpointKey: key('endpoint', 'http://127.0.0.1:8000') });
+  for (const [baseURL, origin] of [['https://127.0.0.1:8000/v1', 'https://127.0.0.1:8000'], ['http://[::1]:8000/v1', 'http://[::1]:8000'], ['http://localhost:8000/v1/', 'http://127.0.0.1:8000']]) {
+    assert.equal(progressEndpoint({ providerID: 'splash', baseURL }).origin, origin, baseURL);
+  }
+  for (const baseURL of [undefined, 'http://127.0.0.1:8000', 'http://127.0.0.1:8000/v1/chat', 'http://example.com/v1', 'http://127.0.0.1:8000/v1?x=1', 'http://user:pw@127.0.0.1:8000/v1', 'http://127.0.0.1:8000/v1#f', 'not a url']) {
+    if (baseURL === undefined) { assert.equal(progressEndpoint({}).origin, 'http://127.0.0.1:8000'); continue; }
+    assert.throws(() => progressEndpoint({ providerID: 'splash', baseURL }), /loopback/);
   }
 });
 
-test('a lookup finds a Splash provider by id or name, returns its address and never its key, and ignores the rest', async () => {
-  const lookup = createSplashLookup({ list: async () => [row('openai', 'OpenAI', 'https://api.openai.com/v1'), SPLASH, row('local', 'Splash', 'http://localhost:8000/v1'),
-    row('splash-lan', 'Splash', 'http://splash.example.com:8000/v1'), row('lms', 'LM Studio', 'http://127.0.0.1:1234/v1')] });
-  const found = await lookup('splash');
-  assert.deepEqual(found, { providerID: 'splash', origin: 'http://127.0.0.1:18181', endpointKey: key('endpoint', 'http://127.0.0.1:18181') });
-  assert.deepEqual(await lookup('local'), { providerID: 'local', origin: 'http://localhost:8000', endpointKey: key('endpoint', 'http://127.0.0.1:8000') });
-  for (const id of ['openai', 'splash-lan', 'lms', 'missing', 'bad id', '', undefined, 5]) assert.equal(await lookup(id), null, String(id));
-  assert.ok(!JSON.stringify(found).includes('sk-never-read'));
+test('only llama.cpp server properties answer as llama.cpp', () => {
+  // The body shape llama.cpp's server README documents for GET /props.
+  assert.equal(isLlamaCppProps({ total_slots: 4, slots: [{ id: 0 }], default_generation_settings: { id: 0, n_ctx: 262144 }, model_path: '/models/qwen.gguf', model_alias: 'qwen' }), true);
+  assert.equal(isLlamaCppProps({ default_generation_settings: { id: 0 }, model_path: '/models/qwen.gguf' }), true);
+  assert.equal(isLlamaCppProps({ total_slots: 4, default_generation_settings: { id: 0 } }), true);
+  assert.equal(isLlamaCppProps({ error: { type: 'unknown', message: 'not found' } }), false);
+  assert.equal(isLlamaCppProps({ src: 'llama-swap', error: { message: 'unauthorized' } }), false);
+  assert.equal(isLlamaCppProps({ data: [{ id: 'qwen', object: 'model' }] }), false);
+  assert.equal(isLlamaCppProps({ status: 'ok' }), false);
+  assert.equal(isLlamaCppProps({ model_path: '/models/qwen.gguf' }), false);
+  assert.equal(isLlamaCppProps(null), false);
+  assert.equal(isLlamaCppProps([]), false);
+  assert.equal(isLlamaCppProps('llama.cpp'), false);
 });
 
-test('the provider list is read once per ttl, answered from the last read in between, and not retried faster than retryMs', async () => {
-  const time = clock(); let reads = 0, down = false;
-  const lookup = createSplashLookup({ list: async () => { reads++; if (down) throw new Error('down'); return [SPLASH]; }, now: time.now });
-  assert.ok(await lookup('splash')); assert.equal(reads, 1);
-  time.advance(10_000); assert.ok(await lookup('splash')); assert.equal(reads, 1);
-  // A provider the last read did not list is looked for again, once, and the next ask within retryMs does not repeat it.
-  assert.equal(await lookup('newcomer'), null); await settle(); assert.equal(reads, 2);
-  assert.equal(await lookup('newcomer'), null); await settle(); assert.equal(reads, 2);
-  // Past the ttl the old answer is still given at once while a fresh read runs behind it.
-  time.advance(30_000); assert.ok(await lookup('splash')); await settle(); assert.equal(reads, 3);
-  down = true; time.advance(30_000);
-  assert.ok(await lookup('splash')); await settle(); assert.equal(reads, 4);
-  assert.ok(await lookup('splash')); await settle(); assert.equal(reads, 4);
-  time.advance(5_000); assert.ok(await lookup('splash')); await settle(); assert.equal(reads, 5);
+const serveProps = async (handler) => {
+  const server = http.createServer((req, res) => handler(req, res));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  return { origin: `http://127.0.0.1:${server.address().port}`, close: () => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }) };
+};
+
+test('the probe is one GET /props, and only a llama.cpp body answers yes', async () => {
+  const seen = [];
+  const engine = await serveProps((req, res) => {
+    seen.push(req.url);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ total_slots: 2, default_generation_settings: { id: 0, n_ctx: 32768 }, model_path: '/models/m.gguf' }));
+  });
+  assert.equal(await probeLlamaCpp(engine.origin), true);
+  assert.deepEqual(seen, ['/props']);
+
+  const swap = await serveProps((req, res) => {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ src: 'llama-swap', error: { message: 'unauthorized: invalid or missing API key', type: 'authentication_error' } }));
+  });
+  assert.equal(await probeLlamaCpp(swap.origin), false, 'an engine behind an API key is not asked for its key');
+
+  const other = await serveProps((req, res) => { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'not found' } })); });
+  assert.equal(await probeLlamaCpp(other.origin), false);
+
+  const html = await serveProps((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html><title>llama.cpp</title></html>'); });
+  assert.equal(await probeLlamaCpp(html.origin), false, 'a web page is not the properties endpoint');
+
+  const silent = await serveProps(() => { /* never answers */ });
+  assert.equal(await probeLlamaCpp(silent.origin, { timeoutMs: 60 }), false, 'a stalled engine is refused rather than waited for');
+  for (const host of [engine, swap, other, html, silent]) await host.close();
 });
 
-test('the first lookup waits only briefly for a slow provider list; the answer arrives with a later request', async () => {
-  let release; const gate = new Promise(resolve => { release = resolve; });
-  const lookup = createSplashLookup({ list: () => gate.then(() => [SPLASH]), firstWaitMs: 20 });
-  const started = Date.now(); assert.equal(await lookup('splash'), null); assert.ok(Date.now() - started < 1_000);
-  release(); await settle(); assert.ok(await lookup('splash'));
+test('a named engine is asked at once; any other local engine only after /props', async () => {
+  const asks = [];
+  const time = clock();
+  const lookup = createProgressLookup({
+    list: async () => [SPLASH, row('swap', 'llama-swap', 'http://127.0.0.1:8080/v1'), row('local', 'Local model', 'http://127.0.0.1:8081/v1'), row('openai', 'OpenAI', 'https://api.openai.com/v1')],
+    probe: async origin => { asks.push(origin); return origin.endsWith('8081'); },
+    now: time.now,
+  });
+  assert.equal((await lookup('splash'))?.progress, true);
+  assert.equal((await lookup('swap'))?.progress, true);
+  await settle();
+  assert.deepEqual(asks, [], 'a named engine is never probed');
+
+  const unnamed = await lookup('local');
+  assert.equal(unnamed.progress, false, 'the first request leaves unaltered while the probe runs');
+  await settle();
+  assert.deepEqual(asks, ['http://127.0.0.1:8081']);
+  assert.equal((await lookup('local')).progress, true, 'a probe that answered makes the next request ask');
+  assert.equal(await lookup('openai'), null, 'a cloud provider is not a local engine');
 });
 
-test('every request that arrives during the first read waits for it, and none waits again, even for a list that never answers', async () => {
-  let release; const gate = new Promise(resolve => { release = resolve; });
-  const lookup = createSplashLookup({ list: () => gate.then(() => [SPLASH]), firstWaitMs: 5_000 });
-  const both = Promise.all([lookup('splash'), lookup('splash')]); release();
-  for (const found of await both) assert.ok(found);
-  const time = clock(), hung = createSplashLookup({ list: () => new Promise(() => {}), now: time.now, firstWaitMs: 100 });
+test('a probe that answered no is kept, and re-asked only after its own interval', async () => {
+  const asks = [];
+  const time = clock();
+  const lookup = createProgressLookup({
+    list: async () => [row('local', 'Local model', 'http://127.0.0.1:8081/v1')],
+    probe: async () => { asks.push(1); return false; },
+    now: time.now, probeRetryMs: 30_000,
+  });
+  for (let i = 0; i < 3; i++) assert.equal((await lookup('local')).progress, false);
+  await settle();
+  assert.equal(asks.length, 1, 'one engine gets one probe');
+  time.advance(29_000);
+  assert.equal((await lookup('local')).progress, false);
+  await settle();
+  assert.equal(asks.length, 1, 'a fresh negative answer is respected');
+  time.advance(2_000);
+  assert.equal((await lookup('local')).progress, false);
+  await settle();
+  assert.equal(asks.length, 2, 'the engine is asked again once the answer is old');
+});
+
+test('a probe that answered yes is kept for minutes, and one flight per endpoint', async () => {
+  const asks = [];
+  const time = clock();
+  let resolveProbe;
+  const lookup = createProgressLookup({
+    list: async () => [row('a', 'Local a', 'http://127.0.0.1:8081/v1'), row('b', 'Local b', 'http://localhost:8081/v1')],
+    probe: async () => { asks.push(1); return new Promise(resolve => { resolveProbe = resolve; }); },
+    now: time.now,
+  });
+  assert.equal((await lookup('a')).progress, false);
+  assert.equal((await lookup('b')).progress, false, 'localhost and 127.0.0.1 are the same endpoint');
+  await settle();
+  assert.equal(asks.length, 1, 'two providers on one endpoint share one probe');
+  resolveProbe(true);
+  await settle();
+  assert.equal((await lookup('a')).progress, true);
+  assert.equal((await lookup('b')).progress, true);
+  time.advance(4 * 60_000);
+  assert.equal((await lookup('a')).progress, true);
+  await settle();
+  assert.equal(asks.length, 1);
+  time.advance(61_000);
+  assert.equal((await lookup('a')).progress, false, 'a kept answer is asked again once it is old');
+  await settle();
+  assert.equal(asks.length, 2);
+  resolveProbe(true);
+  await settle();
+  assert.equal((await lookup('a')).progress, true, 'and the engine is asked again, not left unasked');
+});
+
+test('the provider list is read lazily, once, and a hung read cannot hold a request', async () => {
+  let reads = 0, down = false;
+  const time = clock();
+  const lookup = createProgressLookup({ list: async () => { reads++; if (down) throw new Error('down'); return [SPLASH]; }, now: time.now });
+  assert.equal((await lookup('splash'))?.progress, true);
+  assert.equal((await lookup('splash'))?.progress, true);
+  assert.equal(reads, 1);
+  time.advance(31_000);
+  void lookup('splash');
+  await settle();
+  assert.equal(reads, 2);
+  time.advance(1_000);
+  void lookup('splash');
+  await settle();
+  assert.equal(reads, 2, 'retries are at least retryMs apart');
+  down = true;
+  time.advance(31_000);
+  assert.equal((await lookup('splash'))?.progress, true, 'a failed read keeps the last answer');
+
+  const hung = createProgressLookup({ list: () => new Promise(() => {}), now: time.now, firstWaitMs: 100 });
+  const at = time.now();
   assert.equal(await hung('splash'), null);
-  time.advance(5_000);
-  assert.equal(await Promise.race([hung('splash'), new Promise(resolve => setTimeout(resolve, 50, 'still waiting'))]), null);
-});
+  assert.ok(time.now() - at <= 100, 'a request waits for the first read at most firstWaitMs');
 
-test('a provider list that is missing, malformed or throws never makes a lookup throw', async () => {
-  for (const list of [async () => null, async () => ({}), async () => [null, 5, 'x', {}, { id: 7 }], async () => { throw new Error('boom'); }, () => { throw new Error('sync boom'); }]) {
-    const lookup = createSplashLookup({ list }); assert.equal(await lookup('splash'), null);
+  for (const list of [async () => null, async () => [null], async () => [{ id: 1 }], async () => [{ id: 'ok' }], () => { throw new Error('boom'); }]) {
+    const lazy = createProgressLookup({ list });
+    assert.equal(await lazy('splash'), null);
   }
+  for (const id of [undefined, null, 1, 'x'.repeat(81), 'not an id', '']) assert.equal(await lookup(id), null);
 });
 
-const encode = text => new TextEncoder().encode(text);
-const progress = (processed = 32) => `data: ${JSON.stringify({ model: 'canonical/model', choices: [{ delta: {} }], prompt_progress: { total: 100, cache: 20, processed, time_ms: processed / 2 } })}\r\n\r\n`;
-const memory = () => { const entries = new Map(); return { entries, update: item => entries.set(item.requestID, item), remove: id => entries.delete(id), close: async () => entries.clear() }; };
-const request = (url, providerID) => ({ sessionID: 'ses_private', kind: 'primary', model: { providerID, id: 'alias/model' },
-  request: new Request(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-opencode-session-id': 'ses_private' }, body: JSON.stringify({ stream: true, messages: [{ role: 'user', content: 'PRIVATE PROMPT' }] }) }) });
-const splashRequest = () => request('http://127.0.0.1:18181/v1/chat/completions', 'splash');
-async function load({ list, options, version = '2.2.6' } = {}) {
-  const hooks = new Map(), filters = [], store = memory(); let listed = 0;
-  const ctx = { app: { version }, ...options ? { options } : {}, session: { hook: async (name, callback, filter) => { hooks.set(name, callback); filters.push(filter); } },
-    provider: { list: async () => { listed++; return list(); } } };
-  const dispose = await makePlugin({ storeFactory: () => store, shared: {} }).setup(ctx);
-  return { hooks, filters, store, dispose, get listed() { return listed; } };
-}
-
-test('with no options, a request to the Splash provider OpenCode lists gets progress and is observed; every other provider is untouched', async () => {
-  const plugin = await load({ list: async () => ({ data: [SPLASH, row('openai', 'OpenAI', 'https://api.openai.com/v1')] }) });
-  assert.deepEqual(plugin.filters, [undefined, undefined]);
-  const input = splashRequest(), original = await input.request.clone().json();
-  await plugin.hooks.get('http.request')(input);
-  assert.deepEqual(await input.request.clone().json(), { ...original, return_progress: true });
-  const cloud = request('https://api.openai.com/v1/chat/completions', 'openai'), before = cloud.request;
-  await plugin.hooks.get('http.request')(cloud); assert.equal(cloud.request, before);
-  cloud.response = new Response('x', { headers: { 'content-type': 'text/event-stream' } });
-  const untouched = cloud.response; plugin.hooks.get('http.response')(cloud); assert.equal(cloud.response, untouched); assert.equal(plugin.store.entries.size, 0);
-  input.response = new Response(new ReadableStream({ start(controller) { controller.enqueue(encode(progress())); } }), { headers: { 'content-type': 'text/event-stream' } });
-  plugin.hooks.get('http.response')(input);
-  const reader = input.response.body.getReader(); await reader.read();
-  const saved = [...plugin.store.entries.values()][0];
-  assert.equal(saved.providerID, 'splash'); assert.equal(saved.endpointKey, key('endpoint', 'http://127.0.0.1:18181')); assert.equal(saved.sessionKey, key('session', 'ses_private'));
-  assert.ok(!JSON.stringify(saved).match(/PRIVATE|sk-never-read|ses_private/));
-  await reader.cancel(); await plugin.dispose();
+test('an unnamed engine without a loopback /v1 is never asked, whatever it is named', async () => {
+  const asks = [];
+  const lookup = createProgressLookup({
+    list: async () => [row('cpp', 'llama.cpp', 'https://cpp.example/v1'), row('odd', 'llama-server', 'http://127.0.0.1:8081/v1/chat')],
+    probe: async () => { asks.push(1); return true; },
+  });
+  assert.equal(await lookup('cpp'), null);
+  assert.equal(await lookup('odd'), null);
+  await settle();
+  assert.deepEqual(asks, []);
 });
 
-test('a Splash provider that is not on loopback, or a provider list that fails, leaves requests exactly as they were', async () => {
-  for (const list of [async () => [row('splash', 'Splash', 'http://splash.example.com:18181/v1')], async () => { throw new Error('unavailable'); }, async () => null]) {
-    const plugin = await load({ list }), input = splashRequest(), before = input.request;
-    await plugin.hooks.get('http.request')(input); assert.equal(input.request, before); await plugin.dispose();
-  }
-});
+test('the plugin adds return_progress only where progress is known', async () => {
+  const store = { update: () => {}, remove: () => {}, close: async () => {} };
+  const seen = [];
+  const plugin = makePlugin({
+    storeFactory: () => store,
+    shared: {},
+    warn: () => {},
+    probe: async () => { seen.push('probe'); return false; },
+  });
+  const hooks = {};
+  const teardown = await plugin.setup({
+    app: { version: '2.0.25' },
+    provider: { list: async () => [row('splash', 'Splash', 'http://127.0.0.1:18181/v1'), row('other', 'Local model', 'http://127.0.0.1:18182/v1')] },
+    session: { hook: async (name, handler) => { (hooks[name] ??= []).push(handler); return { dispose: async () => {} }; } },
+  });
+  const fire = async (name, event) => { for (const handler of hooks[name] ?? []) await handler(event); };
+  const request = (providerID, origin) => new Request(`${origin}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-opencode-session-id': 'ses_1' },
+    body: JSON.stringify({ model: 'm', stream: true }),
+  });
+  const event = (providerID, origin) => ({ kind: 'primary', sessionID: 'ses_1', model: { providerID, id: 'm' }, request: request(providerID, origin) });
 
-test('options naming a provider keep the earlier behavior and never read the provider list; promptProgress false installs nothing', async () => {
-  const named = await load({ list: async () => [SPLASH], options: { providerID: 'splish', baseURL: 'http://127.0.0.1:8000/v1' } });
-  assert.deepEqual(named.filters, [{ providerID: 'splish' }, { providerID: 'splish' }]); assert.equal(named.listed, 0);
-  const input = splashRequest(), before = input.request; await named.hooks.get('http.request')(input); assert.equal(input.request, before);
-  assert.equal(named.listed, 0); await named.dispose();
-  const off = await load({ list: async () => [SPLASH], options: { promptProgress: false } });
-  assert.equal(off.hooks.size, 0); assert.equal(off.listed, 0); await off.dispose();
+  const splash = event('splash', 'http://127.0.0.1:18181');
+  await fire('http.request', splash);
+  assert.deepEqual(JSON.parse(await splash.request.text()), { model: 'm', stream: true, return_progress: true }, 'a named engine is asked');
+
+  const other = event('other', 'http://127.0.0.1:18182');
+  await fire('http.request', other);
+  assert.deepEqual(JSON.parse(await other.request.text()), { model: 'm', stream: true }, 'an unprobed engine is left as OpenCode wrote it');
+  await settle();
+  assert.deepEqual(seen, ['probe'], 'the probe runs in the background, not on the request');
+  assert.equal(JSON.parse(await event('other', 'http://127.0.0.1:18182').request.text()).return_progress, undefined);
+  await teardown();
 });

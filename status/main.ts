@@ -4,21 +4,13 @@ import { sameModelId } from '../shared/models';
 import { SLICES, biggestSlice, readSplit, sliceMs, type SliceName, type TurnSplit } from '../shared/receipt';
 import { clearSpark as clearSparkPaths, drawSpark, makeSparkSvg, nextScale, type SparkFrame } from '../shared/spark';
 
-type Live = {
-  tps: number;
-  spanMs: number;
-  chars: number;
-  textChars: number;
-  reasoningChars: number;
-  toolChars: number;
-};
+/** The rate of about the last second: whether tokens are arriving now. */
+type Live = { tps: number };
 
 type TurnResult = {
   tokensPerSecond: number;
   source: 'tokens' | 'estimate';
   tokens: number;
-  activeMs: number;
-  wallMs: number;
   ttftMs: number | null;
   hasReasoning: boolean;
   endedAt: number;
@@ -55,6 +47,8 @@ type CacheInfo = {
 };
 
 type GaugeWire = {
+  /** False off macOS, where there is no memory reading to show; absent from an older service. */
+  macSupported?: boolean;
   mac: {
     pressure: 'normal' | 'warning' | 'critical' | null;
     usedBytes: number | null;
@@ -98,8 +92,8 @@ type GaugeWire = {
 type RateResponse = {
   connection: 'idle' | 'connecting' | 'live' | 'error';
   error: string | null;
-  /** `network` when the origin could not be dialled at all; see `error`. */
-  errorKind: 'network' | 'http' | 'closed' | null;
+  /** `network` when OpenCode could not be reached, `access` when reading it is not allowed; see `error`. */
+  errorKind: 'network' | 'http' | 'closed' | 'access' | null;
   sessionId: string | null;
   busy: boolean;
   waiting: 'permission' | 'question' | null;
@@ -121,7 +115,6 @@ type RateResponse = {
   cache?: CacheInfo | null;
   /** Gauge's own readings; absent from an older service. */
   gauge?: GaugeWire;
-  eventsSeen: number;
 };
 
 type HostSession = { id: string; title: string; busy: boolean; model?: string } | null;
@@ -135,6 +128,7 @@ const COPY = {
     connecting: '连接中',
     reconnecting: '重连中',
     noService: '需在 设置 → 扩展 里允许本地服务',
+    noAccess: '需在 设置 → 扩展 里允许 Gauge 读取会话',
     unreachable: '连不上服务端事件流',
     measured: '实测',
     estimated: '估计',
@@ -177,6 +171,7 @@ const COPY = {
     connecting: 'connecting',
     reconnecting: 'reconnecting',
     noService: 'Allow the local service in Settings → Extensions',
+    noAccess: 'Allow Gauge to read your sessions in Settings → Extensions',
     unreachable: 'cannot reach the server stream',
     measured: 'measured',
     estimated: 'estimated',
@@ -221,6 +216,17 @@ const SPARK_H = 18;
 const SPARK_WINDOW_MS = 30_000;
 /** Floor between watch re-asserts, so a service that is down costs one call a second, not one per poll. */
 const REASSERT_MIN_MS = 1_000;
+/**
+ * How often the page renews its watch. The service sends this session's
+ * reading only while a watch is fresh, so a closed section costs nothing.
+ */
+const WATCH_RENEW_MS = 5_000;
+/**
+ * The service sends a reading at least every two seconds. Hearing nothing for
+ * longer means this host does not deliver its events to the section, and the
+ * page asks for itself, as it always did.
+ */
+const PUSH_STALE_MS = 5_000;
 /** How long the headline number takes to settle on a new value. */
 const GLIDE_MS = 140;
 /** How long a line takes to open; the frame's height is followed for this long. */
@@ -231,7 +237,6 @@ const root = document.querySelector('#root');
 if (!root) throw new Error('Missing #root');
 
 let copy: Copy = COPY.en;
-let origin: string | null = null;
 let session: HostSession = null;
 let mounted = false;
 let polling = false;
@@ -239,6 +244,9 @@ let stopped = false;
 let configuredKey = '';
 let configuring = false;
 let lastReassertAt = 0;
+let lastWatchAt = 0;
+/** When the service last sent this session's reading; 0 until it has. */
+let lastPushAt = 0;
 let heightReported = false;
 /** Latest curve from the service, when this page received it, and its full scale. */
 let sparkFrame: SparkFrame | null = null;
@@ -467,22 +475,6 @@ const formatPct = (value: number | null | undefined): string => (
 const formatCost = (cost: number | null | undefined): string => {
   if (typeof cost !== 'number' || !Number.isFinite(cost) || cost <= 0) return '—';
   return cost < 0.01 ? '<$0.01' : `$${cost.toFixed(2)}`;
-};
-
-/**
- * The origin the page was served from, or null when it has none: a relay
- * client mounts a guest as a `srcDoc`, whose location is `about:srcdoc` with
- * no http(s) origin to report. The service then finds the server on this
- * machine instead of dialing the client's address.
- */
-const resolveOrigin = (): string | null => {
-  try {
-    const url = new URL(window.location.href);
-    if (url.protocol === 'http:' || url.protocol === 'https:') return url.origin;
-  } catch {
-    // about:srcdoc, an opaque sandbox origin, or no window: nothing usable.
-  }
-  return null;
 };
 
 /**
@@ -826,6 +818,12 @@ const paintModel = (gauge: GaugeWire | null | undefined, info: CacheInfo | null 
 /** The memory line: what the Mac is using, and the kernel's own pressure level. */
 const paintMemory = (gauge: GaugeWire | null | undefined): void => {
   const mac = gauge?.mac ?? null;
+  // Off a Mac there is no reading to wait for, so the line is not drawn at all.
+  if (gauge?.macSupported === false) {
+    lineMemory.root.hidden = true;
+    return;
+  }
+  lineMemory.root.hidden = false;
   lineMemory.label.textContent = copy.memory;
   itemSwap.label.textContent = copy.swap;
   itemPressure.label.textContent = copy.pressure;
@@ -896,7 +894,10 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     dot.className = 'dot wait';
     // A network failure is a wrong address, not a bad response: name the
     // condition rather than leak the runtime's `fetch failed`.
-    if (rate.errorKind === 'network') {
+    if (rate.errorKind === 'access') {
+      // The approval that lets Gauge read sessions is missing.
+      placeNotice(copy.noAccess);
+    } else if (rate.errorKind === 'network') {
       placeNotice(copy.unreachable);
     } else if ((rate.error ?? '').length > NOTICE_MAX) {
       // The runtime's own words are rarely short: keep the headline quiet and
@@ -987,7 +988,7 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
   busy: false,
   waiting: null,
   toolActive: false,
-  live: { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 },
+  live: { tps: 0 },
   running: null,
   curve: [],
   turn: { active: false, ttftMs: null },
@@ -996,11 +997,27 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
   gauge: undefined,
 });
 
+/**
+ * Show one reading, from a push or a poll. A service that restarted remembers
+ * nothing and answers with no session, so the watch is asserted again.
+ */
+const take = (rate: RateResponse): void => {
+  // A page with no session must never show another session's numbers: until
+  // this page's watch lands, the service may still answer for a session some
+  // other page watched.
+  render(session === null && rate.sessionId !== null ? withoutSession(rate) : rate);
+  if ((rate.sessionId ?? null) !== (session?.id ?? null)) {
+    const now = Date.now();
+    if (now - lastReassertAt >= REASSERT_MIN_MS) {
+      lastReassertAt = now;
+      configuredKey = '';
+      void configure(session?.id ?? null);
+    }
+  }
+};
+
 const poll = async (): Promise<void> => {
   if (stopped || polling) return;
-  // No origin is not a dead end: a relay client runs this page as a `srcDoc`,
-  // where `window.location` is `about:srcdoc`. The service finds the server on
-  // the machine that hosts it, so the page still asks and shows what it gets.
   polling = true;
   try {
     // Name the session so a page and a service holding different sessions
@@ -1009,28 +1026,8 @@ const poll = async (): Promise<void> => {
       method: 'GET',
       path: session?.id ? `/rate?sessionId=${encodeURIComponent(session.id)}` : '/rate',
     });
-    if (result.status < 400) {
-      const rate = JSON.parse(result.body) as RateResponse;
-      // A page with no session must never show another session's numbers:
-      // until this page's watch(null) lands, the service may still answer for
-      // a session some other page watched.
-      render(session === null && rate.sessionId !== null ? withoutSession(rate) : rate);
-      // A service that restarted (crash, redeploy, spawned anew) remembers
-      // nothing and answers with no session, so the panel would sit on stale
-      // state until the frame remounted. Re-assert the watch instead: the
-      // throttle holds a dead service to one call a second, and `configuring`
-      // stops this from racing the opening /watch.
-      if ((rate.sessionId ?? null) !== (session?.id ?? null)) {
-        const now = Date.now();
-        if (now - lastReassertAt >= REASSERT_MIN_MS) {
-          lastReassertAt = now;
-          configuredKey = '';
-          await configure(session?.id ?? null);
-        }
-      }
-    } else {
-      render(null, `HTTP ${result.status}`);
-    }
+    if (result.status < 400) take(JSON.parse(result.body) as RateResponse);
+    else render(null, `HTTP ${result.status}`);
   } catch (error) {
     render(null, describeError(error));
   } finally {
@@ -1042,16 +1039,18 @@ const configure = async (sessionId: string | null): Promise<void> => {
   // The model the chat is on rides with the watch: the service needs it to
   // say which model is in play, which is not the model the local engine holds.
   const model = session?.model ?? null;
-  const key = `${origin ?? ''}|${sessionId ?? ''}|${model ?? ''}`;
-  if (key === configuredKey || configuring) return;
+  const key = `${sessionId ?? ''}|${model ?? ''}`;
+  const due = Date.now() - lastWatchAt >= WATCH_RENEW_MS;
+  if ((key === configuredKey && !due) || configuring) return;
   configuring = true;
   try {
     await host.serviceRequest({
       method: 'POST',
       path: '/watch',
-      body: JSON.stringify({ ...(origin ? { origin } : {}), sessionId, model }),
+      body: JSON.stringify({ sessionId, model }),
     });
     configuredKey = key;
+    lastWatchAt = Date.now();
   } catch (error) {
     configuredKey = '';
     render(null, describeError(error));
@@ -1059,6 +1058,16 @@ const configure = async (sessionId: string | null): Promise<void> => {
     configuring = false;
   }
 };
+
+// The service sends every watched session's reading to every open page; this
+// page takes only its own.
+host.onServiceEvent(({ topic, data }) => {
+  if (stopped || topic !== 'rate' || !data || typeof data !== 'object') return;
+  const pushed = data as { session?: unknown; rate?: unknown };
+  if ((pushed.session ?? null) !== (session?.id ?? null) || !pushed.rate || typeof pushed.rate !== 'object') return;
+  lastPushAt = Date.now();
+  take(pushed.rate as RateResponse);
+});
 
 const mount = (): void => {
   root.append(hero, sparkEl, noticeEl, rule, rows);
@@ -1073,12 +1082,16 @@ const mount = (): void => {
   }
   stopped = false;
   void configure(session?.id ?? null);
+  // The first reading is asked for: the service sends the next ones.
   void poll();
   requestAnimationFrame(paintSpark);
   const loop = () => {
     if (stopped) return;
     window.setTimeout(async () => {
-      await poll();
+      // Renewing the watch keeps the readings coming.
+      await configure(session?.id ?? null);
+      // Asking is the fallback for a host whose events never reach us.
+      if (Date.now() - lastPushAt > PUSH_STALE_MS) await poll();
       loop();
     }, document.hidden ? 1000 : 250);
   };
@@ -1090,8 +1103,10 @@ host.onReady((next) => {
   applyHostReady(next, document.documentElement);
   // The markup says English; the host knows what the reader actually reads.
   document.documentElement.lang = copy === COPY.zh ? 'zh' : 'en';
+  const previousSession = session?.id ?? null;
   session = next.session ? { id: next.session.id, title: next.session.title, busy: next.session.busy, model: next.session.model } : null;
-  origin = resolveOrigin();
+  // The pushes heard so far were another session's.
+  if ((session?.id ?? null) !== previousSession) lastPushAt = 0;
   unitEl.textContent = copy.unit;
   if (!mounted) {
     mounted = true;
@@ -1103,5 +1118,7 @@ host.onReady((next) => {
 
 host.onSession((next) => {
   session = next ? { id: next.id, title: next.title, busy: next.busy, model: next.model } : null;
+  // The pushes heard so far were another session's.
+  lastPushAt = 0;
   void configure(session?.id ?? null);
 });

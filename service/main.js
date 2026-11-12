@@ -1,11 +1,214 @@
 // service/main.ts
 import http from "node:http";
-import fs3 from "node:fs";
+import fs2 from "node:fs";
 import os2 from "node:os";
-import path3 from "node:path";
-import { execFile as execFile2 } from "node:child_process";
-import { promisify as promisify2 } from "node:util";
-
+import path2 from "node:path";
+// node_modules/@openchamber/sdk/dist/scrollbar-style.js
+var GUEST_SCROLLING_ATTRIBUTE = "data-oc-scrolling";
+var GUEST_SCROLLBAR_CSS = `
+:root {
+  /* Quiet at rest like the app's own thumbs; hover gives a clear grab target. */
+  --oc-scrollbar-thumb: color-mix(in srgb, var(--oc-muted, currentColor) 18%, transparent);
+  --oc-scrollbar-thumb-hover: color-mix(in srgb, var(--oc-muted, currentColor) 36%, transparent);
+  scrollbar-gutter: stable;
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+:hover, [${GUEST_SCROLLING_ATTRIBUTE}] {
+  scrollbar-color: var(--oc-scrollbar-thumb) transparent;
+}
+/* Chromium's standard scrollbar properties otherwise override its pseudo-elements. */
+@supports selector(::-webkit-scrollbar) {
+  *, :hover, [${GUEST_SCROLLING_ATTRIBUTE}] { scrollbar-width: auto; scrollbar-color: auto; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 999px;
+    min-width: 24px;
+    min-height: 24px;
+  }
+  :hover::-webkit-scrollbar-thumb, [${GUEST_SCROLLING_ATTRIBUTE}]::-webkit-scrollbar-thumb { background: var(--oc-scrollbar-thumb); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--oc-scrollbar-thumb-hover); }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  ::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+}
+@media (forced-colors: active) {
+  *, :hover, [${GUEST_SCROLLING_ATTRIBUTE}] { scrollbar-color: auto; }
+  ::-webkit-scrollbar-thumb, ::-webkit-scrollbar-thumb:hover { background: CanvasText; }
+}
+`;
+function installGuestScrollbarActivity(doc) {
+  const root = doc.documentElement;
+  if (root.hasAttribute("data-oc-scrollbar-activity"))
+    return;
+  root.setAttribute("data-oc-scrollbar-activity", "");
+  const timers = new WeakMap;
+  doc.addEventListener("scroll", (event) => {
+    const target = event.target === doc ? root : event.target;
+    if (!(target instanceof Element))
+      return;
+    if (!target.hasAttribute("data-oc-scrolling"))
+      target.setAttribute("data-oc-scrolling", "");
+    const pending = timers.get(target);
+    if (pending !== undefined)
+      clearTimeout(pending);
+    timers.set(target, setTimeout(() => {
+      timers.delete(target);
+      target.removeAttribute("data-oc-scrolling");
+    }, 1000));
+  }, { capture: true, passive: true });
+}
+var GUEST_SCROLLBAR_SCRIPT = `(${installGuestScrollbarActivity.toString()})(document);`;
+// node_modules/@openchamber/sdk/dist/manifest.js
+var TRACKER_URL_TOKENS = ["{id}", "{segment}", "{segments+}"];
+var TRACKER_URL_TOKEN_SET = new Set(TRACKER_URL_TOKENS);
+// node_modules/@openchamber/sdk/dist/session-events.js
+var GUEST_SESSION_EVENT_TYPES = [
+  "turn-finished",
+  "turn-failed",
+  "permission-asked",
+  "question-asked",
+  "turn-started",
+  "session-created",
+  "session-archived",
+  "session-deleted"
+];
+var SESSION_EVENTS_IDLE_MS = 10 * 60000;
+var EVENT_TYPES = new Set(GUEST_SESSION_EVENT_TYPES);
+// node_modules/@openchamber/sdk/dist/service-host.js
+var SERVICE_HOST_PATH = "/service/call";
+var OPENCHAMBER_HOST_CALLBACK_URL_ENV = "OPENCHAMBER_HOST_CALLBACK_URL";
+var SERVICE_HOST_TIMEOUT_MS = 30000;
+var SERVICE_SCHEDULE_IDLE_MS = 10 * 60000;
+var MENTIONS_IDLE_MS = 10 * 60000;
+class ServiceHostError extends Error {
+  code;
+  status;
+  constructor(message, code, status) {
+    super(message);
+    this.name = "ServiceHostError";
+    this.code = code;
+    this.status = status;
+  }
+}
+var createServiceHost = ({ env }) => {
+  const call = async (method, input) => {
+    const base = env[OPENCHAMBER_HOST_CALLBACK_URL_ENV];
+    const token = env.OPENCHAMBER_SERVICE_TOKEN;
+    if (!base || !token)
+      throw new ServiceHostError("This service was not started by OpenChamber.", "HOST_UNAVAILABLE", 0);
+    let response;
+    try {
+      response = await fetch(`${base.replace(/\/+$/, "")}${SERVICE_HOST_PATH}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ method, input }),
+        signal: AbortSignal.timeout(SERVICE_HOST_TIMEOUT_MS)
+      });
+    } catch {
+      throw new ServiceHostError("OpenChamber did not answer.", "HOST_UNAVAILABLE", 0);
+    }
+    const body = await response.json().catch(() => null);
+    if (response.ok && body?.result !== undefined)
+      return body.result;
+    throw new ServiceHostError(body?.error?.message ?? `OpenChamber answered HTTP ${response.status}.`, body?.error?.code ?? "HOST_UNAVAILABLE", response.status);
+  };
+  return {
+    sessions: {
+      start: (input) => call("sessions.start", input),
+      send: (sessionId, prompt) => call("sessions.send", { sessionId, prompt }),
+      retry: (sessionId) => call("sessions.retry", { sessionId }),
+      status: (sessionId) => call("sessions.status", { sessionId }),
+      lastReply: (sessionId) => call("sessions.lastReply", { sessionId }),
+      stop: (sessionId) => call("sessions.stop", { sessionId }),
+      answerPermission: (sessionId, requestId, answer) => call("sessions.answerPermission", { sessionId, requestId, ...answer }),
+      answerForm: (sessionId, formId, values, message) => call("sessions.answerForm", { sessionId, formId, values, ...message === undefined ? {} : { message } })
+    },
+    setInstructions: (directory, text) => call("instructions.set", { directory, text }),
+    emit: (topic, data) => call("panels.emit", { topic, data }),
+    readSettings: () => call("settings.read", {}).then(({ settings }) => settings),
+    needsConfiguration: (message) => call("status.set", { needsConfiguration: message })
+  };
+};
+// node_modules/@openchamber/sdk/dist/file-editor.js
+var patternExpressions = new Map;
+// node_modules/@openchamber/sdk/dist/contract.js
+var GUEST_FILE_STAT_KINDS = ["file", "directory", "other", "missing"];
+var GUEST_GENERATE_LATE_KEEP_MS = 60 * 60000;
+var HOST_REQUEST_ERROR_CODES = [
+  "HOST_UNAVAILABLE",
+  "HOST_TIMEOUT",
+  "HOST_REJECTED",
+  "DISCONNECTED",
+  "DISABLED",
+  "BAD_PATH",
+  "NO_INTEGRATION",
+  "NO_SERVICE",
+  "SERVICE_FAILED",
+  "REQUEST_FAILED",
+  "RESPONSE_TOO_LARGE",
+  "NO_SESSION",
+  "SESSION_BUSY",
+  "NOT_GRANTED",
+  "NO_DIRECTORY",
+  "NOT_FOUND",
+  "FILE_TOO_LARGE",
+  "DENIED",
+  "NO_MODEL",
+  "MODEL_FAILED",
+  "UNSUPPORTED"
+];
+var SERVICE_STATUS_VALUES = ["stopped", "starting", "ready", "failed"];
+var hostRequestErrorCodeSet = new Set(HOST_REQUEST_ERROR_CODES);
+var serviceStatusSet = new Set(SERVICE_STATUS_VALUES);
+var fileStatKindSet = new Set(GUEST_FILE_STAT_KINDS);
+var HOST_PUSH_TYPES = new Set([
+  "workspace",
+  "shells",
+  "ready",
+  "directory",
+  "session",
+  "connection",
+  "settings",
+  "session-lifecycle",
+  "item",
+  "resolve",
+  "action",
+  "service-event",
+  "status-control-event",
+  "popover-closed",
+  "file-open",
+  "file-snapshot",
+  "file-saved",
+  "generate-late"
+]);
+// node_modules/@openchamber/sdk/dist/service-providers.js
+var BROWSER_CONTROL_ACTIONS = [
+  "browser.open",
+  "browser.snapshot",
+  "browser.click",
+  "browser.type",
+  "browser.select",
+  "browser.scroll",
+  "browser.back",
+  "browser.forward",
+  "browser.inspect",
+  "browser.capture",
+  "browser.resize",
+  "browser.close"
+];
+var BROWSER_PROVIDER_IDLE_MS = 10 * 60000;
+var CONTROL_ACTIONS = new Set(BROWSER_CONTROL_ACTIONS);
+var SOURCE_CONTROL_PROVIDER_IDLE_MS = 10 * 60000;
+var NOTIFICATIONS_PROVIDER_IDLE_MS = 10 * 60000;
+var TRACKER_PROVIDER_IDLE_MS = 10 * 60000;
+var QUOTA_PROVIDER_IDLE_MS = 10 * 60000;
+// node_modules/@openchamber/sdk/dist/service-surface.js
+var SURFACE_CONTROLLERS = ["none", "agent", "user"];
+var CONTROLLERS = new Set(SURFACE_CONTROLLERS);
 // shared/models.ts
 var modelDisplayName = (id) => {
   const trimmed = id.trim();
@@ -27,91 +230,18 @@ var splitTurn = (input) => {
 };
 
 // shared/tokens.ts
-var CHARS_DIV_4 = 4;
-var CHARS_DIV_3 = 3;
-var tokensFromChars = (chars, algorithm = "heuristic") => {
+var tokensFromChars = (chars) => {
   if (!Number.isFinite(chars) || chars <= 0)
     return 0;
-  return Math.ceil(chars / (algorithm === "code" ? CHARS_DIV_3 : CHARS_DIV_4));
-};
-
-// service/auth.ts
-import fs from "node:fs/promises";
-import path from "node:path";
-var isLoopbackHost = (hostname) => hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
-var trustedClientOrigin = (origin, desktopOrigin, parentEndpoints) => {
-  let target;
-  try {
-    target = new URL(origin);
-  } catch {
-    return false;
-  }
-  if (target.protocol !== "http:" && target.protocol !== "https:" || target.hostname !== "127.0.0.1" && target.hostname !== "[::1]" || target.username || target.password)
-    return false;
-  if (desktopOrigin !== null) {
-    try {
-      return target.origin === new URL(desktopOrigin).origin;
-    } catch {
-      return false;
-    }
-  }
-  const port = Number(target.port || (target.protocol === "https:" ? 443 : 80));
-  const wildcard = (host) => host === "0.0.0.0" || host === "*" || host === "";
-  return parentEndpoints.some((endpoint) => endpoint.port === port && (target.hostname === "127.0.0.1" ? endpoint.host === "127.0.0.1" || wildcard(endpoint.host) : endpoint.host === "::1" || endpoint.host === "::"));
-};
-var readRecord = async (file) => {
-  try {
-    const value = JSON.parse(await fs.readFile(file, "utf8"));
-    return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
-  } catch {
-    return {};
-  }
-};
-var passwordAuthHeaders = async (origin, dataDir, parentPorts, signal) => {
-  let url;
-  try {
-    url = new URL(origin);
-  } catch {
-    return {};
-  }
-  if (!isLoopbackHost(url.hostname))
-    return {};
-  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
-  if (!Number.isInteger(port) || port <= 0)
-    return {};
-  const instance = await readRecord(path.join(dataDir, "run", `openchamber-${port}.json`));
-  if (!parentPorts.has(port) && Object.keys(instance).length === 0)
-    return {};
-  let password = process.env.OPENCHAMBER_GAUGE_UI_PASSWORD?.trim() ?? "";
-  if (!password) {
-    const value = instance.uiPassword;
-    if (typeof value === "string")
-      password = value;
-  }
-  if (!password)
-    return {};
-  try {
-    const response = await fetch(new URL("/auth/session", url), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ password }),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
-      redirect: "manual"
-    });
-    const cookie = response.headers.get("set-cookie")?.match(/(?:^|,\s*)(oc_ui_session(?:_\d+)?=[^;]+)/)?.[1];
-    await response.body?.cancel();
-    if (response.ok && cookie)
-      return { Cookie: cookie };
-  } catch {}
-  return {};
+  return Math.ceil(chars / 4);
 };
 
 // service/gauge.ts
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import fs2 from "node:fs";
+import fs from "node:fs";
 import os from "node:os";
-import path2 from "node:path";
+import path from "node:path";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile);
 var DEMAND_MS = 1e4;
@@ -172,7 +302,7 @@ var sampleMac = async () => {
     macBusy = false;
   }
 };
-var PROGRESS_DIR = process.env.GAUGE_PROGRESS_DIR || path2.join(os.homedir(), ".cache", "gauge", "prompt-progress");
+var PROGRESS_DIR = process.env.GAUGE_PROGRESS_DIR || path.join(os.homedir(), ".cache", "gauge", "prompt-progress");
 var MAX_WRITERS = 16;
 var MAX_ENTRIES = 16;
 var MAX_FILE_BYTES = 64 * 1024;
@@ -183,18 +313,18 @@ var readProgressEntries = (dir, now) => {
   const out = [];
   let names;
   try {
-    names = fs2.readdirSync(dir).filter((name) => !name.startsWith(".") && name.endsWith(".json")).slice(0, MAX_WRITERS);
+    names = fs.readdirSync(dir).filter((name) => !name.startsWith(".") && name.endsWith(".json")).slice(0, MAX_WRITERS);
   } catch {
     return out;
   }
   for (const name of names) {
-    const file = path2.join(dir, name);
+    const file = path.join(dir, name);
     let doc;
     try {
-      const info = fs2.lstatSync(file);
+      const info = fs.lstatSync(file);
       if (!info.isFile() || info.size > MAX_FILE_BYTES)
         continue;
-      doc = JSON.parse(fs2.readFileSync(file, "utf8"));
+      doc = JSON.parse(fs.readFileSync(file, "utf8"));
     } catch {
       continue;
     }
@@ -442,7 +572,7 @@ var pollComfy = async (now) => {
     comfyBusy = false;
   }
 };
-var SPLASH_RUNTIME_DIR = process.env.GAUGE_SPLASH_RUNTIME_DIR || path2.join(os.homedir(), "Library", "Application Support", "Splash", "runtime");
+var SPLASH_RUNTIME_DIR = process.env.GAUGE_SPLASH_RUNTIME_DIR || path.join(os.homedir(), "Library", "Application Support", "Splash", "runtime");
 var MODEL_EVERY_MS = 3000;
 var MODEL_GIVE_UP_MS = 30000;
 var MODEL_FILE_BYTES = 64 * 1024;
@@ -500,10 +630,10 @@ var splitModelName = (model) => {
 };
 var readJsonFile = (file) => {
   try {
-    const info = fs2.lstatSync(file);
+    const info = fs.lstatSync(file);
     if (!info.isFile() || info.size > MODEL_FILE_BYTES)
       return null;
-    return JSON.parse(fs2.readFileSync(file, "utf8"));
+    return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
     return null;
   }
@@ -537,13 +667,13 @@ var fetchSplashStatus = async (port) => {
 var discoverSplash = async (dir = SPLASH_RUNTIME_DIR, read = fetchSplashStatus) => {
   let names;
   try {
-    names = fs2.readdirSync(dir).filter((name) => name.startsWith("serve-") && name.endsWith(".json")).slice(0, 16);
+    names = fs.readdirSync(dir).filter((name) => name.startsWith("serve-") && name.endsWith(".json")).slice(0, 16);
   } catch {
     return [];
   }
   const found = [];
   for (const name of names) {
-    const record = parseServeRecord(name, readJsonFile(path2.join(dir, name)));
+    const record = parseServeRecord(name, readJsonFile(path.join(dir, name)));
     if (!record)
       continue;
     if (!processAlive(record.pid))
@@ -599,7 +729,7 @@ var gaugeWire = (sessionIds, now) => {
     const step = steps.get(runningId);
     job.step = step && now - step.at < STEP_FRESH_MS ? step : null;
   }
-  return { mac, prompt: promptFor(sessionIds, now), render: job, model };
+  return { macSupported: process.platform === "darwin", mac, prompt: promptFor(sessionIds, now), render: job, model };
 };
 var idleTimer = setInterval(() => {
   if (!wanted(Date.now())) {
@@ -610,51 +740,40 @@ var idleTimer = setInterval(() => {
 idleTimer.unref?.();
 
 // service/main.ts
-var execFileAsync2 = promisify2(execFile2);
-var dataDir = () => {
-  const override = process.env.OPENCHAMBER_DATA_DIR;
-  if (override && override.trim())
-    return path3.resolve(override.trim());
-  return path3.join(os2.homedir(), ".config", "openchamber");
-};
-var readClientToken = () => {
-  const override = process.env.OPENCHAMBER_GAUGE_CLIENT_TOKEN;
-  if (override && override.trim())
-    return override.trim();
-  try {
-    const raw = JSON.parse(fs3.readFileSync(path3.join(dataDir(), "settings.json"), "utf8"));
-    const value = raw?.desktopLocalClientToken;
-    if (typeof value === "string" && value.trim())
-      return value.trim();
-  } catch {}
-  return "";
-};
-var serverHeaders = async (origin) => {
-  const own = desktopOrigin();
-  let endpoints = [];
-  if (!own) {
-    try {
-      endpoints = await parentListenEndpoints();
-    } catch {
-      return {};
-    }
-  }
-  if (!trustedClientOrigin(origin, own, endpoints))
-    return {};
-  const token = readClientToken();
-  return token ? { Authorization: `Bearer ${token}` } : {};
-};
-var desktopOrigin = () => {
-  try {
-    const raw = JSON.parse(fs3.readFileSync(path3.join(dataDir(), "settings.json"), "utf8"));
-    const port = Number(raw?.desktopLocalPort);
-    if (!Number.isInteger(port) || port <= 0 || port > 65535)
-      return null;
-    return `http://127.0.0.1:${port}`;
-  } catch {
-    return null;
-  }
-};
+var OPENCODE_URL = (process.env.OPENCHAMBER_OPENCODE_URL ?? "").replace(/\/+$/, "");
+var opencodeHeaders = (accept) => ({
+  Accept: accept,
+  Authorization: `Bearer ${process.env.OPENCHAMBER_SERVICE_TOKEN ?? ""}`
+});
+var EVENT_TYPES2 = [
+  "session.created",
+  "session.text.delta",
+  "session.text.ended",
+  "session.reasoning.delta",
+  "session.reasoning.ended",
+  "session.tool.input.started",
+  "session.tool.input.delta",
+  "session.tool.input.ended",
+  "session.tool.called",
+  "session.tool.success",
+  "session.tool.failed",
+  "session.shell.started",
+  "session.shell.ended",
+  "session.step.started",
+  "session.step.ended",
+  "session.step.failed",
+  "session.execution.started",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "permission.asked",
+  "permission.replied",
+  "form.created",
+  "form.replied",
+  "form.cancelled"
+];
+var filterTypes = true;
+var serviceHost = createServiceHost({ env: process.env });
 var port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 var token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
 if (!Number.isInteger(port) || port <= 0 || !token) {
@@ -667,8 +786,9 @@ var CURVE_BUCKETS = 24;
 var SAMPLE_LIMIT = 20000;
 var RETRY_BASE_MS = 1000;
 var RETRY_MAX_MS = 15000;
-var PROBE_TIMEOUT_MS = 2000;
-var DISCOVERY_INTERVAL_MS = 5000;
+var SESSION_ID_MAX = 256;
+var MODEL_NAME_MAX = 256;
+var RESUME_GAP_MS = 15000;
 var CALIBRATION_WEIGHT = 0.3;
 var MIN_CALIBRATION_FACTOR = 0.25;
 var MAX_CALIBRATION_FACTOR = 4;
@@ -690,7 +810,6 @@ var calibrate = (model, chars, generated) => {
   calibration.set(model, previous + (factor - previous) * CALIBRATION_WEIGHT);
 };
 var MAX_STREAM_GAP_MS = 1000;
-var TURNS_CAP = 100;
 var SESSIONS_CAP = 20;
 var PERSIST_DEBOUNCE_MS = 1500;
 var PERSIST_VERSION = 1;
@@ -709,11 +828,12 @@ function emptyCache() {
     cost: 0,
     last: null,
     prevHitRate: null,
-    turnBase: null
+    turnBase: null,
+    lastStep: null
   };
 }
 var stepUsageFrom = (tokens, cost) => {
-  const block = readRecord2(tokens.cache);
+  const block = readRecord(tokens.cache);
   return {
     input: readNumber(tokens.input),
     cacheRead: block ? readNumber(block.read) : 0,
@@ -726,15 +846,19 @@ var stepUsageFrom = (tokens, cost) => {
 };
 var foldCacheStep = (agg, sessionId, messageID, usage, now) => {
   const last = agg.last;
-  const retrying = last !== null && last.sessionId === sessionId && last.messageID === messageID;
-  if (retrying && last) {
-    agg.hit -= last.hit;
-    agg.miss -= last.miss;
-    agg.input -= last.input;
-    agg.write -= last.write;
-    agg.output -= last.output;
-    agg.reasoning -= last.reasoning;
+  const before = agg.lastStep;
+  const retrying = before !== null && before.sessionId === sessionId && before.messageID === messageID;
+  if (retrying && before) {
+    agg.output -= before.output;
+    agg.reasoning -= before.reasoning;
+    agg.cost -= before.cost;
     agg.steps = Math.max(0, agg.steps - 1);
+    if (before.cached) {
+      agg.hit -= before.hit;
+      agg.miss -= before.miss;
+      agg.input -= before.input;
+      agg.write -= before.write;
+    }
   }
   if (agg.startedAt === null)
     agg.startedAt = now;
@@ -743,16 +867,31 @@ var foldCacheStep = (agg, sessionId, messageID, usage, now) => {
   agg.output += usage.output;
   agg.reasoning += usage.reasoning;
   agg.cost += usage.cost;
-  if (!usage.hasCache) {
-    return;
-  }
   const hit = usage.cacheRead;
   const miss = usage.input + usage.cacheWrite;
+  agg.lastStep = {
+    sessionId,
+    messageID,
+    cost: usage.cost,
+    output: usage.output,
+    reasoning: usage.reasoning,
+    cached: usage.hasCache,
+    hit,
+    miss,
+    input: usage.input,
+    write: usage.cacheWrite
+  };
+  if (!usage.hasCache) {
+    if (retrying && before?.cached && last?.messageID === messageID)
+      agg.last = null;
+    return;
+  }
   agg.hit += hit;
   agg.miss += miss;
   agg.write += usage.cacheWrite;
   agg.input += usage.input;
-  const previous = retrying ? agg.prevHitRate : last?.hitRate ?? null;
+  const repeatsPoint = last !== null && last.sessionId === sessionId && last.messageID === messageID;
+  const previous = repeatsPoint ? agg.prevHitRate : last?.hitRate ?? null;
   const hitRate = cacheRate(hit, miss);
   agg.last = {
     at: now,
@@ -828,7 +967,7 @@ var cacheMemory = (agg) => ({
   sessions: [...agg.sessions].slice(-60)
 });
 var restoreCache = (raw) => {
-  const rec = readRecord2(raw);
+  const rec = readRecord(raw);
   if (!rec)
     return emptyCache();
   const agg = emptyCache();
@@ -845,7 +984,7 @@ var restoreCache = (raw) => {
   agg.output = readNumber(rec.output);
   agg.reasoning = readNumber(rec.reasoning);
   agg.cost = readNumber(rec.cost);
-  const last = readRecord2(rec.last);
+  const last = readRecord(rec.last);
   if (last && typeof last.sessionId === "string") {
     agg.last = {
       at: readNumber(last.at),
@@ -862,13 +1001,28 @@ var restoreCache = (raw) => {
     };
   }
   agg.prevHitRate = typeof rec.prevHitRate === "number" && Number.isFinite(rec.prevHitRate) ? rec.prevHitRate : null;
-  const base = readRecord2(rec.turnBase);
+  const base = readRecord(rec.turnBase);
   if (base) {
     agg.turnBase = {
       hit: readNumber(base.hit),
       miss: readNumber(base.miss),
       steps: readNumber(base.steps),
       output: readNumber(base.output)
+    };
+  }
+  const step = readRecord(rec.lastStep);
+  if (step && typeof step.sessionId === "string" && typeof step.messageID === "string") {
+    agg.lastStep = {
+      sessionId: step.sessionId,
+      messageID: step.messageID,
+      cost: readNumber(step.cost),
+      output: readNumber(step.output),
+      reasoning: readNumber(step.reasoning),
+      cached: step.cached === true,
+      hit: readNumber(step.hit),
+      miss: readNumber(step.miss),
+      input: readNumber(step.input),
+      write: readNumber(step.write)
     };
   }
   return agg;
@@ -883,10 +1037,8 @@ var watch = null;
 var connection = "idle";
 var lastError = null;
 var lastErrorKind = null;
-var serverOrigin = null;
-var lastDiscoveryAt = 0;
+var streamLostAt = null;
 var lastEventAt = 0;
-var eventsSeen = 0;
 var busy = false;
 var controller = null;
 var retryTimer = null;
@@ -929,7 +1081,6 @@ var clearTurn = () => {
     steps2.delete(id);
   turnStepOrder = [];
 };
-var turns = [];
 var sessionStates = new Map;
 var watched = new Set;
 var sessionParents = new Map;
@@ -966,7 +1117,6 @@ var createSessionState = (sessionId) => ({
   fbChars: -1,
   fbTps: NaN,
   lastTurn: null,
-  turns: [],
   cache: emptyCache(),
   pendingPermissions: new Set,
   pendingQuestions: new Set
@@ -1035,7 +1185,6 @@ var loadState = (state) => {
   fbChars = state.fbChars;
   fbTps = state.fbTps;
   lastTurn = state.lastTurn;
-  turns = state.turns;
   cache = state.cache;
   pendingPermissions = state.pendingPermissions;
   pendingQuestions = state.pendingQuestions;
@@ -1075,7 +1224,6 @@ var leaveSession = () => {
   state.fbChars = fbChars;
   state.fbTps = fbTps;
   state.lastTurn = lastTurn;
-  state.turns = turns;
   state.cache = cache;
   state.pendingPermissions = pendingPermissions;
   state.pendingQuestions = pendingQuestions;
@@ -1087,18 +1235,23 @@ var statePaths = () => {
   const override = process.env.OPENCHAMBER_GAUGE_STATE;
   if (override)
     return [override];
+  const dataDir = process.env.OPENCHAMBER_SERVICE_DATA_DIR;
+  const fallback = path2.join(os2.tmpdir(), "openchamber-gauge-state.json");
+  return dataDir ? [path2.join(dataDir, "state.json"), fallback] : [fallback];
+};
+var legacyStatePath = () => {
+  if (process.env.OPENCHAMBER_GAUGE_STATE)
+    return null;
   const entry = process.argv[1];
-  const beside = entry ? path3.dirname(entry) : process.cwd();
-  return [path3.join(beside, ".gauge-state.json"), path3.join(os2.tmpdir(), "openchamber-gauge-state.json")];
+  return entry ? path2.join(path2.dirname(entry), ".gauge-state.json") : null;
 };
 var memoryOf = (state) => ({
   lastTurn: state.lastTurn,
-  turns: state.turns.slice(-TURNS_CAP),
   cache: cacheMemory(state.cache)
 });
 var readSessions = (file) => {
   try {
-    const parsed = JSON.parse(fs3.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
     if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions)
       return {};
     const out = {};
@@ -1113,7 +1266,7 @@ var readSessions = (file) => {
 };
 var readModels = (file) => {
   try {
-    const parsed = JSON.parse(fs3.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
     const out = {};
     const models = parsed && typeof parsed.models === "object" ? parsed.models : null;
     if (models) {
@@ -1128,7 +1281,8 @@ var readModels = (file) => {
   }
 };
 var readPersisted = () => {
-  for (const file of statePaths()) {
+  const legacy = legacyStatePath();
+  for (const file of [...statePaths().slice(0, 1), ...legacy ? [legacy] : [], ...statePaths().slice(1)]) {
     const sessions = readSessions(file);
     if (Object.keys(sessions).length === 0)
       continue;
@@ -1139,7 +1293,6 @@ var readPersisted = () => {
       const memory = raw;
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
-      state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
       state.cache = restoreCache(memory.cache);
       sessionStates.set(id, state);
     }
@@ -1166,8 +1319,12 @@ var writePersisted = () => {
         models: { ...readModels(file), ...Object.fromEntries(calibration) }
       });
       const tmp = `${file}.${process.pid}.tmp`;
-      fs3.writeFileSync(tmp, payload, "utf8");
-      fs3.renameSync(tmp, file);
+      fs2.mkdirSync(path2.dirname(file), { recursive: true });
+      fs2.writeFileSync(tmp, payload, "utf8");
+      fs2.renameSync(tmp, file);
+      const legacy = legacyStatePath();
+      if (legacy && legacy !== file)
+        fs2.rmSync(legacy, { force: true });
       return;
     } catch {}
   }
@@ -1290,7 +1447,6 @@ var stepToolWithinMs = (step, fromMs, toMs) => {
   }
   return total;
 };
-var stepReasoningExclMs = (_step) => 0;
 var MAX_PLAUSIBLE_TOKENS_PER_SECOND = 5000;
 var plausibleRate = (tokens, ms) => {
   if (!(ms >= 1))
@@ -1310,7 +1466,7 @@ var contributeStep = (step) => {
     return null;
   const genStart = generationStart(step);
   const endRef = step.endAt ?? step.lastDeltaAt ?? step.startAt;
-  const netMs = Math.max(0, endRef - genStart) - stepToolWithinMs(step, genStart, endRef) - stepReasoningExclMs(step);
+  const netMs = Math.max(0, endRef - genStart) - stepToolWithinMs(step, genStart, endRef);
   if (!(netMs >= 1))
     return null;
   let tokens;
@@ -1418,16 +1574,12 @@ var finalizeTurn = (now) => {
       source: sum.real ? "tokens" : "estimate",
       tokens: sum.tokens,
       activeMs: Math.round(sum.netMs),
-      wallMs,
       ttftMs: sum.ttftMs,
       hasReasoning: turnReasoningChars > 0 || [...steps2.values()].some((s) => s.reasoning > 0),
       endedAt: now,
       cache: turnCache,
       split: turnSplit(now, sum.netMs)
     };
-    turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
-    if (turns.length > TURNS_CAP)
-      turns.splice(0, turns.length - TURNS_CAP);
     schedulePersist();
     clearTurn();
     return;
@@ -1448,16 +1600,12 @@ var finalizeTurn = (now) => {
     source: "estimate",
     tokens: estimateTokens(turnChars),
     activeMs,
-    wallMs,
     ttftMs: turnTtftMs(),
     hasReasoning: turnReasoningChars > 0,
     endedAt: now,
     cache: turnCache,
     split: turnSplit(now, activeMs)
   };
-  turns.push({ tps: lastTurn.tokensPerSecond, at: now, cache: turnCache });
-  if (turns.length > TURNS_CAP)
-    turns.splice(0, turns.length - TURNS_CAP);
   schedulePersist();
   clearTurn();
 };
@@ -1506,7 +1654,7 @@ var recordChars = (messageID, partID, kind, chars, now) => {
 var isWatchedSession = (sessionID) => typeof sessionID === "string" && activeSessionId !== null && sessionID === activeSessionId;
 var readString = (value) => typeof value === "string" ? value : "";
 var readNumber = (value) => typeof value === "number" && Number.isFinite(value) ? value : 0;
-var readRecord2 = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+var readRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 var fragmentPartID = (messageID, kind, ordinal) => {
   if (!messageID)
     return "";
@@ -1536,20 +1684,20 @@ var settleStep = (messageID, output, reasoning, now) => {
   closeStepTool(step, now);
 };
 var eventSessionID = (event) => {
-  const payload = readRecord2(event.data) ?? readRecord2(event.properties);
+  const payload = readRecord(event.data) ?? readRecord(event.properties);
   if (!payload)
     return null;
   const direct = readString(payload.sessionID);
   if (direct)
     return direct;
-  const form = readRecord2(payload.form);
+  const form = readRecord(payload.form);
   return form ? readString(form.sessionID) : "";
 };
 var handleEvent = (event, now) => {
   const sessionId = eventSessionID(event);
   const type = normType(readString(event.type));
   if (sessionId && type === "session.created") {
-    const data = readRecord2(event.data) ?? readRecord2(event.properties);
+    const data = readRecord(event.data) ?? readRecord(event.properties);
     const parentID = data ? readString(data.parentID) : "";
     if (parentID)
       sessionParents.set(sessionId, parentID);
@@ -1596,37 +1744,29 @@ var holdForLookup = (sessionId, event) => {
   deferredEvents.set(sessionId, held);
 };
 var fetchSessionParent = async (sessionId) => {
-  const bases = [];
-  for (const candidate of [serverOrigin, watch?.origin, desktopOrigin()]) {
-    if (candidate && !bases.includes(candidate))
-      bases.push(candidate);
-  }
-  for (const base of bases) {
-    let response;
-    try {
-      response = await fetch(new URL(`/api/session/${encodeURIComponent(sessionId)}`, base), {
-        headers: { Accept: "application/json", ...await serverHeaders(base) },
-        signal: AbortSignal.timeout(3000),
-        redirect: "manual"
-      });
-    } catch {
-      continue;
-    }
+  if (!OPENCODE_URL)
+    return null;
+  try {
+    const response = await fetch(`${OPENCODE_URL}/api/session/${encodeURIComponent(sessionId)}`, {
+      headers: opencodeHeaders("application/json"),
+      signal: AbortSignal.timeout(3000),
+      redirect: "manual"
+    });
     const contentType = response.headers.get("content-type") ?? "";
-    if (!response.ok || !contentType.includes("application/json")) {
+    if (!response.ok || !contentType.includes("json")) {
       await response.body?.cancel().catch(() => {
         return;
       });
-      continue;
-    }
-    try {
-      const body = await response.json();
-      return readString(body.parentID);
-    } catch {
       return null;
     }
+    const body = readRecord(await response.json());
+    if (!body)
+      return null;
+    const record = readRecord(body.data) ?? body;
+    return readString(record.parentID) || readString(record.parentId);
+  } catch {
+    return null;
   }
-  return null;
 };
 var resolveSessionParent = async (sessionId) => {
   const parentID = await fetchSessionParent(sessionId);
@@ -1652,7 +1792,7 @@ var dispatchEvent = (event, now) => {
   const type = normType(readString(event.type));
   if (!type)
     return;
-  const payload = readRecord2(event.data) ?? readRecord2(event.properties);
+  const payload = readRecord(event.data) ?? readRecord(event.properties);
   if (!payload)
     return;
   if (type === "session.text.delta" || type === "session.reasoning.delta") {
@@ -1768,7 +1908,7 @@ var dispatchEvent = (event, now) => {
     if (!isWatchedSession(payload.sessionID))
       return;
     markActive(now);
-    const key = `shell:${readString(payload.id) || String(eventsSeen)}`;
+    const key = `shell:${readString(payload.id) || `at${now}`}`;
     activeToolIds.add(key);
     if (toolStartAt === null && turnExecAt !== null)
       toolStartAt = now;
@@ -1817,7 +1957,7 @@ var dispatchEvent = (event, now) => {
     const messageID = readString(payload.assistantMessageID);
     if (!messageID)
       return;
-    const model = readString(payload.modelID) || readString(readRecord2(payload.model)?.id);
+    const model = readString(payload.modelID) || readString(readRecord(payload.model)?.id);
     if (model)
       currentModel = model;
     const existing = steps2.get(messageID);
@@ -1836,7 +1976,7 @@ var dispatchEvent = (event, now) => {
     if (!isWatchedSession(payload.sessionID))
       return;
     markActive(now);
-    const tokens = readRecord2(payload.tokens);
+    const tokens = readRecord(payload.tokens);
     if (!tokens) {
       lastEventAt = now;
       return;
@@ -1900,7 +2040,7 @@ var dispatchEvent = (event, now) => {
     return;
   }
   if (type === "form.created") {
-    const form = readRecord2(payload.form);
+    const form = readRecord(payload.form);
     if (!form || !isWatchedSession(form.sessionID))
       return;
     const requestId = readString(form.id);
@@ -1939,7 +2079,7 @@ var dispatchEvent = (event, now) => {
   if (type === "session.status") {
     if (!isWatchedSession(payload.sessionID))
       return;
-    const status = readRecord2(payload.status);
+    const status = readRecord(payload.status);
     const nextBusy = status?.type === "busy" || status?.type === "retry";
     if (busy && !nextBusy)
       finalizeTurn(now);
@@ -1978,224 +2118,31 @@ var handleSseChunk = (chunk) => {
     return;
   const envelope = parsed;
   const event = envelope.payload && typeof envelope.payload === "object" ? envelope.payload : parsed;
-  eventsSeen += 1;
   handleEvent(event, Date.now());
 };
-var parseEndpoint = (value) => {
-  const bracketed = /^\[([^\]]*)\]:(\d+)$/.exec(value);
-  if (bracketed)
-    return { host: bracketed[1], port: Number(bracketed[2]) };
-  const plain = /^([^:]+):(\d+)$/.exec(value);
-  if (plain)
-    return { host: plain[1], port: Number(plain[2]) };
-  return null;
-};
-var toOrigin = (scheme, host, port) => {
-  const dial = host === "" || host === "*" || host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-  return `${scheme}://${dial.includes(":") ? `[${dial}]` : dial}:${port}`;
-};
-var runFile = async (file, args) => {
-  const { stdout } = await execFileAsync2(file, args, {
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024,
-    windowsHide: true
-  });
-  return String(stdout);
-};
-var windowsListenEndpoints = async (pid) => {
-  const out = await runFile("netstat", ["-ano"]);
-  const found = [];
-  for (const line of out.split(/\r?\n/)) {
-    const cols = line.trim().split(/\s+/);
-    if (cols.length < 5 || cols[0] !== "TCP")
-      continue;
-    if (Number(cols[4]) !== pid)
-      continue;
-    const listening = cols[2] === "0.0.0.0:0" || cols[2] === "[::]:0" || cols[2] === "*:*" || cols[3] === "LISTENING";
-    if (!listening)
-      continue;
-    const endpoint = parseEndpoint(cols[1]);
-    if (endpoint)
-      found.push(endpoint);
-  }
-  return found;
-};
-var ssListenEndpoints = async (pid) => {
-  const out = await runFile("ss", ["-ltnp"]);
-  const found = [];
-  for (const line of out.split(/\r?\n/)) {
-    const cols = line.trim().split(/\s+/);
-    if (cols.length < 6 || cols[0] !== "LISTEN")
-      continue;
-    if (!new RegExp(`\\bpid=${pid}\\b`).test(cols.slice(5).join(" ")))
-      continue;
-    const endpoint = parseEndpoint(cols[3]);
-    if (endpoint)
-      found.push(endpoint);
-  }
-  return found;
-};
-var lsofListenEndpoints = async (pid) => {
-  const out = await runFile("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", String(pid)]);
-  const found = [];
-  for (const line of out.split(/\r?\n/)) {
-    const match = /\bTCP\s+(\S+)/.exec(line);
-    if (!match)
-      continue;
-    const endpoint = parseEndpoint(match[1]);
-    if (endpoint)
-      found.push(endpoint);
-  }
-  return found;
-};
-var LITTLE_ENDIAN = os2.endianness() === "LE";
-var procEndpoint = (value, ipv6) => {
-  const [address, portHex] = value.split(":");
-  if (!address || !portHex)
-    return null;
-  const port = Number.parseInt(portHex, 16);
-  if (!Number.isInteger(port) || port <= 0)
-    return null;
-  if (ipv6) {
-    const loopback = `${"0".repeat(24)}${LITTLE_ENDIAN ? "01000000" : "00000001"}`;
-    return address === loopback || address === "0".repeat(32) ? { host: "::1", port } : null;
-  }
-  if (address === "00000000")
-    return { host: "", port };
-  const bytes = address.match(/../g);
-  if (!bytes || bytes.length !== 4)
-    return null;
-  const ordered = LITTLE_ENDIAN ? [...bytes].reverse() : bytes;
-  const host = ordered.map((byte) => Number.parseInt(byte, 16)).join(".");
-  return { host, port };
-};
-var procListenEndpoints = async (pid) => {
-  const fdDir = `/proc/${pid}/fd`;
-  const inodes = new Set;
-  for (const entry of await fs3.promises.readdir(fdDir)) {
-    try {
-      const target = await fs3.promises.readlink(path3.join(fdDir, entry));
-      const match = /^socket:\[(\d+)\]$/.exec(target);
-      if (match)
-        inodes.add(match[1]);
-    } catch {}
-  }
-  if (inodes.size === 0)
-    return [];
-  const found = [];
-  for (const [file, ipv6] of [
-    ["/proc/net/tcp", false],
-    ["/proc/net/tcp6", true]
-  ]) {
-    let text;
-    try {
-      text = await fs3.promises.readFile(file, "utf8");
-    } catch {
-      continue;
-    }
-    for (const line of text.split(`
-`).slice(1)) {
-      const cols = line.trim().split(/\s+/);
-      if (cols.length < 10 || cols[3] !== "0A" || !inodes.has(cols[9]))
-        continue;
-      const endpoint = procEndpoint(cols[1], ipv6);
-      if (endpoint)
-        found.push(endpoint);
-    }
-  }
-  return found;
-};
-var parentListenEndpoints = async () => {
-  const pid = process.ppid;
-  if (!Number.isInteger(pid) || pid <= 1)
-    return [];
-  if (process.platform === "win32") {
-    try {
-      return await windowsListenEndpoints(pid);
-    } catch {
-      return [];
-    }
-  }
-  try {
-    const found = await ssListenEndpoints(pid);
-    if (found.length > 0)
-      return found;
-  } catch {}
-  try {
-    const found = await lsofListenEndpoints(pid);
-    if (found.length > 0)
-      return found;
-  } catch {}
-  try {
-    return await procListenEndpoints(pid);
-  } catch {
-    return [];
-  }
-};
-var probeEventStream = async (origin, signal) => {
-  try {
-    const response = await fetch(new URL("/api/global/event", origin), {
-      headers: { Accept: "text/event-stream", ...await serverHeaders(origin) },
-      signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
-      redirect: "manual"
-    });
-    const body = response.body;
-    if (body)
-      body.cancel().catch(() => {
-        return;
-      });
-    if (response.status === 401 || response.status === 403)
-      return "refused";
-    if (response.ok && (response.headers.get("content-type") ?? "").includes("text/event-stream"))
-      return "stream";
-    return null;
-  } catch {
-    return null;
-  }
-};
-var discoverServerOrigin = async (signal) => {
-  const now = Date.now();
-  if (now - lastDiscoveryAt < DISCOVERY_INTERVAL_MS)
-    return null;
-  lastDiscoveryAt = now;
-  let endpoints;
-  try {
-    endpoints = await parentListenEndpoints();
-  } catch {
-    return null;
-  }
-  let refused = null;
-  for (const { host, port: candidate } of endpoints) {
-    if (signal.aborted)
-      return null;
-    for (const scheme of ["http", "https"]) {
-      const origin = toOrigin(scheme, host, candidate);
-      const probe = await probeEventStream(origin, signal);
-      if (probe === "stream") {
-        console.log(`[gauge] event stream origin is ${origin}; the page's origin was unreachable here`);
-        return origin;
-      }
-      if (probe === "refused" && refused === null)
-        refused = origin;
-    }
-  }
-  return refused;
-};
-var scheduleReconnect = (message, kind) => {
+var scheduleReconnect = (message, kind, delay = retryDelay) => {
   lastError = message;
   lastErrorKind = kind;
   connection = "error";
-  if (!watch || retryTimer)
+  if (streamLostAt === null)
+    streamLostAt = Date.now();
+  if (retryTimer)
     return;
-  const delay = retryDelay;
-  retryDelay = Math.min(RETRY_MAX_MS, retryDelay * 2);
+  retryDelay = Math.min(RETRY_MAX_MS, Math.max(RETRY_BASE_MS, retryDelay * 2));
   retryTimer = setTimeout(() => {
     retryTimer = null;
     beginStream();
   }, delay);
+  retryTimer.unref?.();
 };
-var startStream = async (tried = new Set) => {
-  const current = watch;
+var eventUrl = () => {
+  const url = new URL(`${OPENCODE_URL}/api/event`);
+  if (filterTypes)
+    for (const type of EVENT_TYPES2)
+      url.searchParams.append("types", type);
+  return url.toString();
+};
+var startStream = async () => {
   if (retryTimer) {
     clearTimeout(retryTimer);
     retryTimer = null;
@@ -2203,119 +2150,101 @@ var startStream = async (tried = new Set) => {
   controller?.abort();
   const local = new AbortController;
   controller = local;
-  connection = "connecting";
+  if (!OPENCODE_URL) {
+    lastError = null;
+    lastErrorKind = "access";
+    connection = "error";
+    return;
+  }
+  if (connection !== "live")
+    connection = "connecting";
+  let response;
+  try {
+    response = await fetch(eventUrl(), {
+      headers: opencodeHeaders("text/event-stream"),
+      signal: local.signal,
+      redirect: "manual"
+    });
+  } catch (error) {
+    if (local.signal.aborted)
+      return;
+    scheduleReconnect(error instanceof Error ? error.message : String(error), "network");
+    return;
+  }
+  if (response.status === 400 && filterTypes) {
+    await response.body?.cancel().catch(() => {
+      return;
+    });
+    filterTypes = false;
+    scheduleReconnect("Event stream refused the type list", "http", 0);
+    return;
+  }
+  if (response.status === 401 || response.status === 403) {
+    await response.body?.cancel().catch(() => {
+      return;
+    });
+    scheduleReconnect(`Event stream answered HTTP ${response.status}`, "access");
+    return;
+  }
+  if (!response.ok || !response.body) {
+    await response.body?.cancel().catch(() => {
+      return;
+    });
+    scheduleReconnect(`Event stream answered HTTP ${response.status}`, "http");
+    return;
+  }
+  const lostFor = streamLostAt === null ? 0 : Date.now() - streamLostAt;
+  if (lostFor > RESUME_GAP_MS) {
+    resetInFlight();
+  }
+  streamLostAt = null;
+  connection = "live";
   lastError = null;
   lastErrorKind = null;
-  const own = desktopOrigin();
-  const seen = new Set(tried);
-  const candidates = [];
-  for (const candidate of [serverOrigin, current?.origin, own]) {
-    if (!candidate || seen.has(candidate))
-      continue;
-    seen.add(candidate);
-    candidates.push(candidate);
-  }
-  for (const origin of candidates) {
-    let response;
-    try {
-      response = await fetch(new URL("/api/global/event", origin), {
-        headers: { Accept: "text/event-stream", ...await serverHeaders(origin) },
-        signal: local.signal,
-        redirect: "manual"
-      });
-      if (response.status === 401 || response.status === 403) {
-        await response.body?.cancel();
-        const endpoints = await parentListenEndpoints();
-        if (local.signal.aborted)
-          return;
-        const headers = await passwordAuthHeaders(origin, dataDir(), new Set(endpoints.map((endpoint) => endpoint.port)), local.signal);
-        if (local.signal.aborted)
-          return;
-        if (Object.keys(headers).length > 0) {
-          response = await fetch(new URL("/api/global/event", origin), {
-            headers: { Accept: "text/event-stream", ...headers },
-            signal: local.signal,
-            redirect: "manual"
-          });
-        }
-      }
-    } catch (error) {
-      if (local.signal.aborted)
-        return;
-      lastError = error instanceof Error ? error.message : String(error);
-      lastErrorKind = "network";
-      continue;
-    }
-    if (!response.ok || !response.body) {
-      lastError = `Event stream answered HTTP ${response.status}`;
-      lastErrorKind = "http";
-      await response.body?.cancel();
-      continue;
-    }
-    if (origin === own)
-      serverOrigin = own;
-    connection = "live";
-    retryDelay = RETRY_BASE_MS;
-    lastEventAt = Date.now();
-    eventsSeen = 0;
-    resetInFlight();
-    try {
-      const decoder = new TextDecoder;
-      const reader = response.body.getReader();
-      let buffer = "";
-      while (!local.signal.aborted) {
-        const { value, done } = await reader.read();
-        if (done)
-          break;
-        buffer += decoder.decode(value, { stream: true });
-        let boundary = buffer.indexOf(`
+  retryDelay = RETRY_BASE_MS;
+  lastEventAt = Date.now();
+  let healthy = false;
+  try {
+    const decoder = new TextDecoder;
+    const reader = response.body.getReader();
+    let buffer = "";
+    while (!local.signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done)
+        break;
+      healthy = true;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf(`
 
 `);
-        while (boundary !== -1) {
-          const chunk = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          handleSseChunk(chunk);
-          boundary = buffer.indexOf(`
+      while (boundary !== -1) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        handleSseChunk(chunk);
+        boundary = buffer.indexOf(`
 
 `);
-        }
       }
-      if (!local.signal.aborted)
-        scheduleReconnect("Event stream closed", "closed");
-    } catch (error) {
-      if (local.signal.aborted)
-        return;
-      scheduleReconnect(error instanceof Error ? error.message : String(error), "network");
     }
+  } catch (error) {
+    if (local.signal.aborted)
+      return;
+    scheduleReconnect(error instanceof Error ? error.message : String(error), "closed", healthy ? 0 : retryDelay);
     return;
   }
   if (local.signal.aborted)
     return;
-  const discovered = await discoverServerOrigin(local.signal);
-  if (local.signal.aborted)
-    return;
-  if (discovered && !seen.has(discovered)) {
-    serverOrigin = discovered;
-    await startStream(seen);
-    return;
-  }
-  scheduleReconnect(lastError ?? "Event stream unreachable", lastErrorKind ?? "network");
+  scheduleReconnect("Event stream closed", "closed", healthy ? 0 : retryDelay);
 };
 var beginStream = () => {
   startStream().catch((error) => {
     scheduleReconnect(error instanceof Error ? error.message : String(error), "network");
   });
 };
-var streamPending = false;
 var ensureStream = () => {
-  if (controller !== null || streamPending)
+  if (controller !== null || retryTimer !== null)
     return;
-  streamPending = true;
-  startStream().catch((error) => {
-    scheduleReconnect(error instanceof Error ? error.message : String(error), "network");
-  }).finally(() => {
-    streamPending = false;
-  });
+  beginStream();
 };
 var stopStream = () => {
   if (retryTimer) {
@@ -2329,35 +2258,18 @@ var stopStream = () => {
 var computeLive = (now) => {
   const from = now - WINDOW_MS;
   let chars = 0;
-  let textChars = 0;
-  let reasoningChars = 0;
-  let toolChars = 0;
   let oldest = now;
   for (const sample of samples) {
     if (sample.at < from)
       continue;
     chars += sample.chars;
-    if (sample.kind === "reasoning")
-      reasoningChars += sample.chars;
-    else if (sample.kind === "tool")
-      toolChars += sample.chars;
-    else
-      textChars += sample.chars;
     if (sample.at < oldest)
       oldest = sample.at;
   }
-  if (chars === 0) {
-    return { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 };
-  }
+  if (chars === 0)
+    return 0;
   const spanMs = Math.max(1, Math.min(WINDOW_MS, now - oldest));
-  return {
-    tps: Math.min(estimateTokens(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND),
-    spanMs,
-    chars,
-    textChars,
-    reasoningChars,
-    toolChars
-  };
+  return Math.min(estimateTokens(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND);
 };
 var computeCurve = (now) => {
   const width = CURVE_WINDOW_MS / CURVE_BUCKETS;
@@ -2377,30 +2289,58 @@ var computeCurve = (now) => {
   }
   return { values, startAt: oldest, stepMs: width };
 };
-var isHttpOrigin = (value) => {
-  try {
-    const parsed = new URL(value);
-    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.username === "" && parsed.password === "";
-  } catch {
-    return false;
-  }
-};
-var applyWatch = (next) => {
-  const originChanged = watch === null || serverOrigin === null && watch.origin !== next.origin;
+var applyWatch = (next, now) => {
   watch = next;
+  leases.set(next.sessionId ?? "", now + LEASE_MS);
   if (next.sessionId) {
     watched.add(next.sessionId);
     const state = trackSession(next.sessionId);
     if (next.model)
       state.chatModel = next.model;
   }
-  if (!originChanged)
-    return false;
-  retryDelay = RETRY_BASE_MS;
-  stopStream();
-  beginStream();
-  return true;
+  ensureStream();
 };
+var LEASE_MS = 12000;
+var PUSH_EVERY_MS = 250;
+var PUSH_KEEPALIVE_MS = 2000;
+var PUSH_SESSIONS_MAX = 6;
+var leases = new Map;
+var lastPushed = new Map;
+var pushing = true;
+var VOLATILE = new Set(["curveAt", "at", "observedAt"]);
+var signature = (body) => {
+  const quiet = Array.isArray(body.curve) && body.curve.every((value) => value <= 0.05);
+  return JSON.stringify(body, (key, value) => VOLATILE.has(key) || quiet && key === "curveStart" ? undefined : value);
+};
+var pushTick = () => {
+  const now = Date.now();
+  for (const [key, until] of leases) {
+    if (until <= now) {
+      leases.delete(key);
+      lastPushed.delete(key);
+    }
+  }
+  if (leases.size === 0)
+    return;
+  noteDemand(now);
+  if (!pushing)
+    return;
+  for (const key of [...leases.keys()].slice(0, PUSH_SESSIONS_MAX)) {
+    const body = rateBody(key || null, now);
+    const sig = signature(body);
+    const previous = lastPushed.get(key);
+    if (previous && previous.sig === sig && now - previous.at < PUSH_KEEPALIVE_MS)
+      continue;
+    lastPushed.set(key, { sig, at: now });
+    serviceHost.emit("rate", { session: key || null, rate: body }).catch((error) => {
+      if (error?.code === "HOST_UNAVAILABLE")
+        pushing = false;
+      lastPushed.delete(key);
+    });
+  }
+};
+var pushTimer = setInterval(pushTick, PUSH_EVERY_MS);
+pushTimer.unref?.();
 var json = (res, status, body) => {
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -2451,16 +2391,16 @@ var SESSION_EVENT_TYPES = new Set([
   "session-deleted"
 ]);
 var handleSessionEvent = (body) => {
-  const request = readRecord2(body);
+  const request = readRecord(body);
   if (!request || request.v !== 1)
     return false;
-  const event = readRecord2(request.event);
+  const event = readRecord(request.event);
   if (!event)
     return false;
   const type = readString(event.type);
   if (!SESSION_EVENT_TYPES.has(type))
     return false;
-  const session = readRecord2(event.session);
+  const session = readRecord(event.session);
   const sessionId = session ? readString(session.id) : "";
   const parentId = session ? readString(session.parentId) : "";
   if (!sessionId)
@@ -2491,6 +2431,39 @@ var chatModelReading = () => {
     return null;
   return { id, name: modelDisplayName(id) };
 };
+var rateBody = (requested, now) => {
+  if (requested !== null)
+    enterSession(requested);
+  else
+    loadState(blankSession);
+  try {
+    const curve = computeCurve(now);
+    return {
+      connection,
+      error: lastError,
+      errorKind: lastErrorKind,
+      sessionId: requested !== null && watched.has(requested) ? requested : null,
+      busy,
+      waiting: waitingKind(),
+      toolActive: toolActive(),
+      live: { tps: computeLive(now) },
+      running: turnStartedAt !== null ? computeRunning() : null,
+      curve: curve.values,
+      curveStart: curve.startAt,
+      curveStep: curve.stepMs,
+      curveAt: now,
+      turn: {
+        active: turnStartedAt !== null,
+        ttftMs: liveTtftMs()
+      },
+      lastTurn,
+      cache: cacheWire(cache),
+      gauge: { ...gaugeWire(sessionIdsFor(requested), now), chatModel: chatModelReading() }
+    };
+  } finally {
+    leaveSession();
+  }
+};
 var server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     json(res, 401, { error: "unauthorized" });
@@ -2504,22 +2477,15 @@ var server = http.createServer((req, res) => {
   if (url.pathname === "/watch" && req.method === "POST") {
     readJsonBody(req).then((raw) => {
       const body = raw && typeof raw === "object" ? raw : {};
-      const rawOrigin = body.origin;
-      if (rawOrigin !== undefined && rawOrigin !== null && typeof rawOrigin !== "string") {
-        json(res, 400, { error: "origin must be an http(s) origin from the OpenChamber server" });
+      if (typeof body.sessionId === "string" && body.sessionId.trim().length > SESSION_ID_MAX) {
+        json(res, 400, { error: "session id too long" });
         return;
       }
-      const hinted = (rawOrigin ?? "").trim();
-      if (hinted !== "" && !isHttpOrigin(hinted)) {
-        json(res, 400, { error: "origin must be an http(s) origin from the OpenChamber server" });
-        return;
-      }
-      const origin = hinted === "" ? null : hinted;
-      const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId : null;
-      const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : null;
-      const fresh = sessionId !== null && !watched.has(sessionId);
-      const changed = applyWatch({ origin, sessionId, model }) || fresh;
-      json(res, 200, { ok: true, changed, connection, sessionId });
+      const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId.trim() : null;
+      const model = typeof body.model === "string" && body.model.trim() && body.model.trim().length <= MODEL_NAME_MAX ? body.model.trim() : null;
+      const changed = sessionId !== null && !watched.has(sessionId);
+      applyWatch({ sessionId, model }, Date.now());
+      json(res, 200, { ok: true, changed, connection, sessionId, push: pushing });
     }).catch((error) => {
       json(res, 400, { error: error instanceof Error ? error.message : "Invalid request" });
     });
@@ -2537,63 +2503,11 @@ var server = http.createServer((req, res) => {
     });
     return;
   }
-  if (url.pathname === "/history") {
-    const requested = readString(url.searchParams.get("sessionId")) || watch?.sessionId || null;
-    if (requested !== null)
-      enterSession(requested);
-    else
-      loadState(blankSession);
-    let body;
-    try {
-      body = {
-        sessionId: requested,
-        turns,
-        cache: cacheWire(cache)
-      };
-    } finally {
-      leaveSession();
-    }
-    json(res, 200, body);
-    return;
-  }
   if (url.pathname === "/rate") {
     const now = Date.now();
     noteDemand(now);
     const requested = readString(url.searchParams.get("sessionId")) || watch?.sessionId || null;
-    if (requested !== null)
-      enterSession(requested);
-    else
-      loadState(blankSession);
-    let body;
-    try {
-      const curve = computeCurve(now);
-      body = {
-        connection,
-        error: lastError,
-        errorKind: lastErrorKind,
-        sessionId: requested !== null && watched.has(requested) ? requested : null,
-        busy,
-        waiting: waitingKind(),
-        toolActive: toolActive(),
-        live: computeLive(now),
-        running: turnStartedAt !== null ? computeRunning() : null,
-        curve: curve.values,
-        curveStart: curve.startAt,
-        curveStep: curve.stepMs,
-        curveAt: now,
-        turn: {
-          active: turnStartedAt !== null,
-          ttftMs: liveTtftMs()
-        },
-        lastTurn,
-        cache: cacheWire(cache),
-        gauge: { ...gaugeWire(sessionIdsFor(requested), now), chatModel: chatModelReading() },
-        eventsSeen
-      };
-    } finally {
-      leaveSession();
-    }
-    json(res, 200, body);
+    json(res, 200, rateBody(requested, now));
     return;
   }
   json(res, 404, { error: "not-found" });

@@ -1,10 +1,10 @@
 {
   "name": "openchamber-gauge",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "OpenChamber Work Status section: live tokens/s, prompt progress, render progress and Mac memory in one place.",
+  "description": "OpenChamber Work Status section: how fast your chat is being written, what the engine is doing, and what the Mac is using.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mikebuckets171/openchamber-gauge.git"
@@ -18,10 +18,11 @@
     "extension",
     "tokens-per-second",
     "tps",
-    "throughput",
     "latency",
     "comfyui",
-    "status-panel"
+    "status-panel",
+    "llama.cpp",
+    "prompt-progress"
   ],
   "openchamber": {
     "apiVersion": 1,
@@ -46,11 +47,13 @@
         "permissions": {
           "exec": [
             "/usr/bin/vm_stat",
-            "/usr/sbin/sysctl",
-            "/usr/sbin/lsof"
+            "/usr/sbin/sysctl"
           ],
           "sockets": []
-        }
+        },
+        "provides": [
+          "opencode"
+        ]
       },
       "sessionEvents": {
         "events": [
