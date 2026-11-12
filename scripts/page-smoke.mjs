@@ -166,7 +166,7 @@ const RATE = {
 };
 
 /** Run one built bundle in a fake frame and collect what it posts to its host. */
-const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false, model: 'page-model' }, rate = RATE, locale = 'zh', serviceDenied = false, slotWidth = 0 } = {}) => {
+const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false, model: 'page-model' }, rate = RATE, locale = 'zh', serviceDenied = false, slotWidth = 0, pushAnswer = true } = {}) => {
   const source = fs.readFileSync(path.join(ROOT, bundle), 'utf8');
   const posted = [];
   const listeners = [];
@@ -182,13 +182,24 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
     removeEventListener: () => {},
   };
   const location = new URL(href);
+  const timers = [];
+  const answered = new Set();
   const win = {
     location,
     document,
-    parent: { postMessage: (message) => posted.push(message) },
+    parent: {
+      postMessage: (message) => {
+        posted.push(message);
+        // A host answers a request when it arrives, not only in one pass after
+        // the handshake: a page that asks on its own tick has to be answered too.
+        // Answered on the next turn of the event loop: the request has to finish
+        // being posted before its answer can be delivered.
+        if (message && message.type === 'service-request') setImmediate(() => answerRequest(message));
+      },
+    },
     addEventListener: (type, fn) => { listeners.push([type, fn]); },
     removeEventListener: () => {},
-    setTimeout: () => 0,
+    setTimeout: (fn) => { timers.push(fn); return timers.length; },
     clearTimeout: () => {},
     setInterval: () => 0,
     clearInterval: () => {},
@@ -237,6 +248,31 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
   const reply = (request, payload) => {
     dispatch({ channel, v: version, type: 'result', id: request.id, ok: true, payload });
   };
+  const answerRequest = (request) => {
+    if (!channel || answered.has(request.id)) return;
+    answered.add(request.id);
+    // A service the user has not allowed: the host answers the way its proxy
+    // does, with a code rather than a body.
+    if (serviceDenied) {
+      dispatch({
+        channel,
+        v: version,
+        type: 'result',
+        id: request.id,
+        ok: false,
+        code: 'NO_SERVICE',
+        error: 'The local service is not allowed for this extension',
+      });
+      return;
+    }
+    if (request.payload?.path === '/watch') {
+      // `push` is what the service says about this host: whether it takes the
+      // readings the service posts.
+      reply(request, { status: 200, body: JSON.stringify({ ok: true, connection: 'live', sessionId: SESSION, push: pushAnswer }) });
+    } else if (request.payload?.path?.startsWith('/rate')) {
+      reply(request, { status: 200, body: JSON.stringify(rate) });
+    }
+  };
 
   vm.runInContext(source, sandbox, { filename: bundle });
   const hello = posted.find((message) => message && message.type === 'hello');
@@ -267,29 +303,10 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
     if (state) state._slotWidth = slotWidth;
   }
 
-  // Answer the page the way the host proxy would. `/watch` is accepted without
-  // an origin: that is what a relay surface has to send.
-  const requests = posted.filter((message) => message && message.type === 'service-request');
-  for (const request of requests) {
-    // A service the user has not allowed: the host answers the way its proxy
-    // does, with a code rather than a body.
-    if (serviceDenied) {
-      dispatch({
-        channel,
-        v: version,
-        type: 'result',
-        id: request.id,
-        ok: false,
-        code: 'NO_SERVICE',
-        error: 'The local service is not allowed for this extension',
-      });
-      continue;
-    }
-    if (request.payload?.path === '/watch') {
-      reply(request, { status: 200, body: JSON.stringify({ ok: true, changed: true, connection: 'live', sessionId: SESSION, push: true }) });
-    } else if (request.payload?.path?.startsWith('/rate')) {
-      reply(request, { status: 200, body: JSON.stringify(rate) });
-    }
+  // `/watch` is accepted without an origin: that is what a relay surface has to
+  // send. Anything posted before this point is answered here.
+  for (const request of posted.filter((message) => message && message.type === 'service-request')) {
+    answerRequest(request);
   }
 
   return {
@@ -298,12 +315,26 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
     root: () => root.textContent,
     /** What the host does when the service posts a reading to the open frames. */
     push: (topic, data) => dispatch({ channel, v: version, type: 'service-event', payload: { topic, data } }),
+    /** Take the page through the ticks its own timer loop would take. */
+    tick: async (rounds = 1) => {
+      for (let round = 0; round < rounds; round += 1) {
+        const batch = timers.splice(0, timers.length);
+        if (batch.length === 0) return;
+        for (const fn of batch) fn();
+        await settle();
+      }
+    },
   };
 };
 
 const settle = async () => {
   for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setImmediate(resolve));
 };
+
+/** How many readings this page has asked the service for. */
+const polls = (guest) => guest.posted.filter(
+  (message) => message.type === 'service-request' && String(message.payload?.path ?? '').startsWith('/rate'),
+).length;
 
 const findByClass = (node, className) => {
   if (String(node.className ?? '').split(/\s+/).includes(className)) return node;
@@ -989,9 +1020,6 @@ for (const surface of SURFACES) {
   // line, the dot — not the headline: that number glides from one reading to
   // the next through the frame loop, and this harness runs no frames.
   {
-    const polls = (guest) => guest.posted.filter(
-      (message) => message.type === 'service-request' && String(message.payload?.path ?? '').startsWith('/rate'),
-    ).length;
     const pushed = runGuest(surface.bundle, surface.url, { locale: 'en' });
     await settle();
     const asked = polls(pushed);
@@ -1032,6 +1060,25 @@ for (const surface of SURFACES) {
       pushed.root().includes('$0.99') && !pushed.root().includes('Cannot reach'),
       JSON.stringify(pushed.root()),
     );
+  }
+
+  // The service tells a page whether this host takes what it posts. Told no, the
+  // page asks on every tick; told yes, a reading it has heard is not asked for
+  // again while it is fresh.
+  {
+    const deaf = runGuest(surface.bundle, surface.url, { locale: 'en', pushAnswer: false });
+    await settle();
+    const askedBefore = polls(deaf);
+    await deaf.tick(4);
+    check(`${surface.name}: a host that takes no posts is asked on every tick`, polls(deaf) >= askedBefore + 3, `polls=${polls(deaf)} from ${askedBefore}`);
+
+    const taken = runGuest(surface.bundle, surface.url, { locale: 'en' });
+    await settle();
+    taken.push('rate', { session: SESSION, rate: RATE });
+    await settle();
+    const takenBefore = polls(taken);
+    await taken.tick(4);
+    check(`${surface.name}: a host that takes them is not asked again`, polls(taken) === takenBefore, `polls=${polls(taken)} from ${takenBefore}`);
   }
 
   // A machine with no memory reading (any non-Mac) does not get a Memory line.

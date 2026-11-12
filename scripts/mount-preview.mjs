@@ -143,7 +143,7 @@ window.addEventListener('message', (event) => {
     send({ type: 'result', id: data.id, ok: false, code: fixture.rejected.code, error: fixture.rejected.error });
     return;
   }
-  const body = data.payload?.path === '/watch' ? { ok: true, changed: true, connection: 'live', sessionId: 'ses_mount', push: true } : fixture;
+  const body = data.payload?.path === '/watch' ? { ok: true, connection: 'live', sessionId: 'ses_mount', push: true } : fixture;
   send({ type: 'result', id: data.id, ok: true, payload: { status: 200, body: JSON.stringify(body) } });
 });
 `;

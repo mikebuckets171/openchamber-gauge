@@ -811,6 +811,7 @@ var calibrate = (model, chars, generated) => {
 };
 var MAX_STREAM_GAP_MS = 1000;
 var SESSIONS_CAP = 20;
+var STATE_FILE_CAP = SESSIONS_CAP * 2;
 var PERSIST_DEBOUNCE_MS = 1500;
 var PERSIST_VERSION = 1;
 var cacheRate = (hit, miss) => hit + miss > 0 ? hit / (hit + miss) * 100 : null;
@@ -1038,7 +1039,6 @@ var connection = "idle";
 var lastError = null;
 var lastErrorKind = null;
 var streamLostAt = null;
-var lastEventAt = 0;
 var busy = false;
 var controller = null;
 var retryTimer = null;
@@ -1280,6 +1280,7 @@ var readModels = (file) => {
     return {};
   }
 };
+var legacyConsumed = false;
 var readPersisted = () => {
   const legacy = legacyStatePath();
   for (const file of [...statePaths().slice(0, 1), ...legacy ? [legacy] : [], ...statePaths().slice(1)]) {
@@ -1296,6 +1297,8 @@ var readPersisted = () => {
       state.cache = restoreCache(memory.cache);
       sessionStates.set(id, state);
     }
+    if (legacy && file === legacy)
+      legacyConsumed = true;
     return;
   }
 };
@@ -1309,7 +1312,7 @@ var writePersisted = () => {
     try {
       const foreign = Object.entries(readSessions(file)).filter(([id]) => own[id] === undefined);
       const sessions = { ...own };
-      for (const [id, memory] of foreign.slice(0, Math.max(0, SESSIONS_CAP - Object.keys(own).length))) {
+      for (const [id, memory] of foreign.slice(0, Math.max(0, STATE_FILE_CAP - Object.keys(own).length))) {
         sessions[id] = memory;
       }
       const payload = JSON.stringify({
@@ -1323,7 +1326,7 @@ var writePersisted = () => {
       fs2.writeFileSync(tmp, payload, "utf8");
       fs2.renameSync(tmp, file);
       const legacy = legacyStatePath();
-      if (legacy && legacy !== file)
+      if (legacy && legacy !== file && legacyConsumed)
         fs2.rmSync(legacy, { force: true });
       return;
     } catch {}
@@ -1626,7 +1629,6 @@ var recordChars = (messageID, partID, kind, chars, now) => {
     samples.splice(0, samples.length - SAMPLE_LIMIT);
   partChars.set(partID, (partChars.get(partID) ?? 0) + chars);
   messageChars.set(messageID, (messageChars.get(messageID) ?? 0) + chars);
-  lastEventAt = now;
   if (turnStartedAt === null) {
     turnStartedAt = now;
     if (turnExecAt !== null && now - turnExecAt <= MAX_STREAM_GAP_MS) {
@@ -1666,7 +1668,6 @@ var markActive = (now) => {
   if (turnExecAt === null)
     turnExecAt = now;
   busy = true;
-  lastEventAt = now;
 };
 var readToolCallID = (payload) => readString(payload.callID) || readString(payload.id) || readString(payload.toolCallID);
 var toolPartID = (messageID, callID) => `${messageID}:tool:${callID || "input"}`;
@@ -1880,7 +1881,6 @@ var dispatchEvent = (event, now) => {
           target.toolSince = now;
       }
     }
-    lastEventAt = now;
     return;
   }
   if (type === "session.tool.success" || type === "session.tool.failed") {
@@ -1901,7 +1901,6 @@ var dispatchEvent = (event, now) => {
       }
     }
     noteTools(now);
-    lastEventAt = now;
     return;
   }
   if (type === "session.shell.started") {
@@ -1920,7 +1919,6 @@ var dispatchEvent = (event, now) => {
       if (target.toolSince === null)
         target.toolSince = now;
     }
-    lastEventAt = now;
     return;
   }
   if (type === "session.shell.ended") {
@@ -1947,7 +1945,6 @@ var dispatchEvent = (event, now) => {
           closeKey(key);
       });
     noteTools(now);
-    lastEventAt = now;
     return;
   }
   if (type === "session.step.started") {
@@ -1969,7 +1966,6 @@ var dispatchEvent = (event, now) => {
     const started = readNumber(payload.started);
     const startAt = started > 0 ? now - Math.max(0, serverCreated - started) : now;
     stepFor(messageID, startAt).startObserved = true;
-    lastEventAt = now;
     return;
   }
   if (type === "session.step.ended" || type === "session.step.failed") {
@@ -1978,13 +1974,11 @@ var dispatchEvent = (event, now) => {
     markActive(now);
     const tokens = readRecord(payload.tokens);
     if (!tokens) {
-      lastEventAt = now;
       return;
     }
     const messageID = readString(payload.assistantMessageID);
     recordCacheStep(readString(payload.sessionID), messageID || `step@${now}`, stepUsageFrom(tokens, readNumber(payload.cost)), now);
     settleStep(messageID, readNumber(tokens.output), readNumber(tokens.reasoning), now);
-    lastEventAt = now;
     return;
   }
   if (type === "session.execution.started") {
@@ -2000,21 +1994,18 @@ var dispatchEvent = (event, now) => {
     if (turnExecAt === null)
       turnExecAt = now;
     busy = true;
-    lastEventAt = now;
     return;
   }
   if (type === "session.execution.succeeded" || type === "session.execution.failed") {
     if (!isWatchedSession(payload.sessionID))
       return;
     busy = false;
-    lastEventAt = now;
     finalizeTurn(now);
     return;
   }
   if (type === "session.execution.interrupted") {
     if (!isWatchedSession(payload.sessionID))
       return;
-    lastEventAt = now;
     if (readString(payload.reason) === "shutdown")
       return;
     busy = false;
@@ -2027,7 +2018,6 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.id);
     if (requestId)
       pendingPermissions.add(requestId);
-    lastEventAt = now;
     return;
   }
   if (type === "permission.replied" || type === "permission.v2.replied") {
@@ -2036,7 +2026,6 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.requestID);
     if (requestId)
       pendingPermissions.delete(requestId);
-    lastEventAt = now;
     return;
   }
   if (type === "form.created") {
@@ -2046,7 +2035,6 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(form.id);
     if (requestId)
       pendingQuestions.add(requestId);
-    lastEventAt = now;
     return;
   }
   if (type === "form.replied" || type === "form.cancelled") {
@@ -2055,7 +2043,6 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.id);
     if (requestId)
       pendingQuestions.delete(requestId);
-    lastEventAt = now;
     return;
   }
   if (type === "question.asked" || type === "question.v2.asked") {
@@ -2064,7 +2051,6 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.id);
     if (requestId)
       pendingQuestions.add(requestId);
-    lastEventAt = now;
     return;
   }
   if (type === "question.replied" || type === "question.rejected" || type === "question.v2.replied" || type === "question.v2.rejected") {
@@ -2073,7 +2059,6 @@ var dispatchEvent = (event, now) => {
     const requestId = readString(payload.requestID);
     if (requestId)
       pendingQuestions.delete(requestId);
-    lastEventAt = now;
     return;
   }
   if (type === "session.status") {
@@ -2086,14 +2071,12 @@ var dispatchEvent = (event, now) => {
     if (nextBusy && turnExecAt === null)
       turnExecAt = now;
     busy = nextBusy;
-    lastEventAt = now;
     return;
   }
   if (type === "session.idle") {
     if (!isWatchedSession(payload.sessionID))
       return;
     busy = false;
-    lastEventAt = now;
     finalizeTurn(now);
   }
 };
@@ -2134,6 +2117,74 @@ var scheduleReconnect = (message, kind, delay = retryDelay) => {
     beginStream();
   }, delay);
   retryTimer.unref?.();
+};
+var fetchActiveSessions = async () => {
+  if (!OPENCODE_URL)
+    return null;
+  try {
+    const response = await fetch(`${OPENCODE_URL}/api/session/active`, {
+      headers: opencodeHeaders("application/json"),
+      signal: AbortSignal.timeout(3000),
+      redirect: "manual"
+    });
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!response.ok || !contentType.includes("json")) {
+      await response.body?.cancel().catch(() => {
+        return;
+      });
+      return null;
+    }
+    const body = readRecord(await response.json());
+    if (!body)
+      return null;
+    const statuses = readRecord(body.data) ?? body;
+    const running = new Set;
+    for (const [id, status] of Object.entries(statuses)) {
+      if (status === null || status === undefined)
+        continue;
+      const record = readRecord(status);
+      const kind = record ? readString(record.type) : "";
+      if (kind && kind !== "running")
+        continue;
+      running.add(id);
+    }
+    return running;
+  } catch {
+    return null;
+  }
+};
+var settleAfterCut = async (lostFor, lostAt) => {
+  if (inSession)
+    return;
+  const inFlight = [...sessionStates.values()].filter((state) => state.busy || state.turnStartedAt !== null || state.activeToolIds.size > 0 || state.pendingPermissions.size > 0 || state.pendingQuestions.size > 0);
+  if (inFlight.length === 0)
+    return;
+  const running = await fetchActiveSessions();
+  if (running === null) {
+    if (lostFor > RESUME_GAP_MS)
+      resetInFlight();
+    return;
+  }
+  for (const state of inFlight) {
+    if (running.has(state.sessionId))
+      continue;
+    if (state.pendingPermissions.size > 0 || state.pendingQuestions.size > 0)
+      continue;
+    if (state.turnExecAt !== null && state.turnExecAt > lostAt)
+      continue;
+    enterSession(state.sessionId);
+    if (state.turnStartedAt !== null)
+      finalizeTurn(lostAt);
+    clearTurn();
+    busy = false;
+    activeToolIds.clear();
+    pendingToolStep.clear();
+    pendingPermissions.clear();
+    pendingQuestions.clear();
+    waitStartAt = null;
+    toolStartAt = null;
+    leaveSession();
+  }
 };
 var eventUrl = () => {
   const url = new URL(`${OPENCODE_URL}/api/event`);
@@ -2193,16 +2244,18 @@ var startStream = async () => {
     scheduleReconnect(`Event stream answered HTTP ${response.status}`, "http");
     return;
   }
-  const lostFor = streamLostAt === null ? 0 : Date.now() - streamLostAt;
-  if (lostFor > RESUME_GAP_MS) {
-    resetInFlight();
-  }
+  const lostAt = streamLostAt ?? Date.now();
+  const lostFor = streamLostAt === null ? 0 : Date.now() - lostAt;
   streamLostAt = null;
+  if (lostFor > 0) {
+    settleAfterCut(lostFor, lostAt).catch(() => {
+      return;
+    });
+  }
   connection = "live";
   lastError = null;
   lastErrorKind = null;
   retryDelay = RETRY_BASE_MS;
-  lastEventAt = Date.now();
   let healthy = false;
   try {
     const decoder = new TextDecoder;
@@ -2325,12 +2378,17 @@ var pushTick = () => {
   noteDemand(now);
   if (!pushing)
     return;
-  for (const key of [...leases.keys()].slice(0, PUSH_SESSIONS_MAX)) {
+  const due = [...leases.keys()].sort((a, b) => (lastPushed.get(a)?.at ?? 0) - (lastPushed.get(b)?.at ?? 0) || (a < b ? -1 : 1));
+  let sent = 0;
+  for (const key of due) {
+    if (sent >= PUSH_SESSIONS_MAX)
+      break;
     const body = rateBody(key || null, now);
     const sig = signature(body);
     const previous = lastPushed.get(key);
     if (previous && previous.sig === sig && now - previous.at < PUSH_KEEPALIVE_MS)
       continue;
+    sent += 1;
     lastPushed.set(key, { sig, at: now });
     serviceHost.emit("rate", { session: key || null, rate: body }).catch((error) => {
       if (error?.code === "HOST_UNAVAILABLE")
@@ -2483,9 +2541,8 @@ var server = http.createServer((req, res) => {
       }
       const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId.trim() : null;
       const model = typeof body.model === "string" && body.model.trim() && body.model.trim().length <= MODEL_NAME_MAX ? body.model.trim() : null;
-      const changed = sessionId !== null && !watched.has(sessionId);
       applyWatch({ sessionId, model }, Date.now());
-      json(res, 200, { ok: true, changed, connection, sessionId, push: pushing });
+      json(res, 200, { ok: true, connection, sessionId, push: pushing });
     }).catch((error) => {
       json(res, 400, { error: error instanceof Error ? error.message : "Invalid request" });
     });

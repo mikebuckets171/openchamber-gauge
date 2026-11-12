@@ -10,22 +10,37 @@
   address the host did not name. Approving Gauge in **Settings → Extensions** is
   what lets it read your sessions.
 - The readings are pushed. The service posts each watched chat's reading to the
-  open pages; a page that has heard none for a while renews its watch and asks
-  for one itself. The same numbers either way, and a host that will not take the
-  posts is not a broken Gauge.
+  open pages — at most six chats per tick, the chats that have waited longest
+  first, so a seventh section open on a seventh chat is served rather than left
+  to polling — and it says in the watch whether this host takes what it posts. A
+  page that is told no asks on every tick; a page that has heard a reading
+  recently does not ask at all. The same numbers either way, and a host that
+  will not take the posts is not a broken Gauge.
 - The numbers Gauge keeps live in the data folder OpenChamber creates for this
   extension, which survives restarts and updates and is deleted with the
-  extension. It used to write beside the service, inside the installed package: a
-  1.0 service finds such a file, reads it once and removes it, so an existing
-  install keeps its last turns, its cache totals and its learned calibration.
+  extension, with room in the file for two servers on one workspace to each keep
+  their own share of it instead of taking turns overwriting it. It used to write
+  beside the service, inside the installed package: a 1.0 service finds such a
+  file, reads it once and removes it, so an existing install keeps its last
+  turns, its cache totals and its learned calibration — and a copy it did not
+  read is left where it is rather than deleted unread.
 - The prompt reading works with any llama.cpp engine, not only Splash. A provider
   named for `llama.cpp`, `llama-server`, `llama-swap` or Splash is asked for
   `return_progress` at once; any other provider on a loopback `/v1` is asked only
   after its own `GET /props` answers with llama.cpp's server properties. The
   probe runs behind the request and never waits for one, it uses no credential
   and never reads one, and LM Studio and Ollama are never asked.
+- A stream that ends while a reply is in flight is settled by asking OpenCode
+  which sessions it is really running (`GET /api/session/active`, one read per
+  reconnect) instead of guessing from how long the gap was: a turn OpenCode still
+  has keeps its measurement, and a turn it no longer has is recorded from what
+  was measured before the cut, stamped at the moment the stream went down. So a
+  three-second cut that swallows a reply's closing events no longer leaves the
+  section saying "writing" on a chat that finished, and no longer folds the
+  outage into the next reply's time.
 - The Memory line is drawn only where a memory reading exists: off a Mac the line
-  is not there at all, rather than a row of dashes.
+  is not there at all, rather than a row of dashes — including on a page that has
+  no chat of its own yet.
 - A read that was not allowed says what is missing — `Allow Gauge to read your
   sessions in Settings → Extensions` — in its own words, apart from a service
   that cannot be reached.

@@ -287,6 +287,13 @@ type SessionMemory = {
 };
 /** Sessions remembered; oldest evicted past this. */
 const SESSIONS_CAP = 20;
+/**
+ * What one state file may carry. Two OpenChamber servers on one workspace share
+ * this file, and each keeps `SESSIONS_CAP` sessions of its own: twice that is
+ * what lets both of them keep their history instead of taking turns overwriting
+ * each other.
+ */
+const STATE_FILE_CAP = SESSIONS_CAP * 2;
 /** How long a change waits before it is written, so a burst of events coalesces. */
 const PERSIST_DEBOUNCE_MS = 1_500;
 /** On-disk schema version; a mismatch discards the file instead of guessing. */
@@ -588,7 +595,6 @@ let lastError: string | null = null;
 let lastErrorKind: ErrorKind | null = null;
 /** When the stream last went down; a short gap resumes the turns in flight. */
 let streamLostAt: number | null = null;
-let lastEventAt = 0;
 let busy = false;
 let controller: AbortController | null = null;
 let retryTimer: NodeJS.Timeout | null = null;
@@ -1007,6 +1013,8 @@ const readModels = (file: string): Record<string, number> => {
 };
 
 /** Restore durable numbers so a restarted service answers immediately. */
+let legacyConsumed = false;
+
 const readPersisted = (): void => {
   const legacy = legacyStatePath();
   for (const file of [...statePaths().slice(0, 1), ...(legacy ? [legacy] : []), ...statePaths().slice(1)]) {
@@ -1022,6 +1030,9 @@ const readPersisted = (): void => {
       state.cache = restoreCache(memory.cache);
       sessionStates.set(id, state);
     }
+    // Only a file this service actually read is safe to remove; one it walked
+    // past keeps its numbers until something has taken them over.
+    if (legacy && file === legacy) legacyConsumed = true;
     return;
   }
 };
@@ -1036,10 +1047,11 @@ const writePersisted = (): void => {
     try {
       // Two OpenChamber servers can share one workspace, so two services share
       // this directory. Overlay our sessions on whatever is already there
-      // instead of clobbering the other instance's history.
+      // instead of clobbering the other instance's history, with room in the
+      // file for both instances' full share of it.
       const foreign = Object.entries(readSessions(file)).filter(([id]) => own[id] === undefined);
       const sessions: Record<string, unknown> = { ...own };
-      for (const [id, memory] of foreign.slice(0, Math.max(0, SESSIONS_CAP - Object.keys(own).length))) {
+      for (const [id, memory] of foreign.slice(0, Math.max(0, STATE_FILE_CAP - Object.keys(own).length))) {
         sessions[id] = memory;
       }
       const payload = JSON.stringify({
@@ -1055,7 +1067,7 @@ const writePersisted = (): void => {
       // The numbers are safe in their new home: the old copy inside the
       // package goes, once.
       const legacy = legacyStatePath();
-      if (legacy && legacy !== file) fs.rmSync(legacy, { force: true });
+      if (legacy && legacy !== file && legacyConsumed) fs.rmSync(legacy, { force: true });
       return;
     } catch {
       // Read-only extension folder: try the next path, and if none works the
@@ -1473,7 +1485,6 @@ const recordChars = (messageID: string, partID: string, kind: Sample['kind'], ch
   if (samples.length > SAMPLE_LIMIT) samples.splice(0, samples.length - SAMPLE_LIMIT);
   partChars.set(partID, (partChars.get(partID) ?? 0) + chars);
   messageChars.set(messageID, (messageChars.get(messageID) ?? 0) + chars);
-  lastEventAt = now;
 
   if (turnStartedAt === null) {
     turnStartedAt = now;
@@ -1540,7 +1551,6 @@ const normType = (type: string): string => type.replace('.next.', '.');
 const markActive = (now: number): void => {
   if (turnExecAt === null) turnExecAt = now;
   busy = true;
-  lastEventAt = now;
 };
 
 /** Stable tool-call identity across OpenChamber/OpenCode payload shapes. */
@@ -1798,7 +1808,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
         if (target.toolSince === null) target.toolSince = now;
       }
     }
-    lastEventAt = now;
     return;
   }
 
@@ -1817,7 +1826,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
       }
     }
     noteTools(now);
-    lastEventAt = now;
     return;
   }
 
@@ -1834,7 +1842,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
       target.toolOpen += 1;
       if (target.toolSince === null) target.toolSince = now;
     }
-    lastEventAt = now;
     return;
   }
 
@@ -1855,7 +1862,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (id) closeKey(`shell:${id}`);
     else activeToolIds.forEach((key) => { if (key.startsWith('shell:')) closeKey(key); });
     noteTools(now);
-    lastEventAt = now;
     return;
   }
 
@@ -1891,7 +1897,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     const started = readNumber(payload.started);
     const startAt = started > 0 ? now - Math.max(0, serverCreated - started) : now;
     stepFor(messageID, startAt).startObserved = true;
-    lastEventAt = now;
     return;
   }
 
@@ -1900,7 +1905,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     markActive(now);
     const tokens = readRecord(payload.tokens);
     if (!tokens) {
-      lastEventAt = now;
       return;
     }
     // The cache accounting runs before `settleStep` because that one skips
@@ -1919,7 +1923,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
       readNumber(tokens.reasoning),
       now,
     );
-    lastEventAt = now;
     return;
   }
 
@@ -1944,21 +1947,18 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     // Mark where the turn began so time to first token can be judged.
     if (turnExecAt === null) turnExecAt = now;
     busy = true;
-    lastEventAt = now;
     return;
   }
 
   if (type === 'session.execution.succeeded' || type === 'session.execution.failed') {
     if (!isWatchedSession(payload.sessionID)) return;
     busy = false;
-    lastEventAt = now;
     finalizeTurn(now);
     return;
   }
 
   if (type === 'session.execution.interrupted') {
     if (!isWatchedSession(payload.sessionID)) return;
-    lastEventAt = now;
     // A shutdown is not the end of the turn: OpenCode keeps the execution
     // claim and resumes the same turn after restart, so the session stays busy
     // until the real terminal outcome arrives.
@@ -1974,7 +1974,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.id);
     if (requestId) pendingPermissions.add(requestId);
-    lastEventAt = now;
     return;
   }
 
@@ -1982,7 +1981,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.requestID);
     if (requestId) pendingPermissions.delete(requestId);
-    lastEventAt = now;
     return;
   }
 
@@ -1992,7 +1990,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!form || !isWatchedSession(form.sessionID)) return;
     const requestId = readString(form.id);
     if (requestId) pendingQuestions.add(requestId);
-    lastEventAt = now;
     return;
   }
 
@@ -2000,7 +1997,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.id);
     if (requestId) pendingQuestions.delete(requestId);
-    lastEventAt = now;
     return;
   }
 
@@ -2008,7 +2004,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.id);
     if (requestId) pendingQuestions.add(requestId);
-    lastEventAt = now;
     return;
   }
 
@@ -2016,7 +2011,6 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (!isWatchedSession(payload.sessionID)) return;
     const requestId = readString(payload.requestID);
     if (requestId) pendingQuestions.delete(requestId);
-    lastEventAt = now;
     return;
   }
 
@@ -2030,14 +2024,12 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     if (busy && !nextBusy) finalizeTurn(now);
     if (nextBusy && turnExecAt === null) turnExecAt = now;
     busy = nextBusy;
-    lastEventAt = now;
     return;
   }
 
   if (type === 'session.idle') {
     if (!isWatchedSession(payload.sessionID)) return;
     busy = false;
-    lastEventAt = now;
     finalizeTurn(now);
   }
 };
@@ -2075,6 +2067,90 @@ const scheduleReconnect = (message: string, kind: ErrorKind, delay = retryDelay)
     beginStream();
   }, delay);
   retryTimer.unref?.();
+};
+
+/**
+ * Which sessions OpenCode says are running right now, or null when it could not
+ * be asked. `/api/session/active` is global and answers `{ data: { [id]: status } }`:
+ * an id that is absent from it is idle.
+ */
+const fetchActiveSessions = async (): Promise<Set<string> | null> => {
+  if (!OPENCODE_URL) return null;
+  try {
+    const response = await fetch(`${OPENCODE_URL}/api/session/active`, {
+      headers: opencodeHeaders('application/json'),
+      signal: AbortSignal.timeout(3_000),
+      redirect: 'manual',
+    });
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!response.ok || !contentType.includes('json')) {
+      await response.body?.cancel().catch(() => undefined);
+      return null;
+    }
+    const body = readRecord(await response.json());
+    if (!body) return null;
+    const statuses = readRecord(body.data) ?? body;
+    const running = new Set<string>();
+    for (const [id, status] of Object.entries(statuses)) {
+      if (status === null || status === undefined) continue;
+      const record = readRecord(status);
+      const kind = record ? readString(record.type) : '';
+      if (kind && kind !== 'running') continue;
+      running.add(id);
+    }
+    return running;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Settle what a cut left in flight, now that the stream is back.
+ *
+ * A turn's closing events were published while the stream was down, so they are
+ * gone for good, and a session left `busy` reads as "writing" forever. OpenCode
+ * answers which sessions are running right now, so the question is asked rather
+ * than guessed from how long the gap was: a turn it still holds keeps its
+ * measurement, and one it no longer holds is recorded from what was measured
+ * before the cut — stamped at the moment the stream went down, so an idle stretch
+ * spent waiting for the stream never becomes part of the reply's time — and then
+ * cleared. A chat waiting on a person (a permission, a question) is still its own
+ * turn whatever the read says, and a turn that began after the cut is a live turn
+ * with its own ending coming.
+ */
+const settleAfterCut = async (lostFor: number, lostAt: number): Promise<void> => {
+  if (inSession) return;
+  const inFlight = [...sessionStates.values()].filter((state) => (
+    state.busy
+    || state.turnStartedAt !== null
+    || state.activeToolIds.size > 0
+    || state.pendingPermissions.size > 0
+    || state.pendingQuestions.size > 0
+  ));
+  if (inFlight.length === 0) return;
+  const running = await fetchActiveSessions();
+  if (running === null) {
+    // Could not ask: a gap long enough for the closing events to have gone by
+    // unseen is treated as a loss, as it always was.
+    if (lostFor > RESUME_GAP_MS) resetInFlight();
+    return;
+  }
+  for (const state of inFlight) {
+    if (running.has(state.sessionId)) continue;
+    if (state.pendingPermissions.size > 0 || state.pendingQuestions.size > 0) continue;
+    if (state.turnExecAt !== null && state.turnExecAt > lostAt) continue;
+    enterSession(state.sessionId);
+    if (state.turnStartedAt !== null) finalizeTurn(lostAt);
+    clearTurn();
+    busy = false;
+    activeToolIds.clear();
+    pendingToolStep.clear();
+    pendingPermissions.clear();
+    pendingQuestions.clear();
+    waitStartAt = null;
+    toolStartAt = null;
+    leaveSession();
+  }
 };
 
 const eventUrl = (): string => {
@@ -2139,17 +2215,19 @@ const startStream = async (): Promise<void> => {
     return;
   }
 
-  const lostFor = streamLostAt === null ? 0 : Date.now() - streamLostAt;
-  if (lostFor > RESUME_GAP_MS) {
-    // Long enough for a turn's closing events to have gone by unseen.
-    resetInFlight();
-  }
+  const lostAt = streamLostAt ?? Date.now();
+  const lostFor = streamLostAt === null ? 0 : Date.now() - lostAt;
   streamLostAt = null;
+  if (lostFor > 0) {
+    // Whatever is still marked in flight is checked against what OpenCode is
+    // really running, whatever the gap was: a three-second cut can swallow a
+    // turn's closing event just as a three-minute one can.
+    void settleAfterCut(lostFor, lostAt).catch(() => undefined);
+  }
   connection = 'live';
   lastError = null;
   lastErrorKind = null;
   retryDelay = RETRY_BASE_MS;
-  lastEventAt = Date.now();
 
   let healthy = false;
   try {
@@ -2347,11 +2425,21 @@ const pushTick = (): void => {
   // A page is looking: keep the Mac, prompt and render readers warm.
   noteDemand(now);
   if (!pushing) return;
-  for (const key of [...leases.keys()].slice(0, PUSH_SESSIONS_MAX)) {
+  // Least recently pushed first, and only a real push spends the budget: with
+  // more pages open than one tick can carry, every one of them gets a turn
+  // instead of the first six holding the channel while the rest fall back to
+  // asking.
+  const due = [...leases.keys()].sort(
+    (a, b) => (lastPushed.get(a)?.at ?? 0) - (lastPushed.get(b)?.at ?? 0) || (a < b ? -1 : 1),
+  );
+  let sent = 0;
+  for (const key of due) {
+    if (sent >= PUSH_SESSIONS_MAX) break;
     const body = rateBody(key || null, now);
     const sig = signature(body);
     const previous = lastPushed.get(key);
     if (previous && previous.sig === sig && now - previous.at < PUSH_KEEPALIVE_MS) continue;
+    sent += 1;
     lastPushed.set(key, { sig, at: now });
     void serviceHost.emit('rate', { session: key || null, rate: body as never }).catch((error: unknown) => {
       // No callback address: this host was not told to take events from us.
@@ -2534,10 +2622,10 @@ const server = http.createServer((req, res) => {
       const model = typeof body.model === 'string' && body.model.trim() && body.model.trim().length <= MODEL_NAME_MAX
         ? body.model.trim()
         : null;
-      // `changed` means "you were not already set up for this".
-      const changed = sessionId !== null && !watched.has(sessionId);
       applyWatch({ sessionId, model }, Date.now());
-      json(res, 200, { ok: true, changed, connection, sessionId, push: pushing });
+      // `push` is this service saying whether the host takes what it posts: a
+      // page that is told no starts asking again instead of waiting to notice.
+      json(res, 200, { ok: true, connection, sessionId, push: pushing });
     }).catch((error: unknown) => {
       json(res, 400, { error: error instanceof Error ? error.message : 'Invalid request' });
     });

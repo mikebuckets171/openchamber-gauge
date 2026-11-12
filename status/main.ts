@@ -247,6 +247,8 @@ let lastReassertAt = 0;
 let lastWatchAt = 0;
 /** When the service last sent this session's reading; 0 until it has. */
 let lastPushAt = 0;
+/** Whether this host takes the readings the service posts, as the service says. */
+let hostPushes = true;
 let heightReported = false;
 /** Latest curve from the service, when this page received it, and its full scale. */
 let sparkFrame: SparkFrame | null = null;
@@ -994,7 +996,10 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
   turn: { active: false, ttftMs: null },
   lastTurn: null,
   cache: null,
-  gauge: undefined,
+  // What the machine itself says is not another chat's number: the Mac's memory
+  // keeps its reading — and with it the knowledge that this machine has none to
+  // wait for — while everything that belongs to a chat goes blank.
+  gauge: rate.gauge ? { ...rate.gauge, prompt: null, render: null, model: null, chatModel: null } : undefined,
 });
 
 /**
@@ -1035,6 +1040,15 @@ const poll = async (): Promise<void> => {
   }
 };
 
+/** What a `/watch` answer says about pushed readings; an unreadable one is no answer. */
+const readPushAnswer = (body: string): boolean => {
+  try {
+    return (JSON.parse(body) as { push?: unknown }).push !== false;
+  } catch {
+    return true;
+  }
+};
+
 const configure = async (sessionId: string | null): Promise<void> => {
   // The model the chat is on rides with the watch: the service needs it to
   // say which model is in play, which is not the model the local engine holds.
@@ -1044,11 +1058,15 @@ const configure = async (sessionId: string | null): Promise<void> => {
   if ((key === configuredKey && !due) || configuring) return;
   configuring = true;
   try {
-    await host.serviceRequest({
+    const answer = await host.serviceRequest({
       method: 'POST',
       path: '/watch',
       body: JSON.stringify({ sessionId, model }),
     });
+    // The service says whether this host takes what it posts. Told no, asking is
+    // the only route, so ask on every tick instead of spending five seconds
+    // discovering it.
+    hostPushes = readPushAnswer(answer.body);
     configuredKey = key;
     lastWatchAt = Date.now();
   } catch (error) {
@@ -1065,6 +1083,8 @@ host.onServiceEvent(({ topic, data }) => {
   if (stopped || topic !== 'rate' || !data || typeof data !== 'object') return;
   const pushed = data as { session?: unknown; rate?: unknown };
   if ((pushed.session ?? null) !== (session?.id ?? null) || !pushed.rate || typeof pushed.rate !== 'object') return;
+  // One that arrived is proof this host delivers them, whatever it said before.
+  hostPushes = true;
   lastPushAt = Date.now();
   take(pushed.rate as RateResponse);
 });
@@ -1091,7 +1111,7 @@ const mount = (): void => {
       // Renewing the watch keeps the readings coming.
       await configure(session?.id ?? null);
       // Asking is the fallback for a host whose events never reach us.
-      if (Date.now() - lastPushAt > PUSH_STALE_MS) await poll();
+      if (!hostPushes || Date.now() - lastPushAt > PUSH_STALE_MS) await poll();
       loop();
     }, document.hidden ? 1000 : 250);
   };

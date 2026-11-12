@@ -38,9 +38,18 @@ const listen = async (handler) => {
 const makeFeed = async () => {
   const clients = new Set();
   const dials = [];
-  const state = { refuse: null };
+  const activeDials = [];
+  const state = { refuse: null, running: null };
   const server = await listen((req, res) => {
     const url = (req.url ?? '').split('?')[0];
+    if (url === '/api/session/active') {
+      // OpenCode's own answer to "which sessions are running right now": a map,
+      // and an id that is absent from it is idle.
+      activeDials.push({ at: Date.now(), authorization: req.headers.authorization ?? null });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ data: Object.fromEntries((state.running ?? []).map((id) => [id, { type: 'running' }])) }));
+      return;
+    }
     if (url !== '/api/event') {
       res.writeHead(404).end();
       return;
@@ -58,7 +67,9 @@ const makeFeed = async () => {
   return {
     ...server,
     dials,
+    activeDials,
     clients,
+    running: (ids) => { state.running = ids; },
     refuse: (status) => { state.refuse = status; },
     allow: () => { state.refuse = null; },
     cut: () => { for (const res of clients) res.destroy(); clients.clear(); },
@@ -327,6 +338,186 @@ const freePort = async () => {
   await svc.stop();
   feed.cut();
   feed.server.close();
+}
+
+// --- a short cut that swallowed the end of a turn ---------------------------
+// The stream ended after a reply's closing events had been published, so they
+// are gone for good. Guessing from the length of the gap kept 0.5 honest and
+// left 1.0 showing "writing" on a chat that had finished: so the service asks
+// OpenCode which sessions it is really running, and a turn it no longer has is
+// recorded from what was measured before the cut.
+{
+  const feed = await makeFeed();
+  const svc = await startService({ port: await freePort(), dataDir: path.join(root, 'short-cut-data'), feedUrl: feed.origin });
+  await svc.watch({ sessionId: 'ses_short' });
+  check('the short-cut feed attaches', await svc.live());
+  feed.running(['ses_short']);
+  feed.emit('session.execution.started', { sessionID: 'ses_short' });
+  feed.emit('session.step.started', { sessionID: 'ses_short', assistantMessageID: 'msgShort' });
+  feed.emit('session.text.delta', { sessionID: 'ses_short', assistantMessageID: 'msgShort', ordinal: 0, delta: 'c'.repeat(400) });
+  await sleep(300);
+  const midTurn = await svc.rate('ses_short');
+  check('the turn is live before the cut', midTurn.busy === true && midTurn.turn.active === true, JSON.stringify({ busy: midTurn.busy, turn: midTurn.turn }));
+  const cutAt = Date.now();
+  feed.cut();
+  feed.refuse(503); // keep the stream down while the closing events go by unseen
+  feed.running([]);
+  feed.emit('session.step.ended', {
+    sessionID: 'ses_short', assistantMessageID: 'msgShort',
+    tokens: { input: 10, output: 120, reasoning: 0, cache: { read: 100, write: 0 } }, cost: 0,
+  });
+  feed.emit('session.execution.succeeded', { sessionID: 'ses_short' });
+  await sleep(1_200);
+  feed.allow();
+  let after = null;
+  for (let i = 0; i < 80 && after?.connection !== 'live'; i += 1) {
+    await sleep(100);
+    after = await svc.rate('ses_short');
+  }
+  check('the stream is live again after a cut of a couple of seconds', after?.connection === 'live', JSON.stringify({ connection: after?.connection }));
+  check('and a turn whose ending went unseen is not held open',
+    after?.busy === false && after?.turn?.active === false,
+    JSON.stringify({ busy: after?.busy, turn: after?.turn }));
+  check('it was settled by asking OpenCode what it is running', feed.activeDials.length > 0, `dials=${feed.activeDials.length}`);
+  const settled = await svc.rate('ses_short');
+  check('the reply is kept as what was measured, ending at the cut and not at the reconnect',
+    settled.lastTurn !== null && settled.lastTurn.endedAt <= cutAt + 200 && settled.lastTurn.split.totalMs < 4_000,
+    JSON.stringify({ endedAt: settled.lastTurn?.endedAt, cutAt, split: settled.lastTurn?.split }));
+
+  // A turn OpenCode still has is left alone: a cut costs it nothing.
+  feed.running(['ses_short']);
+  feed.emit('session.execution.started', { sessionID: 'ses_short' });
+  feed.emit('session.step.started', { sessionID: 'ses_short', assistantMessageID: 'msgLive' });
+  feed.emit('session.text.delta', { sessionID: 'ses_short', assistantMessageID: 'msgLive', ordinal: 0, delta: 'd'.repeat(400) });
+  await sleep(300);
+  feed.cut();
+  feed.refuse(503);
+  await sleep(1_200);
+  feed.allow();
+  for (let i = 0; i < 80 && (await svc.rate('ses_short')).connection !== 'live'; i += 1) await sleep(100);
+  const kept = await svc.rate('ses_short');
+  check('a turn OpenCode still holds keeps its measurement across the cut',
+    kept.busy === true && kept.turn?.active === true,
+    JSON.stringify({ busy: kept.busy, turn: kept.turn }));
+  feed.emit('session.step.ended', {
+    sessionID: 'ses_short', assistantMessageID: 'msgLive',
+    tokens: { input: 10, output: 130, reasoning: 0, cache: { read: 100, write: 0 } }, cost: 0,
+  });
+  feed.emit('session.execution.succeeded', { sessionID: 'ses_short' });
+  await sleep(300);
+  const done = await svc.rate('ses_short');
+  check('and it settles normally afterwards', done.lastTurn?.tokens === 130, JSON.stringify(done.lastTurn));
+  await svc.stop();
+  feed.cut();
+  feed.server.close();
+}
+
+// --- more pages open than one push tick can carry ---------------------------
+// Six is the per-tick budget, not the number of sections Gauge serves: with
+// eight open, every one of them has to be reached.
+{
+  const feed = await makeFeed();
+  const callback = await makeCallback();
+  const svc = await startService({
+    port: await freePort(),
+    dataDir: path.join(root, 'eight-page-data'),
+    feedUrl: feed.origin,
+    callbackUrl: callback.origin,
+  });
+  const sessions = Array.from({ length: 8 }, (_, i) => `ses_many_${i}`);
+  for (const session of sessions) await svc.watch({ sessionId: session });
+  for (const session of sessions) {
+    feed.emit('session.execution.started', { sessionID: session });
+    feed.emit('session.step.started', { sessionID: session, assistantMessageID: `msg_${session}` });
+    feed.emit('session.text.delta', { sessionID: session, assistantMessageID: `msg_${session}`, ordinal: 0, delta: 'x'.repeat(120) });
+  }
+  const startedAt = Date.now();
+  const seconds = 2.5;
+  while (Date.now() - startedAt < seconds * 1_000) {
+    for (const session of sessions) {
+      feed.emit('session.text.delta', { sessionID: session, assistantMessageID: `msg_${session}`, ordinal: 0, delta: 'y'.repeat(120) });
+    }
+    await sleep(150);
+  }
+  const emits = callback.emits();
+  const pushed = new Set(emits.map((call) => call?.input?.data?.session));
+  check('every watched session gets its turn of the push',
+    sessions.every((session) => pushed.has(session)),
+    JSON.stringify(sessions.filter((session) => !pushed.has(session))));
+  const perSecond = emits.length / seconds;
+  check('and the budget still stays under the host limit of 30 events a second', perSecond <= 30, `emits/s=${perSecond.toFixed(1)} of 30`);
+  await svc.stop();
+  feed.cut();
+  feed.server.close();
+  callback.server.close();
+}
+
+// --- two services sharing one data dir both keep their sessions -------------
+{
+  const feed = await makeFeed();
+  const dataDir = path.join(root, 'shared-data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  const file = path.join(dataDir, 'state.json');
+  const other = {};
+  for (let i = 0; i < 20; i += 1) other[`ses_other_${i}`] = { lastTurn: null, cache: null };
+  fs.writeFileSync(file, JSON.stringify({ version: 1, savedAt: Date.now(), sessions: other, models: {} }));
+  const svc = await startService({ port: await freePort(), dataDir, feedUrl: feed.origin });
+  const own = Array.from({ length: 20 }, (_, i) => `ses_own_${i}`);
+  for (const session of own) await svc.watch({ sessionId: session });
+  check('the shared-file service attaches', await svc.live());
+  // One settled turn is what makes it write; a watch on its own changes nothing.
+  feed.emit('session.execution.started', { sessionID: own[0] });
+  feed.emit('session.step.started', { sessionID: own[0], assistantMessageID: 'msg_own' });
+  feed.emit('session.text.delta', { sessionID: own[0], assistantMessageID: 'msg_own', ordinal: 0, delta: 'z'.repeat(200) });
+  await sleep(200);
+  feed.emit('session.step.ended', {
+    sessionID: own[0], assistantMessageID: 'msg_own',
+    tokens: { input: 4, output: 20, reasoning: 0, cache: { read: 10, write: 0 } }, cost: 0,
+  });
+  feed.emit('session.execution.succeeded', { sessionID: own[0] });
+  await sleep(2_200); // past the persistence debounce
+  const ids = new Set(Object.keys(JSON.parse(fs.readFileSync(file, 'utf8')).sessions ?? {}));
+  const missing = [...own, ...Object.keys(other)].filter((id) => !ids.has(id));
+  check('a service at its cap does not erase the other instance\'s sessions',
+    missing.length === 0, JSON.stringify(missing.slice(0, 4)));
+  check('and the shared file stays bounded', ids.size <= 40, `sessions=${ids.size}`);
+  await svc.stop();
+  feed.cut();
+  feed.server.close();
+}
+
+// --- a legacy file this service never read is not thrown away --------------
+// The normal migration reads it and removes it. This is the case where the
+// extension's own file is already newer than the copy beside the service: the
+// newer numbers must not be deleted unread.
+{
+  const feed = await makeFeed();
+  const dataDir = path.join(root, 'keep-legacy-data');
+  fs.mkdirSync(dataDir, { recursive: true });
+  const endedAt = Date.now() - 30_000;
+  fs.writeFileSync(path.join(dataDir, 'state.json'), JSON.stringify({
+    version: 1, savedAt: endedAt,
+    sessions: { ses_from_data: { lastTurn: { tokensPerSecond: 20, source: 'estimate', tokens: 40, activeMs: 2_000, ttftMs: 100, hasReasoning: false, endedAt }, cache: null } },
+    models: {},
+  }));
+  const legacy = path.join('service', '.gauge-state.json');
+  fs.rmSync(legacy, { force: true });
+  fs.writeFileSync(legacy, JSON.stringify({
+    version: 1, savedAt: endedAt,
+    sessions: { ses_from_legacy: { lastTurn: { tokensPerSecond: 60, source: 'estimate', tokens: 90, activeMs: 1_500, ttftMs: 100, hasReasoning: false, endedAt }, cache: null } },
+    models: {},
+  }));
+  const svc = await startService({ port: await freePort(), dataDir, feedUrl: feed.origin });
+  await svc.watch({ sessionId: 'ses_from_data' });
+  await sleep(200);
+  const read = await svc.rate('ses_from_data');
+  check('the extension\'s own file is the one it reads', read.lastTurn?.tokens === 40, JSON.stringify(read.lastTurn));
+  await sleep(2_200);
+  check('a legacy file it did not read is left where it is', fs.existsSync(legacy));
+  await svc.stop();
+  feed.cut();
+  feed.server.close();
+  fs.rmSync(legacy, { force: true });
 }
 
 // --- what a page may name in a watch -----------------------------------------

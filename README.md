@@ -157,16 +157,13 @@ npm test          # smoke, regressions, page smoke, cache and the OpenCode plugi
 bun test service  # the parsers behind the readings, and the receipt's arithmetic
 ```
 
-`node scripts/preview.mjs <file.html>` writes a scratch page to `<file.html>`
-(a temporary file by default) that draws the section's own CSS around the
-markup the page builds, for checking a layout change in a browser without
-OpenChamber. It is a development aid: nothing in the shipped section uses it.
-
-`node scripts/mount-preview.mjs` goes further: it copies the real built page
-into frames of a fake host that answers the way OpenChamber's proxy does — idle,
-writing, compacting, an empty chat, a refused service — so a headless browser
-photographs what the shipped section really paints, including the parts only a
-real host can trigger. Same development aid, same exemption.
+`node scripts/mount-preview.mjs` writes a scratch page, to a temporary file by
+default, that mounts the real built page in frames of a fake host answering the
+way OpenChamber's proxy does — idle, writing, an engine reading its prompt, a
+chat compacting, an empty chat, a machine with no memory reading, a refused
+service — so a headless browser photographs what the shipped section really
+paints, including the parts only a real host can trigger. Same development aid,
+same exemption.
 
 ## Credits and licence
 
