@@ -429,7 +429,7 @@ var readEngineEntries = (dir, now) => {
       const done = e?.done;
       if (!e || typeof e.requestID !== "string" || typeof e.sessionKey !== "string" || !done)
         continue;
-      if (e.kind !== "primary" && e.kind !== "compaction")
+      if (e.kind !== "primary")
         continue;
       if (typeof e.expiresAtMs !== "number" || e.expiresAtMs <= now)
         continue;
@@ -1339,7 +1339,7 @@ var readModels = (file) => {
 var readEngineModels = (file) => {
   try {
     const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
-    return Array.isArray(parsed?.engines) ? parsed.engines.filter((id) => typeof id === "string" && id.length > 0 && id.length <= MODEL_NAME_MAX).slice(-32) : [];
+    return Array.isArray(parsed?.engines) ? parsed.engines.filter((id) => typeof id === "string" && id.length > 0 && id !== "*" && id.length <= MODEL_NAME_MAX).slice(-32) : [];
   } catch {
     return [];
   }
@@ -1602,7 +1602,12 @@ var noteClaimed = (id) => {
   if (claimedEngine.size > 256)
     claimedEngine.delete(claimedEngine.values().next().value);
 };
-var ENGINE_SLACK_MS = 3000;
+var noteEngineModel = (model) => {
+  if (model && model !== "*")
+    engineModels.add(model);
+};
+var ENGINE_LEAD_MS = 1000;
+var ENGINE_TAIL_MS = 250;
 var findEngineFigure = (entries, key, model, from, to) => {
   const wanted = model && model !== "*" ? modelKey(model) : null;
   let best = null;
@@ -1611,7 +1616,7 @@ var findEngineFigure = (entries, key, model, from, to) => {
       continue;
     if (wanted && entry.modelKey && entry.modelKey !== wanted)
       continue;
-    if (entry.endedAt < from - 1000 || entry.endedAt > to + ENGINE_SLACK_MS)
+    if (entry.endedAt < from - ENGINE_LEAD_MS || entry.endedAt > to + ENGINE_TAIL_MS)
       continue;
     if (!best || entry.endedAt < best.endedAt)
       best = entry;
@@ -1623,19 +1628,22 @@ var claimEngineFigures = (now, fresh = false) => {
     return;
   let entries = null;
   const key = sessionKey(activeSessionId);
+  const newest = turnStepOrder[turnStepOrder.length - 1];
   for (const id of turnStepOrder) {
     const step = steps2.get(id);
-    if (!step || step.engine || step.endAt === null || now - step.endAt > ENGINE_CLAIM_MS)
+    if (!step || step.engine)
+      continue;
+    if (step.endAt === null ? id !== newest : now - step.endAt > ENGINE_CLAIM_MS)
       continue;
     entries ??= engineFigures(now, fresh);
     if (entries.length === 0)
       return;
-    const found = findEngineFigure(entries, key, step.model, step.startAt, step.endAt);
+    const found = findEngineFigure(entries, key, step.model, step.startAt, step.endAt ?? now);
     if (!found)
       continue;
     noteClaimed(found.id);
     step.engine = { tps: found.tps, tokens: found.tokens };
-    engineModels.add(step.model);
+    noteEngineModel(step.model);
     schedulePersist();
   }
 };
@@ -1668,7 +1676,7 @@ var headlineFigure = (now) => {
     const step = steps2.get(turnStepOrder[i]);
     if (!step)
       continue;
-    const figure = step.endAt === null ? openStepEstimate(step) : stepFigure(step, now);
+    const figure = step.endAt === null && !step.engine ? openStepEstimate(step) : stepFigure(step, now);
     if (figure)
       return figure;
   }
@@ -1707,7 +1715,7 @@ var patchLastStep = (sessionId, endedAt, step) => {
   if (!found)
     return;
   noteClaimed(found.id);
-  engineModels.add(step.model);
+  noteEngineModel(step.model);
   turn.lastStep = { tps: found.tps, source: "engine" };
   schedulePersist();
 };
@@ -2539,7 +2547,7 @@ var computeCurve = (now) => {
   }
   const values = [];
   for (let b = 0;b < CURVE_BUCKETS; b += 1) {
-    values.push(buckets[b] === 0 ? 0 : said[b] > 0 ? said[b] : Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    values.push(buckets[b] === 0 ? 0 : said[b]);
   }
   return { values, startAt: oldest, stepMs: width };
 };
@@ -2566,8 +2574,26 @@ var signature = (body) => {
   const quiet = Array.isArray(body.curve) && body.curve.every((value) => value <= 0.05);
   return JSON.stringify(body, (key, value) => VOLATILE.has(key) || quiet && key === "curveStart" ? undefined : value);
 };
+var claimInBackground = (now) => {
+  if (inSession)
+    return;
+  for (const [id, state] of sessionStates) {
+    const newest = state.steps.get(state.turnStepOrder[state.turnStepOrder.length - 1] ?? "");
+    if (!newest || newest.engine || !engineModels.has(newest.model))
+      continue;
+    if (newest.endAt !== null && now - newest.endAt > ENGINE_CLAIM_MS)
+      continue;
+    enterSession(id);
+    try {
+      claimEngineFigures(now);
+    } finally {
+      leaveSession();
+    }
+  }
+};
 var pushTick = () => {
   const now = Date.now();
+  claimInBackground(now);
   for (const [key, until] of leases) {
     if (until <= now) {
       leases.delete(key);

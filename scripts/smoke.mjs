@@ -34,7 +34,7 @@ const writeEngine = (entries) => {
     entries: entries.map((entry, i) => ({
       requestID: `req-${entry.id ?? i}:done`, sessionKey: helperKey(entry.session ?? SESSION), providerID: 'splash',
       endpointKey: 'e', modelKey: createHash('sha256').update(`gauge-model-v1\0${entry.model ?? 'SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF'}`).digest('hex'), kind: 'primary', done: { tokens: entry.tokens, ms: entry.tokens / entry.tps * 1000, tps: entry.tps },
-      endedAtMs: entry.endedAt ?? now, observedAtMs: now, expiresAtMs: now + 15_000,
+      endedAtMs: entry.endedAt ?? now, observedAtMs: now, expiresAtMs: now + (entry.ttlMs ?? 15_000),
     })),
   }));
 };
@@ -872,10 +872,13 @@ check(
     unknownLocal.running?.source === 'tokens' && unknownLocal.running.tps === astra.running.tps,
     JSON.stringify(unknownLocal.running),
   );
+  // The helper notes a reply's end at its closing frame, before OpenCode ends
+  // the step; here the file lands a moment after the step ended.
+  const s1At = Date.now();
   ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgSplash1', tokens: { output: 60, reasoning: 0 } });
   await sleep(100);
   const waiting = await (await svcFetch('/rate')).json();
-  writeEngine([{ id: 's1', tokens: 1110, tps: 48.1 }]);
+  writeEngine([{ id: 's1', tokens: 1110, tps: 48.1, endedAt: s1At }]);
   await sleep(400);
   const local = await (await svcFetch('/rate')).json();
   check(
@@ -898,12 +901,13 @@ check(
       || value <= Math.max(writing.running.tps, astra.running.tps, 48.1) + 0.01),
     JSON.stringify({ curve: writing.curve, running: writing.running, from: splashFrom, start: writing.curveStart }),
   );
+  const s2At = Date.now();
   ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgSplash2', tokens: { output: 65, reasoning: 0 } });
   ev('session.execution.succeeded', { sessionID: SESSION });
   await sleep(150);
   const ended = await (await svcFetch('/rate')).json();
   // The second step's figure lands a moment after the turn ended.
-  writeEngine([{ id: 's1', tokens: 1110, tps: 48.1, endedAt: Date.now() - 2_000 }, { id: 's2', tokens: 1801, tps: 49.3 }]);
+  writeEngine([{ id: 's1', tokens: 1110, tps: 48.1, endedAt: s1At }, { id: 's2', tokens: 1801, tps: 49.3, endedAt: s2At }]);
   let patched = ended;
   for (let i = 0; i < 30 && patched.lastTurn?.lastStep?.source !== 'engine'; i += 1) {
     await sleep(200);
@@ -920,6 +924,147 @@ check(
     JSON.stringify({ average: patched.lastTurn.tokensPerSecond, last: patched.lastTurn.lastStep }),
   );
   fs.rmSync(path.join(PROGRESS_DIR, 'writer.json'), { force: true });
+}
+
+// --- a local step's figure, whatever its tools do ---------------------------
+// OpenCode ends a step only once its tools have run (SessionStep.attempt joins
+// them before it publishes `session.step.ended`), and the helper keeps a figure
+// for 15 s. A step whose tool ran longer lost its own figure and took the next
+// step's, and the reply rested on a number Splash never wrote. A figure that
+// leaves the helper's file soon after it lands stands in for that long tool.
+{
+  const SPLASH = 'SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF';
+  const local = (session, id) => emit({ id: 'e', created: Date.now(), type: 'session.step.started', data: {
+    sessionID: session, assistantMessageID: id, started: Date.now(), model: { id: SPLASH, providerID: 'splash' } } });
+  const write = async (session, id, ms) => {
+    for (let t = 0; t < ms; t += 100) {
+      ev('session.text.delta', { sessionID: session, assistantMessageID: id, ordinal: 0, delta: 'x'.repeat(40) });
+      await sleep(100);
+    }
+  };
+
+  ev('session.execution.started', { sessionID: SESSION });
+  local(SESSION, 'msgTool1');
+  await write(SESSION, 'msgTool1', 1200);
+  writeEngine([{ id: 't1', tokens: 280, tps: 41, ttlMs: 400 }]);
+  ev('session.tool.called', { sessionID: SESSION, assistantMessageID: 'msgTool1', id: 'longTool' });
+  await sleep(250);
+  const toolRunning = await (await svcFetch('/rate')).json();
+  check(
+    'a local step reads its engine\'s figure while its tools still run',
+    toolRunning.running?.source === 'engine' && toolRunning.running.tps === 41,
+    JSON.stringify(toolRunning.running),
+  );
+  await sleep(400); // the figure is gone from the helper's file; the tool runs on
+  ev('session.tool.success', { sessionID: SESSION, assistantMessageID: 'msgTool1', id: 'longTool' });
+  ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgTool1', tokens: { output: 280, reasoning: 0 } });
+  local(SESSION, 'msgTool2');
+  await write(SESSION, 'msgTool2', 600);
+  writeEngine([{ id: 't2', tokens: 30, tps: 52 }]);
+  ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgTool2', tokens: { output: 30, reasoning: 0 } });
+  ev('session.execution.succeeded', { sessionID: SESSION });
+  await sleep(300);
+  const afterTool = await (await svcFetch('/rate')).json();
+  check(
+    'the step after a long tool keeps its own figure, and the reply rests on it',
+    afterTool.lastTurn?.lastStep?.source === 'engine' && afterTool.lastTurn.lastStep.tps === 52,
+    JSON.stringify(afterTool.lastTurn?.lastStep),
+  );
+
+  // A step whose figure never came (the helper gave up on its reply) is timed
+  // like any other; it must not take the next step's figure.
+  ev('session.execution.started', { sessionID: SESSION });
+  local(SESSION, 'msgLost');
+  await write(SESSION, 'msgLost', 800);
+  ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgLost', tokens: { output: 80, reasoning: 0 } });
+  local(SESSION, 'msgNext');
+  await write(SESSION, 'msgNext', 600);
+  writeEngine([{ id: 'n1', tokens: 30, tps: 53 }]);
+  ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgNext', tokens: { output: 30, reasoning: 0 } });
+  ev('session.execution.succeeded', { sessionID: SESSION });
+  await sleep(300);
+  const afterLost = await (await svcFetch('/rate')).json();
+  check(
+    'a step without its own figure leaves the next step\'s to that step',
+    afterLost.lastTurn?.lastStep?.source === 'engine' && afterLost.lastTurn.lastStep.tps === 53,
+    JSON.stringify(afterLost.lastTurn?.lastStep),
+  );
+
+  // With no page reading the chat at all, the figure is still collected.
+  const BG = 'ses_local_bg';
+  ev('session.created', { sessionID: BG });
+  ev('session.execution.started', { sessionID: BG });
+  local(BG, 'msgBg1');
+  await write(BG, 'msgBg1', 1200);
+  writeEngine([{ id: 'bg1', session: BG, tokens: 280, tps: 44, ttlMs: 800 }]);
+  ev('session.tool.called', { sessionID: BG, assistantMessageID: 'msgBg1', id: 'bgTool' });
+  await sleep(1_300); // nothing reads this chat while its tool runs
+  ev('session.tool.success', { sessionID: BG, assistantMessageID: 'msgBg1', id: 'bgTool' });
+  ev('session.step.ended', { sessionID: BG, assistantMessageID: 'msgBg1', tokens: { output: 280, reasoning: 0 } });
+  ev('session.execution.succeeded', { sessionID: BG });
+  await sleep(150);
+  const bg = await (await svcFetch(`/rate?sessionId=${BG}`)).json();
+  check(
+    'with no page open, a local step whose tool outlives the helper\'s entry still rests on its engine\'s figure',
+    bg.lastTurn?.lastStep?.source === 'engine' && bg.lastTurn.lastStep.tps === 44,
+    JSON.stringify(bg.lastTurn?.lastStep),
+  );
+  fs.rmSync(path.join(PROGRESS_DIR, 'writer.json'), { force: true });
+}
+
+// A step whose start was missed (the service came up mid-reply) has no model
+// name. Its engine figure is still its own, but "no name" is not a model that
+// reports figures: remembered as one, every later step whose start was missed,
+// a cloud one too, was estimated from its text like a local step.
+{
+  const NAMELESS = 'ses_nameless';
+  ev('session.created', { sessionID: NAMELESS });
+  for (let i = 0; i < 8; i += 1) {
+    ev('session.text.delta', { sessionID: NAMELESS, assistantMessageID: 'msgNameless', ordinal: 0, delta: 'y'.repeat(40) });
+    await sleep(100);
+  }
+  writeEngine([{ id: 'nl1', session: NAMELESS, tokens: 90, tps: 46 }]);
+  ev('session.step.ended', { sessionID: NAMELESS, assistantMessageID: 'msgNameless', tokens: { output: 90, reasoning: 0 } });
+  ev('session.execution.succeeded', { sessionID: NAMELESS });
+  await sleep(300);
+  const nameless = await (await svcFetch(`/rate?sessionId=${NAMELESS}`)).json();
+  check(
+    'a step whose start was missed still reads its own engine figure',
+    nameless.lastTurn?.lastStep?.source === 'engine' && nameless.lastTurn.lastStep.tps === 46,
+    JSON.stringify(nameless.lastTurn?.lastStep),
+  );
+  const LATE_CLOUD = 'ses_nameless_cloud';
+  ev('session.created', { sessionID: LATE_CLOUD });
+  for (let i = 0; i < 13; i += 1) {
+    ev('session.text.delta', { sessionID: LATE_CLOUD, assistantMessageID: 'msgLateCloud', ordinal: 0, delta: 'z'.repeat(400) });
+    await sleep(100);
+  }
+  const lateCloud = await (await svcFetch(`/rate?sessionId=${LATE_CLOUD}`)).json();
+  check('a later step whose start was missed is not taken for a local one', lateCloud.running === null, JSON.stringify(lateCloud.running));
+  ev('session.step.ended', { sessionID: LATE_CLOUD, assistantMessageID: 'msgLateCloud', tokens: { output: 1300, reasoning: 0 } });
+  ev('session.execution.succeeded', { sessionID: LATE_CLOUD });
+  fs.rmSync(path.join(PROGRESS_DIR, 'writer.json'), { force: true });
+}
+
+// A new chat's first step, sent in one burst before the headline has any number
+// to say: the curve stays at the floor rather than drawing the burst's rate, a
+// spike that then flattened every point after it.
+{
+  const FRESH = 'ses_fresh_curve';
+  ev('session.created', { sessionID: FRESH });
+  ev('session.execution.started', { sessionID: FRESH });
+  emit({ id: 'e', created: Date.now(), type: 'session.step.started', data: {
+    sessionID: FRESH, assistantMessageID: 'msgBurst', started: Date.now() - 5_000, model: { id: 'claude-fable-5-2', providerID: 'claude-agent' } } });
+  ev('session.text.delta', { sessionID: FRESH, assistantMessageID: 'msgBurst', ordinal: 0, delta: 'f'.repeat(1480) });
+  await sleep(1_400); // the burst's bucket is complete
+  const fresh = await (await svcFetch(`/rate?sessionId=${FRESH}`)).json();
+  check(
+    'a new chat\'s first burst draws no speed the headline did not show',
+    fresh.running === null && fresh.lastTurn === null && fresh.curve.every((value) => value === 0),
+    JSON.stringify({ running: fresh.running, curve: fresh.curve }),
+  );
+  ev('session.step.ended', { sessionID: FRESH, assistantMessageID: 'msgBurst', tokens: { output: 370, reasoning: 0 } });
+  ev('session.execution.succeeded', { sessionID: FRESH });
 }
 
 // --- the feed is the only thing the service dials ---------------------------

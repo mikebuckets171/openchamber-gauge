@@ -219,8 +219,8 @@ export const takeReadMs = (sessionIds: string[]): number => {
 /**
  * The engine's own figures for one finished local reply: what llama.cpp's
  * server, or Splash, put in the reply's closing `timings` frame. The helper
- * keeps each for its file's lifetime (15 s) so the step that asked for it can
- * claim it after the step has ended.
+ * keeps each for 15 s, so the step that asked for it claims it as soon as it is
+ * there: OpenCode ends a step only after its tools have run, often later.
  */
 export type EngineFigure = {
   id: string;
@@ -258,7 +258,9 @@ export const readEngineEntries = (dir: string, now: number): EngineFigure[] => {
       const e = raw as Record<string, unknown>;
       const done = e?.done as Record<string, unknown> | undefined;
       if (!e || typeof e.requestID !== 'string' || typeof e.sessionKey !== 'string' || !done) continue;
-      if (e.kind !== 'primary' && e.kind !== 'compaction') continue;
+      // Only a step's own call. A compaction is read just before the next step
+      // starts, inside that step's window, and is no step of its own.
+      if (e.kind !== 'primary') continue;
       if (typeof e.expiresAtMs !== 'number' || e.expiresAtMs <= now) continue;
       if (typeof e.endedAtMs !== 'number' || !Number.isFinite(e.endedAtMs) || e.endedAtMs > now + 1_000) continue;
       const tokens = done.tokens;

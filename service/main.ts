@@ -1026,7 +1026,7 @@ const readEngineModels = (file: string): string[] => {
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { engines?: unknown };
     return Array.isArray(parsed?.engines)
-      ? parsed.engines.filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= MODEL_NAME_MAX).slice(-32)
+      ? parsed.engines.filter((id): id is string => typeof id === 'string' && id.length > 0 && id !== '*' && id.length <= MODEL_NAME_MAX).slice(-32)
       : [];
   } catch {
     return [];
@@ -1397,43 +1397,65 @@ const noteClaimed = (id: string): void => {
 };
 
 /**
+ * Remember a model as one that reports its own figures. `*` is a step whose
+ * start was missed, not a model: kept as one, every later step whose start was
+ * missed, a cloud one too, was estimated from its text like a local step.
+ */
+const noteEngineModel = (model: string): void => {
+  if (model && model !== '*') engineModels.add(model);
+};
+
+/**
  * The earliest unclaimed figure of this session and model that could belong to
  * a step spanning [from, to]. The helper notes the reply's end as it reads it,
- * just before OpenCode ends the step, so the window is the step itself plus a
- * moment's slack either side.
+ * before OpenCode ends the step (which it does only once the step's tools have
+ * run), so a figure never really ends after its step: the window reaches a
+ * second before the step's start, which is rebased onto this clock, and only a
+ * moment past its end. A wider tail let a step whose own figure never came take
+ * the next step's.
  */
-const ENGINE_SLACK_MS = 3_000;
+const ENGINE_LEAD_MS = 1_000;
+const ENGINE_TAIL_MS = 250;
 const findEngineFigure = (entries: EngineFigure[], key: string, model: string, from: number, to: number): EngineFigure | null => {
   const wanted = model && model !== '*' ? modelKey(model) : null;
   let best: EngineFigure | null = null;
   for (const entry of entries) {
     if (entry.sessionKey !== key || claimedEngine.has(entry.id)) continue;
     if (wanted && entry.modelKey && entry.modelKey !== wanted) continue;
-    if (entry.endedAt < from - 1_000 || entry.endedAt > to + ENGINE_SLACK_MS) continue;
+    if (entry.endedAt < from - ENGINE_LEAD_MS || entry.endedAt > to + ENGINE_TAIL_MS) continue;
     if (!best || entry.endedAt < best.endedAt) best = entry;
   }
   return best;
 };
 
 /**
- * Give the turn's recently ended steps their engine figures. Oldest first: the
- * requests of one chat run one after another, so the earliest figure belongs
- * to the earliest step still without one.
+ * Give the turn's steps their engine figures. Oldest first: the requests of
+ * one chat run one after another, so the earliest figure belongs to the
+ * earliest step still without one.
+ *
+ * The newest step may claim while it is still open. OpenCode ends a step only
+ * once its tools have run, which can be minutes after the reply's last frame
+ * (a long command, a subagent, a permission), and the helper keeps a figure
+ * for 15 s: waiting for the end lost the figure, and the step after took it.
  */
 const claimEngineFigures = (now: number, fresh = false): void => {
   if (!activeSessionId) return;
   let entries: EngineFigure[] | null = null;
   const key = sessionKey(activeSessionId);
+  const newest = turnStepOrder[turnStepOrder.length - 1];
   for (const id of turnStepOrder) {
     const step = steps.get(id);
-    if (!step || step.engine || step.endAt === null || now - step.endAt > ENGINE_CLAIM_MS) continue;
+    if (!step || step.engine) continue;
+    // Only the newest step can be the call in flight; an older one left open
+    // (a failure that reported nothing) must not take a later reply's figure.
+    if (step.endAt === null ? id !== newest : now - step.endAt > ENGINE_CLAIM_MS) continue;
     entries ??= engineFigures(now, fresh);
     if (entries.length === 0) return;
-    const found = findEngineFigure(entries, key, step.model, step.startAt, step.endAt);
+    const found = findEngineFigure(entries, key, step.model, step.startAt, step.endAt ?? now);
     if (!found) continue;
     noteClaimed(found.id);
     step.engine = { tps: found.tps, tokens: found.tokens };
-    engineModels.add(step.model);
+    noteEngineModel(step.model);
     schedulePersist();
   }
 };
@@ -1479,7 +1501,8 @@ const headlineFigure = (now: number): StepFigure | null => {
   for (let i = turnStepOrder.length - 1; i >= 0; i -= 1) {
     const step = steps.get(turnStepOrder[i]);
     if (!step) continue;
-    const figure = step.endAt === null ? openStepEstimate(step) : stepFigure(step, now);
+    // A step whose reply is over reads its engine's figure while its tools run.
+    const figure = step.endAt === null && !step.engine ? openStepEstimate(step) : stepFigure(step, now);
     if (figure) return figure;
   }
   return null;
@@ -1516,7 +1539,7 @@ const patchLastStep = (sessionId: string, endedAt: number, step: { startAt: numb
   const found = findEngineFigure(engineFigures(Date.now(), true), sessionKey(sessionId), step.model, step.startAt, step.endAt);
   if (!found) return;
   noteClaimed(found.id);
-  engineModels.add(step.model);
+  noteEngineModel(step.model);
   turn.lastStep = { tps: found.tps, source: 'engine' };
   schedulePersist();
 };
@@ -2538,14 +2561,12 @@ const computeCurve = (now: number): { values: number[]; startAt: number; stepMs:
   }
   const values: number[] = [];
   for (let b = 0; b < CURVE_BUCKETS; b += 1) {
-    // A bucket where words arrived is what the headline said then; a quiet one
-    // is the floor. Only a bucket from before the headline had any number to
-    // say falls back to the rate of what it holds across its own width (the
-    // width, not the span its samples covered: one chunk over 1 ms would read
-    // as a spike that flattens every other point).
-    values.push(buckets[b] === 0 ? 0 : said[b] > 0
-      ? said[b]
-      : Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    // A bucket where words arrived is what the headline said then; a quiet one,
+    // or one from before the headline had any number to say, is the floor. The
+    // rate of what a bucket held was the old fallback, and on a new chat's
+    // first burst it drew a spike the number never showed, which then flattened
+    // every point after it.
+    values.push(buckets[b] === 0 ? 0 : said[b]);
   }
   return { values, startAt: oldest, stepMs: width };
 };
@@ -2604,8 +2625,29 @@ const signature = (body: Record<string, unknown>): string => {
   ));
 };
 
+/**
+ * Claim engine figures for chats no page is reading. A page's own reading
+ * claims for its chat four times a second; without one nothing else asks while
+ * a step's tools run, and the helper keeps a figure for only 15 s.
+ */
+const claimInBackground = (now: number): void => {
+  if (inSession) return;
+  for (const [id, state] of sessionStates) {
+    const newest = state.steps.get(state.turnStepOrder[state.turnStepOrder.length - 1] ?? '');
+    if (!newest || newest.engine || !engineModels.has(newest.model)) continue;
+    if (newest.endAt !== null && now - newest.endAt > ENGINE_CLAIM_MS) continue;
+    enterSession(id);
+    try {
+      claimEngineFigures(now);
+    } finally {
+      leaveSession();
+    }
+  }
+};
+
 const pushTick = (): void => {
   const now = Date.now();
+  claimInBackground(now);
   for (const [key, until] of leases) {
     if (until <= now) {
       leases.delete(key);

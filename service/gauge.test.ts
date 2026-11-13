@@ -5,7 +5,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseVmStat, parseSysctl, readProgressEntries, parseJobs, sessionKey } from './gauge';
+import { parseVmStat, parseSysctl, readEngineEntries, readProgressEntries, parseJobs, sessionKey } from './gauge';
 
 const VM_STAT = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                                    18002.
@@ -105,6 +105,27 @@ describe('prompt progress files', () => {
 
   test('a missing directory reads as no progress, not an error', () => {
     expect(readProgressEntries(join(tmpdir(), 'gauge-progress-missing'), Date.now())).toEqual([]);
+  });
+
+  test('only a step\'s own call leaves an engine figure; a compaction is no step', () => {
+    // A compaction is read just before the next step starts, inside that
+    // step's claim window: taken as a figure, it went to that step, and each
+    // step after it read the one before.
+    const dir = mkdtempSync(join(tmpdir(), 'gauge-progress-'));
+    try {
+      const now = Date.now();
+      const done = (requestID: string, kind: string, tps: number) => ({
+        requestID, sessionKey: 'abc', providerID: 'splash', endpointKey: 'e', modelKey: 'm', kind,
+        done: { tokens: 900, ms: 900 / tps * 1000, tps }, endedAtMs: now - 100, observedAtMs: now - 100, expiresAtMs: now + 14_000,
+      });
+      write(dir, 'w.json', {
+        schemaVersion: 1, writerID: 'w', updatedAtMs: now, expiresAtMs: now + 15_000,
+        entries: [done('c:done', 'compaction', 61), done('p:done', 'primary', 47.5), done('t:done', 'title', 80)],
+      });
+      const figures = readEngineEntries(dir, now);
+      expect(figures).toHaveLength(1);
+      expect(figures[0]).toMatchObject({ id: 'p:done', tps: 47.5, tokens: 900, sessionKey: 'abc', modelKey: 'm' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
