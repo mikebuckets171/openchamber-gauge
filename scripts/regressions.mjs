@@ -379,6 +379,13 @@ const freePort = async () => {
     after = await svc.rate('ses_short');
   }
   check('the stream is live again after a cut of a couple of seconds', after?.connection === 'live', JSON.stringify({ connection: after?.connection }));
+  // The question to OpenCode goes out once the stream is back, so its answer
+  // can land a moment after `live`: on a slow CI runner it had not yet, and
+  // this check failed on a service that was right (Nov 13, twice).
+  for (let i = 0; i < 30 && (after?.busy !== false || feed.activeDials.length === 0); i += 1) {
+    await sleep(100);
+    after = await svc.rate('ses_short');
+  }
   check('and a turn whose ending went unseen is not held open',
     after?.busy === false && after?.turn?.active === false,
     JSON.stringify({ busy: after?.busy, turn: after?.turn }));
