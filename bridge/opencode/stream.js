@@ -54,10 +54,12 @@ export function observeStream(response, { metadata, store, signal, onClose = () 
     writing = true; previous = undefined; store.remove(metadata.requestID);
   };
   const closing = body => {
-    const timings = parseTimings(body.timings);
+    // Chat completions and Anthropic's messages carry them at the top of the
+    // closing frame; the Responses API inside the finished response.
+    const timings = parseTimings(body.timings ?? (object(body.response) ? body.response.timings : undefined));
     if (!timings) return false;
     // Kept under its own id so the end of the stream does not take it away: the
-    // service reads it after the step ends, and it expires on its own.
+    // service claims it for the step that asked, and it expires on its own.
     store.update({ ...metadata, ...(responseModelKey ? { responseModelKey } : {}), requestID: `${metadata.requestID}:done`, done: timings, endedAtMs: Date.now() });
     void store.flush?.().catch?.(() => {});
     finish();

@@ -103,6 +103,37 @@ test('the engine\'s own figures for the reply are kept from its closing frame, b
   await plugin.dispose();
 });
 
+// The same figures as Splash 1.6.1's other two dialects write them: Anthropic's
+// messages put `timings` at the top of `message_delta`
+// (`server/dialects/anthropic.py`), the Responses API inside the finished
+// response of `response.completed` (`server/dialects/responses.py`).
+test('the closing figures are read from the Anthropic and Responses dialects too', async () => {
+  const timings = { predicted_n: 412, predicted_ms: 8240, predicted_per_second: 50 };
+  const tails = {
+    anthropic: [
+      `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`,
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done.' } })}\n\n`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 412 }, timings })}\n\n`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`,
+    ],
+    responses: [
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'Done.' })}\n\n`,
+      `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: 'resp_1', object: 'response', status: 'completed', model: 'canonical/model', output: [], usage: { output_tokens: 412 }, timings } })}\n\n`,
+    ],
+  };
+  for (const [dialect, tail] of Object.entries(tails)) {
+    const store = memory();
+    const parts = [progress(), ...tail].map(encode);
+    const originals = [...parts];
+    const reader = observeStream(source(parts).response, { metadata, store }).body.getReader();
+    for (const original of originals) assert.equal((await reader.read()).value, original, dialect);
+    const saved = [...store.entries.values()];
+    assert.equal(saved.length, 1, dialect);
+    assert.deepEqual(saved[0].done, { tokens: 412, ms: 8240, tps: 50 }, dialect);
+    assert.equal((await reader.read()).done, true, dialect);
+  }
+});
+
 test('a reply without timings, or with nonsense ones, leaves nothing behind', async () => {
   for (const timings of [undefined, { predicted_n: 0, predicted_ms: 10, predicted_per_second: 1 }, { predicted_n: 10, predicted_ms: -1, predicted_per_second: 1 }, { predicted_n: 10, predicted_ms: 10, predicted_per_second: Infinity }, 'fast']) {
     const store = memory();
