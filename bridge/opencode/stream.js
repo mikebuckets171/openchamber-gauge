@@ -19,21 +19,55 @@ const outputStarted = body => {
     || (object(choice.delta) && Object.entries(choice.delta).some(([name, value]) => name !== 'role' && value != null && value !== '' && (!Array.isArray(value) || value.length > 0)))));
 };
 
+/**
+ * The engine's own figures for the reply it just wrote, from the `timings`
+ * object llama.cpp's server (and Splash, which copies its shape) puts in the
+ * last frame of a streamed reply: tokens written, the time from the first token
+ * to the last, and the rate the engine itself worked out from them.
+ */
+export function parseTimings(value) {
+  if (!object(value)) return null;
+  const tokens = value.predicted_n, ms = value.predicted_ms, tps = value.predicted_per_second;
+  if (!Number.isSafeInteger(tokens) || tokens <= 0) return null;
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return null;
+  if (typeof tps !== 'number' || !Number.isFinite(tps) || tps <= 0 || tps > 5_000) return null;
+  return { tokens, ms, tps };
+}
+
 // This parser sees bytes already requested by the downstream consumer. It never
 // starts a second reader/tee, buffers a whole reply, or changes a response byte.
+//
+// Until the reply starts it reads the prompt's progress. After that it only
+// looks for the engine's closing `timings`, and parses no frame that does not
+// name them.
 export function observeStream(response, { metadata, store, signal, onClose = () => {}, onObserver = () => {} }) {
   if (!response.body || !response.ok || !response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')) return response;
   const reader = response.body.getReader(), decoder = new TextDecoder();
-  let buffer = '', frame = [], frameSize = 0, previous, responseModelKey, ended = false;
+  let buffer = '', frame = [], frameSize = 0, previous, responseModelKey, ended = false, writing = false;
   const finish = () => {
     if (ended) return;
     ended = true; buffer = ''; frame = []; frameSize = 0;
     store.remove(metadata.requestID); signal?.removeEventListener('abort', finish); onClose();
   };
+  const startWriting = () => {
+    // The prompt is read: its progress goes, and the observer stays for the end.
+    writing = true; previous = undefined; store.remove(metadata.requestID);
+  };
+  const closing = body => {
+    const timings = parseTimings(body.timings);
+    if (!timings) return false;
+    // Kept under its own id so the end of the stream does not take it away: the
+    // service reads it after the step ends, and it expires on its own.
+    store.update({ ...metadata, ...(responseModelKey ? { responseModelKey } : {}), requestID: `${metadata.requestID}:done`, done: timings, endedAtMs: Date.now() });
+    void store.flush?.().catch?.(() => {});
+    finish();
+    return true;
+  };
   const event = () => {
     if (ended || !frame.length) { frame = []; frameSize = 0; return; }
     const data = frame.join('\n'); frame = []; frameSize = 0;
     if (data === '[DONE]') { finish(); return; }
+    if (writing && !data.includes('"timings"')) return;
     let body;
     try { body = JSON.parse(data); } catch { finish(); return; }
     if (!object(body)) return;
@@ -42,7 +76,9 @@ export function observeStream(response, { metadata, store, signal, onClose = () 
       if (responseModelKey && responseModelKey !== model) { finish(); return; }
       responseModelKey = model;
     }
-    if (outputStarted(body)) { finish(); return; }
+    if (closing(body)) return;
+    if (writing) return;
+    if (outputStarted(body)) { startWriting(); return; }
     if (!Object.hasOwn(body, 'prompt_progress')) return;
     const progress = parseProgress(body.prompt_progress, previous);
     if (!progress) { finish(); return; }

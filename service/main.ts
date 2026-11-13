@@ -28,7 +28,7 @@ import { createServiceHost } from '@openchamber/sdk';
 import { modelDisplayName } from '../shared/models';
 import { splitTurn, type TurnSplit } from '../shared/receipt';
 import { tokensFromChars } from '../shared/tokens';
-import { gaugeWire, noteDemand, takeReadMs } from './gauge';
+import { engineFigures, gaugeWire, modelKey, noteDemand, sessionKey, takeReadMs, type EngineFigure } from './gauge';
 
 /**
  * The read-only OpenCode connection OpenChamber gives an approved service.
@@ -154,7 +154,8 @@ type ConnectionState = 'idle' | 'connecting' | 'live' | 'error';
 /** What kind of failure `lastError` describes, so the panel can word it. */
 type ErrorKind = 'network' | 'http' | 'closed' | 'access';
 
-type Sample = { at: number; chars: number; kind: 'text' | 'reasoning' | 'tool' };
+/** One streamed fragment, and what the headline said when it arrived (0 when it said nothing). */
+type Sample = { at: number; chars: number; kind: 'text' | 'reasoning' | 'tool'; tps: number };
 
 type WatchConfig = {
   sessionId: string | null;
@@ -188,6 +189,8 @@ type TurnResult = {
   split?: TurnSplit;
   /** Time the turn sat waiting on a person (a permission, a question); not part of `split`. */
   askMs?: number;
+  /** The speed the reply ended at: its last step's. What the headline keeps once the turn is over. */
+  lastStep?: { tps: number; source: 'engine' | 'tokens' | 'estimate' };
 };
 
 type WaitingKind = 'permission' | 'question';
@@ -651,6 +654,10 @@ type StepRecord = {
   toolSpans: Array<[number, number]>;
   toolOpen: number;
   toolSince: number | null;
+  /** The model this step ran on. */
+  model: string;
+  /** The local engine's own figures for this step's reply, once claimed. */
+  engine: { tps: number; tokens: number } | null;
 };
 let steps = new Map<string, StepRecord>();
 /** Step ids seen in this turn, in arrival order. */
@@ -1014,6 +1021,18 @@ const readModels = (file: string): Record<string, number> => {
   }
 };
 
+/** Models stored as reporting their own figures. */
+const readEngineModels = (file: string): string[] => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { engines?: unknown };
+    return Array.isArray(parsed?.engines)
+      ? parsed.engines.filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= MODEL_NAME_MAX).slice(-32)
+      : [];
+  } catch {
+    return [];
+  }
+};
+
 /** Restore durable numbers so a restarted service answers immediately. */
 let legacyConsumed = false;
 
@@ -1025,6 +1044,7 @@ const readPersisted = (): void => {
     for (const [model, factor] of Object.entries(readModels(file))) {
       calibration.set(model, factor as number);
     }
+    for (const model of readEngineModels(file)) engineModels.add(model);
     for (const [id, raw] of Object.entries(sessions)) {
       const memory = raw as Partial<SessionMemory>;
       const state = createSessionState(id);
@@ -1061,6 +1081,9 @@ const writePersisted = (): void => {
         savedAt: Date.now(),
         sessions,
         models: { ...readModels(file), ...Object.fromEntries(calibration) },
+        // Models that report their own figures, so a restarted service can
+        // estimate their steps live again without waiting for one to end.
+        engines: [...new Set([...readEngineModels(file), ...engineModels])].slice(-32),
       });
       const tmp = `${file}.${process.pid}.tmp`;
       fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -1191,6 +1214,8 @@ const stepFor = (messageID: string, now: number): StepRecord => {
       toolSpans: [],
       toolOpen: 0,
       toolSince: null,
+      model: currentModel,
+      engine: null,
     };
     steps.set(messageID, step);
     turnStepOrder.push(messageID);
@@ -1340,46 +1365,160 @@ const sumSteps = (): {
   };
 };
 
+// --- the speed of one step ------------------------------------------------------
+//
+// The headline is the speed of the model call in progress, not an average over
+// the whole turn: an agent turn can run for hours across models, and its
+// average said little about what the chat was doing now.
+//
+// A local llama.cpp engine (Splash included) reports its own figure for every
+// reply in the reply's closing frame, and that is the step's speed. Every other
+// step is timed from the start of the call to its end, less the tools it ran:
+// a provider that sends a step's text in one burst gave no honest span to
+// divide by (a 370-token Fable step landed in 0.59 s of a 6.3 s call and read
+// 624 tok/s), and one rule for all of them never switches methods mid-chat.
+
+type StepFigure = { tps: number; tokens: number; source: 'engine' | 'tokens' | 'estimate' };
+
+/** Models whose steps came back with an engine figure: their open steps may be estimated live. */
+const engineModels = new Set<string>();
+/** Engine figures already given to a step, so one reply is never counted twice. */
+const claimedEngine = new Set<string>();
+/** How long an ended local step waits for its engine figure before it is timed like any other. */
+const ENGINE_WAIT_MS = 3_000;
+/** How long after its end a step may still claim its figure (the helper's file lives 15 s). */
+const ENGINE_CLAIM_MS = 16_000;
+/** An open local step is estimated only once it has written for this long. */
+const OPEN_ESTIMATE_MIN_MS = 1_000;
+
+const noteClaimed = (id: string): void => {
+  claimedEngine.add(id);
+  if (claimedEngine.size > 256) claimedEngine.delete(claimedEngine.values().next().value as string);
+};
+
 /**
- * The running turn average, built the same way as the finalized one: summed
- * step tokens over summed step nets, so the headline converges to the final
- * number instead of jumping at turn end. Open steps contribute character
- * estimates frozen at their last counted activity — silence extends nothing.
- * Null when nothing measurable yet.
+ * The earliest unclaimed figure of this session and model that could belong to
+ * a step spanning [from, to]. The helper notes the reply's end as it reads it,
+ * just before OpenCode ends the step, so the window is the step itself plus a
+ * moment's slack either side.
  */
-const computeRunning = (): { tps: number; source: 'tokens' | 'estimate' } | null => {
-  const sum = sumSteps();
-  if (sum) return { tps: sum.tokens / (sum.netMs / 1000), source: sum.real ? 'tokens' : 'estimate' };
-  if (turnStartedAt === null || turnChars === 0) return null;
-  // No measurable step (typically a late attach): estimate frozen at the last
-  // counted character. Recomputed only when new characters arrive, so the
-  // number holds instead of sagging while the model thinks.
-  if (turnChars === fbChars && Number.isFinite(fbTps)) {
-    return { tps: fbTps, source: 'estimate' };
+const ENGINE_SLACK_MS = 3_000;
+const findEngineFigure = (entries: EngineFigure[], key: string, model: string, from: number, to: number): EngineFigure | null => {
+  const wanted = model && model !== '*' ? modelKey(model) : null;
+  let best: EngineFigure | null = null;
+  for (const entry of entries) {
+    if (entry.sessionKey !== key || claimedEngine.has(entry.id)) continue;
+    if (wanted && entry.modelKey && entry.modelKey !== wanted) continue;
+    if (entry.endedAt < from - 1_000 || entry.endedAt > to + ENGINE_SLACK_MS) continue;
+    if (!best || entry.endedAt < best.endedAt) best = entry;
   }
-  const ref = turnLastCharAt ?? turnStartedAt;
-  const frozenWait = turnWaitMs + (waitStartAt !== null ? Math.max(0, ref - waitStartAt) : 0);
-  const frozenTool = turnToolMs + (toolStartAt !== null ? Math.max(0, ref - toolStartAt) : 0);
-  const reconstructed = turnExecAt === null
-    ? ref - turnStartedAt
-    : (ref - turnExecAt) - frozenWait - frozenTool;
-  // A tool or a wait that finished *after* the last counted character is
-  // subtracted from a span that ends before it, which leaves a negative
-  // number; flooring that at 1 ms turns a few hundred characters into over a
-  // hundred thousand tok/s. The accumulated streaming gaps already skip waits
-  // and tool runs, so they are the honest denominator when the reconstruction
-  // will not hold.
-  const elapsedMs = reconstructed >= 1 ? reconstructed : turnActiveMs;
-  const tps = plausibleRate(estimateTokens(turnChars), elapsedMs);
-  if (tps === null) {
-    // Nothing defensible to freeze: leave the cache empty rather than a number
-    // that only looks like a measurement.
-    fbTps = NaN;
-    return null;
+  return best;
+};
+
+/**
+ * Give the turn's recently ended steps their engine figures. Oldest first: the
+ * requests of one chat run one after another, so the earliest figure belongs
+ * to the earliest step still without one.
+ */
+const claimEngineFigures = (now: number, fresh = false): void => {
+  if (!activeSessionId) return;
+  let entries: EngineFigure[] | null = null;
+  const key = sessionKey(activeSessionId);
+  for (const id of turnStepOrder) {
+    const step = steps.get(id);
+    if (!step || step.engine || step.endAt === null || now - step.endAt > ENGINE_CLAIM_MS) continue;
+    entries ??= engineFigures(now, fresh);
+    if (entries.length === 0) return;
+    const found = findEngineFigure(entries, key, step.model, step.startAt, step.endAt);
+    if (!found) continue;
+    noteClaimed(found.id);
+    step.engine = { tps: found.tps, tokens: found.tokens };
+    engineModels.add(step.model);
+    schedulePersist();
   }
-  fbChars = turnChars;
-  fbTps = tps;
-  return { tps, source: 'estimate' };
+};
+
+/**
+ * One step's speed, or null when it has none yet.
+ *
+ * An ended step of a model that reports its own figures waits a moment for
+ * that figure instead of showing a different number first.
+ */
+const stepFigure = (step: StepRecord, now: number): StepFigure | null => {
+  if (step.engine) return { tps: step.engine.tps, tokens: step.engine.tokens, source: 'engine' };
+  if (!step.settled || !step.startObserved || step.endAt === null) return null;
+  if (engineModels.has(step.model) && now - step.endAt < ENGINE_WAIT_MS) return null;
+  const tokens = step.output + step.reasoning;
+  if (!(tokens > 0)) return null;
+  const ms = (step.endAt - step.startAt) - stepToolWithinMs(step, step.startAt, step.endAt);
+  const tps = plausibleRate(tokens, ms);
+  return tps === null ? null : { tps, tokens, source: 'tokens' };
+};
+
+/**
+ * A local step still writing, estimated from what it has streamed: the same
+ * span the engine itself measures, first word to now, less tools. Only for a
+ * model whose steps have come back with engine figures; anything else has no
+ * speed until its call ends.
+ */
+const openStepEstimate = (step: StepRecord): StepFigure | null => {
+  if (!engineModels.has(step.model) || step.firstCharAt === null || step.lastDeltaAt === null) return null;
+  const span = (step.lastDeltaAt - step.firstCharAt) - stepToolWithinMs(step, step.firstCharAt, step.lastDeltaAt);
+  if (span < OPEN_ESTIMATE_MIN_MS) return null;
+  const tokens = estimateTokens(step.chars);
+  const tps = plausibleRate(tokens, span);
+  return tps === null ? null : { tps, tokens, source: 'estimate' };
+};
+
+/**
+ * What the headline says while a turn runs: the step writing now when it can
+ * be told, else the last step of this turn that has a speed. Null before any
+ * step of the turn has one; the page then keeps the last reply's number.
+ */
+const headlineFigure = (now: number): StepFigure | null => {
+  for (let i = turnStepOrder.length - 1; i >= 0; i -= 1) {
+    const step = steps.get(turnStepOrder[i]);
+    if (!step) continue;
+    const figure = step.endAt === null ? openStepEstimate(step) : stepFigure(step, now);
+    if (figure) return figure;
+  }
+  return null;
+};
+
+/** The turn's speeds: every step that has one, the reply's average over them, and the last. */
+const turnFigures = (now: number): { average: StepFigure; last: StepFigure } | null => {
+  let tokens = 0;
+  let ms = 0;
+  let last: StepFigure | null = null;
+  let source: StepFigure['source'] = 'tokens';
+  let anyEngine = false;
+  for (const id of turnStepOrder) {
+    const step = steps.get(id);
+    if (!step) continue;
+    // At the turn's end nothing is still to come: an ended step is timed now.
+    const figure = stepFigure(step, now + ENGINE_WAIT_MS);
+    if (!figure) continue;
+    tokens += figure.tokens;
+    ms += (figure.tokens / figure.tps) * 1000;
+    anyEngine = anyEngine || figure.source === 'engine';
+    last = figure;
+  }
+  if (!last || !(ms >= 1)) return null;
+  if (anyEngine && last.source === 'engine') source = 'engine';
+  return { average: { tps: tokens / (ms / 1000), tokens, source }, last };
+};
+
+/** A turn that ended before its last step's engine figure was written: give it that figure when it lands. */
+const patchLastStep = (sessionId: string, endedAt: number, step: { startAt: number; endAt: number; model: string }): void => {
+  const state = sessionStates.get(sessionId);
+  const turn = state?.lastTurn;
+  if (!state || !turn || turn.endedAt !== endedAt || turn.lastStep?.source === 'engine') return;
+  const found = findEngineFigure(engineFigures(Date.now(), true), sessionKey(sessionId), step.model, step.startAt, step.endAt);
+  if (!found) return;
+  noteClaimed(found.id);
+  engineModels.add(step.model);
+  turn.lastStep = { tps: found.tps, source: 'engine' };
+  schedulePersist();
 };
 
 /**
@@ -1421,21 +1560,39 @@ const finalizeTurn = (now: number): void => {
   noteTools(now);
   const wallMs = turnStartedAt !== null ? Math.max(1, now - turnStartedAt) : 1;
   const sum = sumSteps();
-  if (sum) {
+  claimEngineFigures(now, true);
+  const figures = turnFigures(now);
+  if (sum || figures) {
     // Only consume the aggregate's base once the turn is actually recorded.
     const turnCache = snapshotTurnCache();
+    // The receipt's writing slice stays the time words were arriving; the
+    // speeds are the steps' own.
+    const writeMs = sum ? sum.netMs : 0;
+    const average = figures?.average ?? null;
     lastTurn = {
-      tokensPerSecond: sum.tokens / (sum.netMs / 1000),
-      source: sum.real ? 'tokens' : 'estimate',
-      tokens: sum.tokens,
-      activeMs: Math.round(sum.netMs),
-      ttftMs: sum.ttftMs,
+      tokensPerSecond: average ? average.tps : sum!.tokens / (sum!.netMs / 1000),
+      source: average ? (average.source === 'estimate' ? 'estimate' : 'tokens') : (sum!.real ? 'tokens' : 'estimate'),
+      tokens: average ? average.tokens : sum!.tokens,
+      activeMs: Math.round(writeMs),
+      ttftMs: sum ? sum.ttftMs : null,
       hasReasoning: turnReasoningChars > 0 || [...steps.values()].some((s) => s.reasoning > 0),
       endedAt: now,
       cache: turnCache,
-      split: turnSplit(now, sum.netMs),
+      split: turnSplit(now, writeMs),
       askMs: Math.round(turnWaitMs),
+      ...(figures ? { lastStep: { tps: figures.last.tps, source: figures.last.source } } : {}),
     };
+    // The last step's own figure can land a moment after the turn ends.
+    const lastId = [...turnStepOrder].reverse().find((id) => steps.get(id)?.endAt !== null);
+    const lastStep = lastId ? steps.get(lastId) : undefined;
+    if (activeSessionId && lastStep && !lastStep.engine && lastStep.endAt !== null) {
+      const sessionId = activeSessionId;
+      const span = { startAt: lastStep.startAt, endAt: lastStep.endAt, model: lastStep.model };
+      for (const delay of [500, 2_000, 5_000]) {
+        const timer = setTimeout(() => patchLastStep(sessionId, now, span), delay);
+        timer.unref?.();
+      }
+    }
     schedulePersist();
     clearTurn();
     return;
@@ -1493,7 +1650,8 @@ const recordChars = (messageID: string, partID: string, kind: Sample['kind'], ch
   // Any streamed model output proves the turn is alive, even when the
   // `execution.started` event was missed (late watch attach).
   busy = true;
-  samples.push({ at: now, chars, kind });
+  const sample: Sample = { at: now, chars, kind, tps: 0 };
+  samples.push(sample);
   if (samples.length > SAMPLE_LIMIT) samples.splice(0, samples.length - SAMPLE_LIMIT);
   partChars.set(partID, (partChars.get(partID) ?? 0) + chars);
   messageChars.set(messageID, (messageChars.get(messageID) ?? 0) + chars);
@@ -1522,6 +1680,11 @@ const recordChars = (messageID: string, partID: string, kind: Sample['kind'], ch
     if (step.firstCharAt === null) step.firstCharAt = now;
     if (kind === 'reasoning') step.sawReasoning = true;
   }
+  // The curve draws the headline's own history, so it never shows a speed the
+  // number did not.
+  // Before this turn has a speed of its own the headline still shows the last
+  // reply's, and so does the curve.
+  sample.tps = headlineFigure(now)?.tps ?? lastTurn?.lastStep?.tps ?? lastTurn?.tokensPerSecond ?? 0;
 };
 
 /**
@@ -1589,6 +1752,8 @@ const settleStep = (messageID: string, output: number, reasoning: number, now: n
   step.settled = true;
   if (step.endAt === null) step.endAt = now;
   closeStepTool(step, now);
+  // Earlier steps' figures are on disk by now; this one's usually a moment later.
+  claimEngineFigures(now);
 };
 
 type RawEvent = { type?: unknown; data?: unknown; properties?: unknown; created?: unknown };
@@ -1908,7 +2073,11 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     const serverCreated = readNumber(event.created) || now;
     const started = readNumber(payload.started);
     const startAt = started > 0 ? now - Math.max(0, serverCreated - started) : now;
-    stepFor(messageID, startAt).startObserved = true;
+    const step = stepFor(messageID, startAt);
+    // A step whose first output beat its start event still started when it did.
+    step.startAt = Math.min(step.startAt, startAt);
+    step.startObserved = true;
+    step.model = currentModel;
     return;
   }
 
@@ -2358,21 +2527,25 @@ const computeCurve = (now: number): { values: number[]; startAt: number; stepMs:
   const oldest = newest - CURVE_WINDOW_MS;
   pruneSamples(oldest);
   const buckets = new Array<number>(CURVE_BUCKETS).fill(0);
+  const said = new Array<number>(CURVE_BUCKETS).fill(0);
   for (const sample of samples) {
     if (sample.at < oldest || sample.at >= newest) continue;
     // Every sample before the newest edge falls inside the 24 buckets above;
     // the clamp only guards the index against rounding.
     const b = Math.min(CURVE_BUCKETS - 1, Math.floor((sample.at - oldest) / width));
     buckets[b] += sample.chars;
+    if (sample.tps > 0) said[b] = sample.tps;
   }
   const values: number[] = [];
   for (let b = 0; b < CURVE_BUCKETS; b += 1) {
-    // A bucket is a fixed slice of the window, so its rate is what it holds
-    // across its own width. Measuring the span the samples covered read a
-    // bucket holding one chunk as that chunk over 1 ms, and sparkPaths
-    // normalizes by the largest point, so a single such bucket flattened every
-    // other point on the curve.
-    values.push(Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    // A bucket where words arrived is what the headline said then; a quiet one
+    // is the floor. Only a bucket from before the headline had any number to
+    // say falls back to the rate of what it holds across its own width (the
+    // width, not the span its samples covered: one chunk over 1 ms would read
+    // as a spike that flattens every other point).
+    values.push(buckets[b] === 0 ? 0 : said[b] > 0
+      ? said[b]
+      : Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
   return { values, startAt: oldest, stepMs: width };
 };
@@ -2570,6 +2743,7 @@ const rateBody = (requested: string | null, now: number): Record<string, unknown
   if (requested !== null) enterSession(requested);
   else loadState(blankSession);
   try {
+    claimEngineFigures(now);
     const curve = computeCurve(now);
     return {
       connection,
@@ -2584,7 +2758,9 @@ const rateBody = (requested: string | null, now: number): Record<string, unknown
       waiting: waitingKind(),
       toolActive: toolActive(),
       live: { tps: computeLive(now) },
-      running: turnStartedAt !== null ? computeRunning() : null,
+      // The speed of the step writing now, or the last one of this turn that
+      // has one: what the headline shows while the turn runs.
+      running: busy || turnStepOrder.length > 0 ? headlineFigure(now) : null,
       // The buckets' own clock travels with them: without it a guest can
       // only place them on an index axis, which is what made the curve
       // deform instead of slide. `curveAt` is the window's right edge.

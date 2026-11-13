@@ -309,6 +309,7 @@ var MAX_WRITERS = 16;
 var MAX_ENTRIES = 16;
 var MAX_FILE_BYTES = 64 * 1024;
 var PROGRESS_EVERY_MS = 400;
+var modelKey = (modelId) => createHash("sha256").update(`gauge-model-v1\x00${modelId}`).digest("hex");
 var sessionKey = (sessionId) => createHash("sha256").update(`gauge-session-v1\x00${sessionId}`).digest("hex");
 var count = (value) => Number.isSafeInteger(value) && value >= 0;
 var readProgressEntries = (dir, now) => {
@@ -400,6 +401,59 @@ var takeReadMs = (sessionIds) => {
     }
   }
   return sum;
+};
+var readEngineEntries = (dir, now) => {
+  const out = [];
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((name) => !name.startsWith(".") && name.endsWith(".json")).slice(0, MAX_WRITERS);
+  } catch {
+    return out;
+  }
+  for (const name of names) {
+    let doc;
+    try {
+      const file = path.join(dir, name);
+      const info = fs.lstatSync(file);
+      if (!info.isFile() || info.size > MAX_FILE_BYTES)
+        continue;
+      doc = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      continue;
+    }
+    const record = doc;
+    if (!record || record.schemaVersion !== 1 || !Array.isArray(record.entries))
+      continue;
+    for (const raw of record.entries.slice(0, MAX_ENTRIES)) {
+      const e = raw;
+      const done = e?.done;
+      if (!e || typeof e.requestID !== "string" || typeof e.sessionKey !== "string" || !done)
+        continue;
+      if (e.kind !== "primary" && e.kind !== "compaction")
+        continue;
+      if (typeof e.expiresAtMs !== "number" || e.expiresAtMs <= now)
+        continue;
+      if (typeof e.endedAtMs !== "number" || !Number.isFinite(e.endedAtMs) || e.endedAtMs > now + 1000)
+        continue;
+      const tokens = done.tokens;
+      const tps = done.tps;
+      if (!Number.isSafeInteger(tokens) || tokens <= 0)
+        continue;
+      if (typeof tps !== "number" || !Number.isFinite(tps) || tps <= 0 || tps > 5000)
+        continue;
+      const modelKey = typeof e.modelKey === "string" ? e.modelKey : null;
+      out.push({ id: e.requestID, sessionKey: e.sessionKey, modelKey, tokens, tps, endedAt: e.endedAtMs });
+    }
+  }
+  return out;
+};
+var engineCache = null;
+var ENGINE_EVERY_MS = 200;
+var engineFigures = (now, fresh = false) => {
+  if (fresh || !engineCache || now - engineCache.at >= ENGINE_EVERY_MS) {
+    engineCache = { at: now, entries: readEngineEntries(PROGRESS_DIR, now) };
+  }
+  return engineCache.entries;
 };
 var progressCache = null;
 var promptFor = (sessionIds, now) => {
@@ -1282,6 +1336,14 @@ var readModels = (file) => {
     return {};
   }
 };
+var readEngineModels = (file) => {
+  try {
+    const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
+    return Array.isArray(parsed?.engines) ? parsed.engines.filter((id) => typeof id === "string" && id.length > 0 && id.length <= MODEL_NAME_MAX).slice(-32) : [];
+  } catch {
+    return [];
+  }
+};
 var legacyConsumed = false;
 var readPersisted = () => {
   const legacy = legacyStatePath();
@@ -1292,6 +1354,8 @@ var readPersisted = () => {
     for (const [model, factor] of Object.entries(readModels(file))) {
       calibration.set(model, factor);
     }
+    for (const model of readEngineModels(file))
+      engineModels.add(model);
     for (const [id, raw] of Object.entries(sessions)) {
       const memory = raw;
       const state = createSessionState(id);
@@ -1321,7 +1385,8 @@ var writePersisted = () => {
         version: PERSIST_VERSION,
         savedAt: Date.now(),
         sessions,
-        models: { ...readModels(file), ...Object.fromEntries(calibration) }
+        models: { ...readModels(file), ...Object.fromEntries(calibration) },
+        engines: [...new Set([...readEngineModels(file), ...engineModels])].slice(-32)
       });
       const tmp = `${file}.${process.pid}.tmp`;
       fs2.mkdirSync(path2.dirname(file), { recursive: true });
@@ -1420,7 +1485,9 @@ var stepFor = (messageID, now) => {
       sawReasoning: false,
       toolSpans: [],
       toolOpen: 0,
-      toolSince: null
+      toolSince: null,
+      model: currentModel,
+      engine: null
     };
     steps2.set(messageID, step);
     turnStepOrder.push(messageID);
@@ -1525,28 +1592,124 @@ var sumSteps = () => {
     ttftMs: ttfts.length > 0 ? ttfts.reduce((a, b) => a + b, 0) / ttfts.length : null
   };
 };
-var computeRunning = () => {
-  const sum = sumSteps();
-  if (sum)
-    return { tps: sum.tokens / (sum.netMs / 1000), source: sum.real ? "tokens" : "estimate" };
-  if (turnStartedAt === null || turnChars === 0)
-    return null;
-  if (turnChars === fbChars && Number.isFinite(fbTps)) {
-    return { tps: fbTps, source: "estimate" };
+var engineModels = new Set;
+var claimedEngine = new Set;
+var ENGINE_WAIT_MS = 3000;
+var ENGINE_CLAIM_MS = 16000;
+var OPEN_ESTIMATE_MIN_MS = 1000;
+var noteClaimed = (id) => {
+  claimedEngine.add(id);
+  if (claimedEngine.size > 256)
+    claimedEngine.delete(claimedEngine.values().next().value);
+};
+var ENGINE_SLACK_MS = 3000;
+var findEngineFigure = (entries, key, model, from, to) => {
+  const wanted = model && model !== "*" ? modelKey(model) : null;
+  let best = null;
+  for (const entry of entries) {
+    if (entry.sessionKey !== key || claimedEngine.has(entry.id))
+      continue;
+    if (wanted && entry.modelKey && entry.modelKey !== wanted)
+      continue;
+    if (entry.endedAt < from - 1000 || entry.endedAt > to + ENGINE_SLACK_MS)
+      continue;
+    if (!best || entry.endedAt < best.endedAt)
+      best = entry;
   }
-  const ref = turnLastCharAt ?? turnStartedAt;
-  const frozenWait = turnWaitMs + (waitStartAt !== null ? Math.max(0, ref - waitStartAt) : 0);
-  const frozenTool = turnToolMs + (toolStartAt !== null ? Math.max(0, ref - toolStartAt) : 0);
-  const reconstructed = turnExecAt === null ? ref - turnStartedAt : ref - turnExecAt - frozenWait - frozenTool;
-  const elapsedMs = reconstructed >= 1 ? reconstructed : turnActiveMs;
-  const tps = plausibleRate(estimateTokens(turnChars), elapsedMs);
-  if (tps === null) {
-    fbTps = NaN;
-    return null;
+  return best;
+};
+var claimEngineFigures = (now, fresh = false) => {
+  if (!activeSessionId)
+    return;
+  let entries = null;
+  const key = sessionKey(activeSessionId);
+  for (const id of turnStepOrder) {
+    const step = steps2.get(id);
+    if (!step || step.engine || step.endAt === null || now - step.endAt > ENGINE_CLAIM_MS)
+      continue;
+    entries ??= engineFigures(now, fresh);
+    if (entries.length === 0)
+      return;
+    const found = findEngineFigure(entries, key, step.model, step.startAt, step.endAt);
+    if (!found)
+      continue;
+    noteClaimed(found.id);
+    step.engine = { tps: found.tps, tokens: found.tokens };
+    engineModels.add(step.model);
+    schedulePersist();
   }
-  fbChars = turnChars;
-  fbTps = tps;
-  return { tps, source: "estimate" };
+};
+var stepFigure = (step, now) => {
+  if (step.engine)
+    return { tps: step.engine.tps, tokens: step.engine.tokens, source: "engine" };
+  if (!step.settled || !step.startObserved || step.endAt === null)
+    return null;
+  if (engineModels.has(step.model) && now - step.endAt < ENGINE_WAIT_MS)
+    return null;
+  const tokens = step.output + step.reasoning;
+  if (!(tokens > 0))
+    return null;
+  const ms = step.endAt - step.startAt - stepToolWithinMs(step, step.startAt, step.endAt);
+  const tps = plausibleRate(tokens, ms);
+  return tps === null ? null : { tps, tokens, source: "tokens" };
+};
+var openStepEstimate = (step) => {
+  if (!engineModels.has(step.model) || step.firstCharAt === null || step.lastDeltaAt === null)
+    return null;
+  const span = step.lastDeltaAt - step.firstCharAt - stepToolWithinMs(step, step.firstCharAt, step.lastDeltaAt);
+  if (span < OPEN_ESTIMATE_MIN_MS)
+    return null;
+  const tokens = estimateTokens(step.chars);
+  const tps = plausibleRate(tokens, span);
+  return tps === null ? null : { tps, tokens, source: "estimate" };
+};
+var headlineFigure = (now) => {
+  for (let i = turnStepOrder.length - 1;i >= 0; i -= 1) {
+    const step = steps2.get(turnStepOrder[i]);
+    if (!step)
+      continue;
+    const figure = step.endAt === null ? openStepEstimate(step) : stepFigure(step, now);
+    if (figure)
+      return figure;
+  }
+  return null;
+};
+var turnFigures = (now) => {
+  let tokens = 0;
+  let ms = 0;
+  let last = null;
+  let source = "tokens";
+  let anyEngine = false;
+  for (const id of turnStepOrder) {
+    const step = steps2.get(id);
+    if (!step)
+      continue;
+    const figure = stepFigure(step, now + ENGINE_WAIT_MS);
+    if (!figure)
+      continue;
+    tokens += figure.tokens;
+    ms += figure.tokens / figure.tps * 1000;
+    anyEngine = anyEngine || figure.source === "engine";
+    last = figure;
+  }
+  if (!last || !(ms >= 1))
+    return null;
+  if (anyEngine && last.source === "engine")
+    source = "engine";
+  return { average: { tps: tokens / (ms / 1000), tokens, source }, last };
+};
+var patchLastStep = (sessionId, endedAt, step) => {
+  const state = sessionStates.get(sessionId);
+  const turn = state?.lastTurn;
+  if (!state || !turn || turn.endedAt !== endedAt || turn.lastStep?.source === "engine")
+    return;
+  const found = findEngineFigure(engineFigures(Date.now(), true), sessionKey(sessionId), step.model, step.startAt, step.endAt);
+  if (!found)
+    return;
+  noteClaimed(found.id);
+  engineModels.add(step.model);
+  turn.lastStep = { tps: found.tps, source: "engine" };
+  schedulePersist();
 };
 var snapshotTurnCache = () => {
   const agg = cache;
@@ -1576,20 +1739,35 @@ var finalizeTurn = (now) => {
   noteTools(now);
   const wallMs = turnStartedAt !== null ? Math.max(1, now - turnStartedAt) : 1;
   const sum = sumSteps();
-  if (sum) {
+  claimEngineFigures(now, true);
+  const figures = turnFigures(now);
+  if (sum || figures) {
     const turnCache = snapshotTurnCache();
+    const writeMs = sum ? sum.netMs : 0;
+    const average = figures?.average ?? null;
     lastTurn = {
-      tokensPerSecond: sum.tokens / (sum.netMs / 1000),
-      source: sum.real ? "tokens" : "estimate",
-      tokens: sum.tokens,
-      activeMs: Math.round(sum.netMs),
-      ttftMs: sum.ttftMs,
+      tokensPerSecond: average ? average.tps : sum.tokens / (sum.netMs / 1000),
+      source: average ? average.source === "estimate" ? "estimate" : "tokens" : sum.real ? "tokens" : "estimate",
+      tokens: average ? average.tokens : sum.tokens,
+      activeMs: Math.round(writeMs),
+      ttftMs: sum ? sum.ttftMs : null,
       hasReasoning: turnReasoningChars > 0 || [...steps2.values()].some((s) => s.reasoning > 0),
       endedAt: now,
       cache: turnCache,
-      split: turnSplit(now, sum.netMs),
-      askMs: Math.round(turnWaitMs)
+      split: turnSplit(now, writeMs),
+      askMs: Math.round(turnWaitMs),
+      ...figures ? { lastStep: { tps: figures.last.tps, source: figures.last.source } } : {}
     };
+    const lastId = [...turnStepOrder].reverse().find((id) => steps2.get(id)?.endAt !== null);
+    const lastStep = lastId ? steps2.get(lastId) : undefined;
+    if (activeSessionId && lastStep && !lastStep.engine && lastStep.endAt !== null) {
+      const sessionId = activeSessionId;
+      const span = { startAt: lastStep.startAt, endAt: lastStep.endAt, model: lastStep.model };
+      for (const delay of [500, 2000, 5000]) {
+        const timer = setTimeout(() => patchLastStep(sessionId, now, span), delay);
+        timer.unref?.();
+      }
+    }
     schedulePersist();
     clearTurn();
     return;
@@ -1632,7 +1810,8 @@ var recordChars = (messageID, partID, kind, chars, now) => {
   if (chars <= 0)
     return;
   busy = true;
-  samples.push({ at: now, chars, kind });
+  const sample = { at: now, chars, kind, tps: 0 };
+  samples.push(sample);
   if (samples.length > SAMPLE_LIMIT)
     samples.splice(0, samples.length - SAMPLE_LIMIT);
   partChars.set(partID, (partChars.get(partID) ?? 0) + chars);
@@ -1660,6 +1839,7 @@ var recordChars = (messageID, partID, kind, chars, now) => {
     if (kind === "reasoning")
       step.sawReasoning = true;
   }
+  sample.tps = headlineFigure(now)?.tps ?? lastTurn?.lastStep?.tps ?? lastTurn?.tokensPerSecond ?? 0;
 };
 var isWatchedSession = (sessionID) => typeof sessionID === "string" && activeSessionId !== null && sessionID === activeSessionId;
 var readString = (value) => typeof value === "string" ? value : "";
@@ -1691,6 +1871,7 @@ var settleStep = (messageID, output, reasoning, now) => {
   if (step.endAt === null)
     step.endAt = now;
   closeStepTool(step, now);
+  claimEngineFigures(now);
 };
 var eventSessionID = (event) => {
   const payload = readRecord(event.data) ?? readRecord(event.properties);
@@ -1973,7 +2154,10 @@ var dispatchEvent = (event, now) => {
     const serverCreated = readNumber(event.created) || now;
     const started = readNumber(payload.started);
     const startAt = started > 0 ? now - Math.max(0, serverCreated - started) : now;
-    stepFor(messageID, startAt).startObserved = true;
+    const step = stepFor(messageID, startAt);
+    step.startAt = Math.min(step.startAt, startAt);
+    step.startObserved = true;
+    step.model = currentModel;
     return;
   }
   if (type === "session.step.ended" || type === "session.step.failed") {
@@ -2344,15 +2528,18 @@ var computeCurve = (now) => {
   const oldest = newest - CURVE_WINDOW_MS;
   pruneSamples(oldest);
   const buckets = new Array(CURVE_BUCKETS).fill(0);
+  const said = new Array(CURVE_BUCKETS).fill(0);
   for (const sample of samples) {
     if (sample.at < oldest || sample.at >= newest)
       continue;
     const b = Math.min(CURVE_BUCKETS - 1, Math.floor((sample.at - oldest) / width));
     buckets[b] += sample.chars;
+    if (sample.tps > 0)
+      said[b] = sample.tps;
   }
   const values = [];
   for (let b = 0;b < CURVE_BUCKETS; b += 1) {
-    values.push(Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    values.push(buckets[b] === 0 ? 0 : said[b] > 0 ? said[b] : Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
   return { values, startAt: oldest, stepMs: width };
 };
@@ -2509,6 +2696,7 @@ var rateBody = (requested, now) => {
   else
     loadState(blankSession);
   try {
+    claimEngineFigures(now);
     const curve = computeCurve(now);
     return {
       connection,
@@ -2519,7 +2707,7 @@ var rateBody = (requested, now) => {
       waiting: waitingKind(),
       toolActive: toolActive(),
       live: { tps: computeLive(now) },
-      running: turnStartedAt !== null ? computeRunning() : null,
+      running: busy || turnStepOrder.length > 0 ? headlineFigure(now) : null,
       curve: curve.values,
       curveStart: curve.startAt,
       curveStep: curve.stepMs,

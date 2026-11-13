@@ -71,6 +71,49 @@ test('a llama.cpp prefill is read as its server writes it', async () => {
   await plugin.dispose();
 });
 
+// The end of a Splash 1.6.1 reply, frame for frame as its OpenAI dialect writes
+// it (`server/dialects/openai.py`): text, the closing chunk with the finish
+// reason and llama-server `timings`, the usage chunk, and `[DONE]`. The figures
+// are a real `Done` line from Splash's log: 2,894 tokens at 49.9 tok/s.
+const splashTail = [
+  { id: 'chatcmpl-7', object: 'chat.completion.chunk', created: 1, model: 'canonical/model', choices: [{ index: 0, delta: { content: 'Done.' }, finish_reason: null }] },
+  { id: 'chatcmpl-7', object: 'chat.completion.chunk', created: 1, model: 'canonical/model', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    timings: { prompt_n: 102378, prompt_ms: 14999.1, prompt_per_second: 785.6, predicted_n: 2894, predicted_ms: 57950.2, predicted_per_second: 49.9, cache_n: 90624, draft_n: 3100, draft_n_accepted: 1800 } },
+  { id: 'chatcmpl-7', object: 'chat.completion.chunk', created: 1, model: 'canonical/model', choices: [], usage: { prompt_tokens: 102378, completion_tokens: 2894, total_tokens: 105272 } },
+].map(body => `data: ${JSON.stringify(body)}\n\n`);
+
+test('the engine\'s own figures for the reply are kept from its closing frame, bytes untouched', async () => {
+  const plugin = await setup(memory());
+  const input = event();
+  await plugin.hooks.get('http.request')(input);
+  const parts = [progress(), ...splashTail, 'data: [DONE]\n\n'].map(encode);
+  const originals = [...parts];
+  input.response = source(parts).response;
+  plugin.hooks.get('http.response')(input);
+  const reader = input.response.body.getReader();
+  for (const original of originals) assert.equal((await reader.read()).value, original);
+  const saved = [...plugin.store.entries.values()];
+  assert.equal(saved.length, 1, 'only the closing figures stay; the prompt reading went when the reply started');
+  assert.deepEqual(saved[0].done, { tokens: 2894, ms: 57950.2, tps: 49.9 });
+  assert.equal(saved[0].sessionKey, key('session', 'ses_private'));
+  assert.equal(saved[0].requestID.endsWith(':done'), true);
+  assert.equal(typeof saved[0].endedAtMs, 'number');
+  assert.ok(!JSON.stringify(saved).match(/PRIVATE|secret-token|ses_private|canonical\/model|alias\/model/));
+  assert.equal((await reader.read()).done, true);
+  await plugin.dispose();
+});
+
+test('a reply without timings, or with nonsense ones, leaves nothing behind', async () => {
+  for (const timings of [undefined, { predicted_n: 0, predicted_ms: 10, predicted_per_second: 1 }, { predicted_n: 10, predicted_ms: -1, predicted_per_second: 1 }, { predicted_n: 10, predicted_ms: 10, predicted_per_second: Infinity }, 'fast']) {
+    const store = memory();
+    const parts = [progress(), `data: ${JSON.stringify({ choices: [{ delta: { content: 'x' } }] })}\n\n`, `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], ...(timings === undefined ? {} : { timings }) })}\n\n`, 'data: [DONE]\n\n'].map(encode);
+    const reader = observeStream(source(parts).response, { metadata, store }).body.getReader();
+    for (let i = 0; i < parts.length; i += 1) await reader.read();
+    assert.equal(store.entries.size, 0, JSON.stringify(timings));
+    await reader.cancel();
+  }
+});
+
 test('versions outside the accepted OpenCode 2 releases never install prompt request mutation or alter a request', async () => {
   for (const version of ['2.0.24', '3.0.0', '2.0.25-custom', undefined]) {
     const plugin = await setup(memory(), {}, version ?? 'unknown'), input = event(), original = input.request;

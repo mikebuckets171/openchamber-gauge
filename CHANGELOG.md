@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.0
+
+Numbers you can trust, and a headline that keeps up.
+
+- The headline is the speed of the step being written, one call to the model,
+  not an average over the whole turn. An agent turn that ran for hours, or
+  switched models partway, used to hold the number to the hours before.
+- A local llama.cpp engine's step (Splash included) reads the engine's own
+  figure from the reply's last frame: the same number Splash writes in its log.
+  The OpenCode helper now keeps watching a local reply to its end for it; the
+  bytes still pass through unchanged.
+- Every other step is timed from the start of its call to its end, less tools.
+  A provider that sends a step's text in one burst used to be divided by the
+  burst: a 370-token Fable step read 624 tok/s, and reads 59 now.
+- When a reply is over the headline keeps the speed it ended at, so nothing
+  jumps; the reply's average is behind `Took`, as `Average`.
+- The curve draws what the headline said, so it never spikes above it.
+- A page that hears no pushed reading for 3 seconds (was 5) asks for one
+  itself, which is what a phone over the relay may need.
+
 ## 1.1.0
 
 A calmer section.

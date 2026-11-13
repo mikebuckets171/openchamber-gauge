@@ -18,6 +18,8 @@ type TurnResult = {
   split?: TurnSplit;
   /** Time the turn waited on a person; outside `split`, absent from an older service. */
   askMs?: number;
+  /** The speed the reply ended at, its last step's; absent from an older service. */
+  lastStep?: { tps: number; source: 'engine' | 'tokens' | 'estimate' };
 };
 
 type CachePoint = {
@@ -101,8 +103,8 @@ type RateResponse = {
   waiting: 'permission' | 'question' | null;
   toolActive: boolean;
   live: Live;
-  /** Running turn average; null when nothing has streamed yet this turn. */
-  running: { tps: number; source: 'tokens' | 'estimate' } | null;
+  /** The speed of the step writing now, or of this turn's last step that has one; null before any has. */
+  running: { tps: number; source: 'engine' | 'tokens' | 'estimate' } | null;
   /** Drawn curve owned by the service: one rate per bucket of the last 30 s. */
   curve: number[];
   /** Epoch ms of the first bucket; absent from an older service. */
@@ -144,7 +146,7 @@ const COPY = {
     wait: '等待',
     write: '生成',
     tool: '工具',
-    speed: '速度',
+    speed: '平均速度',
     firstWord: '首字',
     reading: '读取提示',
     compacting: '正在整理上下文',
@@ -189,7 +191,7 @@ const COPY = {
     wait: 'waiting',
     write: 'writing',
     tool: 'tools',
-    speed: 'Speed',
+    speed: 'Average',
     firstWord: 'First word',
     reading: 'reading prompt',
     compacting: 'compacting',
@@ -229,10 +231,11 @@ const REASSERT_MIN_MS = 1_000;
 const WATCH_RENEW_MS = 5_000;
 /**
  * The service sends a reading at least every two seconds. Hearing nothing for
- * longer means this host does not deliver its events to the section, and the
- * page asks for itself, as it always did.
+ * longer means this host does not deliver its events to the section (a phone
+ * through the relay may not), and the page asks for itself, as it always did.
+ * Three seconds is the keepalive plus room for a slow relay.
  */
-const PUSH_STALE_MS = 5_000;
+const PUSH_STALE_MS = 3_000;
 /** How long the headline number takes to settle on a new value. */
 const GLIDE_MS = 140;
 /** How long a line takes to open; the frame's height is followed for this long. */
@@ -917,9 +920,12 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   // them so that fit is judged on the room there really is.
   const live = rate.live.tps;
   const streaming = rate.busy && rate.waiting === null && live > 0.05;
-  // Headline is the running turn average: stable across network jitter and
-  // identical to the finalized average when the turn ends.
-  const shown = rate.running ? rate.running.tps : (rate.lastTurn?.tokensPerSecond ?? NaN);
+  // The headline is the speed of the step writing now, else of the last step
+  // that has one, and once the reply is over the speed it ended at: so it
+  // never jumps when a reply ends, and never averages hours or two models.
+  const shown = rate.running
+    ? rate.running.tps
+    : (rate.lastTurn?.lastStep?.tps ?? rate.lastTurn?.tokensPerSecond ?? NaN);
   const hasValue = Number.isFinite(shown) && shown > 0;
   setHero(hasValue ? shown : null);
   // Grey whenever tokens are not arriving, so the number does not read as a

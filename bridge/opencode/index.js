@@ -4,7 +4,9 @@
 // observer removed. On a streaming request to a local llama.cpp engine it adds the
 // engine's own documented `return_progress: true` option, watches the same response
 // for `prompt_progress` frames until output starts, and writes `{ total, cache,
-// processed }` per request to ~/.cache/gauge/prompt-progress. Gauge's service reads
+// processed }` per request to ~/.cache/gauge/prompt-progress. It then watches on to
+// the reply's last frame for the engine's own `timings` (tokens, time, rate) and
+// writes those for the step that asked. Gauge's service reads
 // that file. Which engines may be asked is `providers.js`'s question: a name that
 // says llama.cpp or Splash, or an engine whose own `/props` says so. No prompt,
 // reply, header, key or raw session id is saved.

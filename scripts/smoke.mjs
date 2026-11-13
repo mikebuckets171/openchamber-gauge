@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 
 const SERVICE_TOKEN = 'smoke-test-token';
@@ -21,6 +22,22 @@ const OTHER = 'ses_other';
 // regressions.mjs's question.)
 const STATE_FILE = path.join(os.tmpdir(), `gauge-smoke-state-${process.pid}.json`);
 fs.rmSync(STATE_FILE, { force: true });
+// Where the OpenCode helper would write: a scratch folder, so the engine
+// figures below are the test's own and a real Splash on this machine is not read.
+const PROGRESS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'gauge-smoke-progress-'));
+const helperKey = (sessionId) => createHash('sha256').update(`gauge-session-v1\0${sessionId}`).digest('hex');
+/** Write the closing figures of local replies the way the helper's store does. */
+const writeEngine = (entries) => {
+  const now = Date.now();
+  fs.writeFileSync(path.join(PROGRESS_DIR, 'writer.json'), JSON.stringify({
+    schemaVersion: 1, writerID: 'writer', updatedAtMs: now, expiresAtMs: now + 15_000,
+    entries: entries.map((entry, i) => ({
+      requestID: `req-${entry.id ?? i}:done`, sessionKey: helperKey(entry.session ?? SESSION), providerID: 'splash',
+      endpointKey: 'e', modelKey: createHash('sha256').update(`gauge-model-v1\0${entry.model ?? 'SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF'}`).digest('hex'), kind: 'primary', done: { tokens: entry.tokens, ms: entry.tokens / entry.tps * 1000, tps: entry.tps },
+      endedAtMs: entry.endedAt ?? now, observedAtMs: now, expiresAtMs: now + 15_000,
+    })),
+  }));
+};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -83,6 +100,7 @@ const svc = spawn(process.execPath, ['service/main.js'], {
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
     OPENCHAMBER_GAUGE_STATE: STATE_FILE,
     OPENCHAMBER_OPENCODE_URL: FEED_URL,
+    GAUGE_PROGRESS_DIR: PROGRESS_DIR,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -136,9 +154,11 @@ ev('session.reasoning.delta', {
 });
 await sleep(120);
 let midRate = await (await svcFetch('/rate')).json();
+// A cloud step has no speed until its call ends: the time it took is part of
+// it, and an estimate from text that may arrive in one burst is not a speed.
 check(
-  'running average exists mid-turn (estimate before settle)',
-  midRate.running !== null && midRate.running.tps > 0 && midRate.running.source === 'estimate',
+  'a cloud step shows no made-up speed before its call ends',
+  midRate.running === null,
   JSON.stringify(midRate.running),
 );
 let rate = await (await svcFetch('/rate')).json();
@@ -179,10 +199,18 @@ check('last turn uses real token counts', rate.lastTurn?.source === 'tokens', JS
 check('last turn tokens = output + reasoning', rate.lastTurn?.tokens === 100, JSON.stringify(rate.lastTurn));
 check('last turn has TTFT', typeof rate.lastTurn?.ttftMs === 'number' && rate.lastTurn.ttftMs >= 300, JSON.stringify(rate.lastTurn));
 check('last turn saw reasoning', rate.lastTurn?.hasReasoning === true, JSON.stringify(rate.lastTurn));
+// 100 tokens over the whole call: 400 ms before the first word plus ~400 ms
+// of writing, so about 110 tok/s, where the writing span alone said ~190.
 check(
-  'last turn tps ≈ tokens/activeMs',
-  Math.abs(rate.lastTurn.tokensPerSecond - rate.lastTurn.tokens / (rate.lastTurn.activeMs / 1000)) < 0.01,
+  'a cloud step is timed from its call\'s start to its end',
+  rate.lastTurn.tokensPerSecond > 70 && rate.lastTurn.tokensPerSecond < 160
+    && rate.lastTurn.tokensPerSecond < rate.lastTurn.tokens / (rate.lastTurn.activeMs / 1000),
   JSON.stringify(rate.lastTurn),
+);
+check(
+  'a one-step reply rests on that step',
+  Math.abs((rate.lastTurn.lastStep?.tps ?? 0) - rate.lastTurn.tokensPerSecond) < 1e-6 && rate.lastTurn.lastStep?.source === 'tokens',
+  JSON.stringify(rate.lastTurn.lastStep),
 );
 {
   const split = rate.lastTurn?.split;
@@ -264,10 +292,9 @@ check('tool execution detected', toolRate1.toolActive === true, JSON.stringify({
 await sleep(700); // tool runs ~0.7s with no deltas: denominator must stay frozen
 let toolRate2 = await (await svcFetch('/rate')).json();
 check(
-  'headline locked while tool runs',
-  toolRate1.running !== null && toolRate2.running !== null
-    && Math.abs(toolRate2.running.tps - toolRate1.running.tps) / Math.max(1, toolRate1.running.tps) < 0.05,
-  `before=${toolRate1.running?.tps} after=${toolRate2.running?.tps}`,
+  'headline holds while a tool runs',
+  JSON.stringify(toolRate2.running) === JSON.stringify(toolRate1.running),
+  `before=${JSON.stringify(toolRate1.running)} after=${JSON.stringify(toolRate2.running)}`,
 );
 ev('session.tool.success', { sessionID: SESSION, assistantMessageID: 'msg5', id: 'tool1' });
 ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg5', ordinal: 1, delta: 'v'.repeat(200) });
@@ -379,9 +406,11 @@ check(
   (rate.lastTurn?.ttftMs ?? 0) > 1500,
   `ttft=${rate.lastTurn?.ttftMs}`,
 );
+// Every cloud step is timed from the start of its call: 100 tokens over ~2.8 s,
+// not over the 400 ms in which they arrived (~250 tok/s).
 check(
-  'time to first token is not in the divisor',
-  rate.lastTurn?.source === 'tokens' && rate.lastTurn?.tokensPerSecond > 150,
+  'a cloud step\'s wait before its first word is in its time',
+  rate.lastTurn?.source === 'tokens' && rate.lastTurn?.tokensPerSecond > 20 && rate.lastTurn?.tokensPerSecond < 60,
   JSON.stringify(rate.lastTurn),
 );
 
@@ -433,9 +462,9 @@ const freeze1 = await (await svcFetch('/rate')).json();
 await sleep(600); // model thinks with no deltas: nothing new countable
 const freeze2 = await (await svcFetch('/rate')).json();
 check(
-  'headline frozen while thinking (no new tokens, no new time)',
-  freeze1.running !== null && freeze2.running !== null && freeze2.running.tps === freeze1.running.tps,
-  `before=${freeze1.running?.tps} after=${freeze2.running?.tps}`,
+  'headline holds while the model thinks',
+  JSON.stringify(freeze2.running) === JSON.stringify(freeze1.running),
+  `before=${JSON.stringify(freeze1.running)} after=${JSON.stringify(freeze2.running)}`,
 );
 ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgF', tokens: { output: 100, reasoning: 0 } });
 ev('session.execution.succeeded', { sessionID: SESSION });
@@ -473,9 +502,8 @@ const fb1 = await (await svcFetch('/rate')).json();
 await sleep(400); // silence with unmeasurable steps: estimate must hold too
 const fb2 = await (await svcFetch('/rate')).json();
 check(
-  'fallback estimate frozen during silence',
-  fb1.running !== null && fb2.running !== null
-    && fb1.running.source === 'estimate' && fb2.running.tps === fb1.running.tps,
+  'a call whose start was missed shows no made-up speed',
+  fb1.running === null && fb2.running === null,
   `before=${JSON.stringify(fb1.running)} after=${JSON.stringify(fb2.running)}`,
 );
 ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgH', tokens: { output: 30, reasoning: 0 } });
@@ -520,7 +548,7 @@ await sleep(150);
 const mineMidTurn = await (await svcFetch(`/rate?sessionId=${SESSION}`)).json();
 check(
   'a second watch leaves this session mid-turn intact',
-  mineMidTurn.running !== null && mineMidTurn.turn.active === true,
+  mineMidTurn.busy === true && mineMidTurn.turn.active === true,
   JSON.stringify({ running: mineMidTurn.running, active: mineMidTurn.turn.active }),
 );
 check('each page reads its own session id', mineMidTurn.sessionId === SESSION, `sessionId=${mineMidTurn.sessionId}`);
@@ -600,7 +628,7 @@ rate = await (await svcFetch('/rate')).json();
 check('missed start still shows busy', rate.busy === true, JSON.stringify({ busy: rate.busy }));
 check('tool execution detected without started', rate.toolActive === true, JSON.stringify({ toolActive: rate.toolActive }));
 check('tool input counted live', rate.live.tps > 0 && rate.toolActive === true, JSON.stringify({ live: rate.live, toolActive: rate.toolActive }));
-check('running exists during tool input', rate.running !== null && rate.running.tps > 0, JSON.stringify(rate.running));
+check('no made-up speed while a cloud call writes its tool input', rate.running === null, JSON.stringify(rate.running));
 ev('session.tool.success', { sessionID: SESSION, assistantMessageID: 'msgLate', id: 'toolLate' });
 ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgLate', ordinal: 0, delta: 'z'.repeat(60) });
 await sleep(100);
@@ -791,6 +819,108 @@ check(
   rate.lastTurn === null || rate.lastTurn.tokensPerSecond < 1000,
   `tps=${rate.lastTurn?.tokensPerSecond}`,
 );
+
+// --- the headline is the step, not the turn ---------------------------------
+// The cases Michael saw (2026-11-13). A Fable step on the claude-agent provider
+// took 6.3 s from its call to its end and sent its 370 tokens in one 0.59 s
+// burst: Gauge divided by the burst and saved 624 tok/s. And one agent turn ran
+// three hours, 499 steps on GPT-6 Astra and then Splash, so a turn average hid
+// Splash's own 43–50 tok/s.
+{
+  ev('session.execution.started', { sessionID: SESSION });
+  const callAt = Date.now();
+  emit({ id: 'e', created: Date.now() + 5_700, type: 'session.step.started', data: {
+    sessionID: SESSION, assistantMessageID: 'msgFable', started: callAt, model: { id: 'claude-fable-5-2', providerID: 'claude-agent' } } });
+  ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgFable', ordinal: 0, delta: 'f'.repeat(1480) });
+  await sleep(590);
+  // The step's own start is 5.7 s before its events were published, so the
+  // whole call reads ~6.3 s on the service's clock.
+  ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgFable', tokens: { output: 283, reasoning: 87 } });
+  ev('session.execution.succeeded', { sessionID: SESSION });
+  await sleep(150);
+  rate = await (await svcFetch('/rate')).json();
+  check(
+    'a step sent in one burst reads its call\'s speed (about 59), not the burst\'s (624)',
+    rate.lastTurn?.lastStep?.tps > 45 && rate.lastTurn?.lastStep?.tps < 75,
+    JSON.stringify(rate.lastTurn?.lastStep),
+  );
+}
+{
+  ev('session.execution.started', { sessionID: SESSION });
+  for (let i = 0; i < 3; i += 1) {
+    const id = `msgAstra${i}`;
+    emit({ id: 'e', created: Date.now(), type: 'session.step.started', data: { sessionID: SESSION, assistantMessageID: id, started: Date.now(), model: { id: 'gpt-6-astra', providerID: 'openai' } } });
+    ev('session.text.delta', { sessionID: SESSION, assistantMessageID: id, ordinal: 0, delta: 'a'.repeat(400) });
+    await sleep(250);
+    ev('session.step.ended', { sessionID: SESSION, assistantMessageID: id, tokens: { output: 100, reasoning: 0 } });
+  }
+  await sleep(100);
+  const astra = await (await svcFetch('/rate')).json();
+  check('a cloud step\'s speed is the headline once it ends', astra.running?.source === 'tokens' && astra.running.tps > 200, JSON.stringify(astra.running));
+  // The chat switches to Splash mid-turn. The engine writes its own figure
+  // for the reply; the helper keeps it, and the step claims it.
+  const SPLASH = 'SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF';
+  const splashFrom = Date.now();
+  emit({ id: 'e', created: Date.now(), type: 'session.step.started', data: { sessionID: SESSION, assistantMessageID: 'msgSplash1', started: Date.now(), model: { id: SPLASH, providerID: 'splash' } } });
+  for (let i = 0; i < 6; i += 1) {
+    ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgSplash1', ordinal: 0, delta: 'b'.repeat(40) });
+    await sleep(100);
+  }
+  const unknownLocal = await (await svcFetch('/rate')).json();
+  check(
+    'a step of a model not yet known to report its own figure keeps the last step\'s speed',
+    unknownLocal.running?.source === 'tokens' && unknownLocal.running.tps === astra.running.tps,
+    JSON.stringify(unknownLocal.running),
+  );
+  ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgSplash1', tokens: { output: 60, reasoning: 0 } });
+  await sleep(100);
+  const waiting = await (await svcFetch('/rate')).json();
+  writeEngine([{ id: 's1', tokens: 1110, tps: 48.1 }]);
+  await sleep(400);
+  const local = await (await svcFetch('/rate')).json();
+  check(
+    'a local step reads Splash\'s own figure, not the turn\'s mix of models',
+    local.running?.source === 'engine' && local.running.tps === 48.1,
+    JSON.stringify({ before: waiting.running, after: local.running }),
+  );
+  // A second Splash step: its model is now known to report its own figure, so
+  // it is estimated while it writes, then takes the engine's figure.
+  emit({ id: 'e', created: Date.now(), type: 'session.step.started', data: { sessionID: SESSION, assistantMessageID: 'msgSplash2', started: Date.now(), model: { id: SPLASH, providerID: 'splash' } } });
+  for (let i = 0; i < 13; i += 1) {
+    ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgSplash2', ordinal: 0, delta: 'c'.repeat(20) });
+    await sleep(100);
+  }
+  const writing = await (await svcFetch('/rate')).json();
+  check('a local step is estimated while it writes', writing.running?.source === 'estimate' && writing.running.tps > 0, JSON.stringify(writing.running));
+  check(
+    'the curve never shows a speed the headline did not',
+    writing.curve.every((value, i) => writing.curveStart + i * writing.curveStep < splashFrom
+      || value <= Math.max(writing.running.tps, astra.running.tps, 48.1) + 0.01),
+    JSON.stringify({ curve: writing.curve, running: writing.running, from: splashFrom, start: writing.curveStart }),
+  );
+  ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgSplash2', tokens: { output: 65, reasoning: 0 } });
+  ev('session.execution.succeeded', { sessionID: SESSION });
+  await sleep(150);
+  const ended = await (await svcFetch('/rate')).json();
+  // The second step's figure lands a moment after the turn ended.
+  writeEngine([{ id: 's1', tokens: 1110, tps: 48.1, endedAt: Date.now() - 2_000 }, { id: 's2', tokens: 1801, tps: 49.3 }]);
+  let patched = ended;
+  for (let i = 0; i < 30 && patched.lastTurn?.lastStep?.source !== 'engine'; i += 1) {
+    await sleep(200);
+    patched = await (await svcFetch('/rate')).json();
+  }
+  check(
+    'the reply rests on the speed it ended at, even when that figure lands after it',
+    patched.lastTurn?.lastStep?.source === 'engine' && patched.lastTurn.lastStep.tps === 49.3,
+    JSON.stringify({ before: ended.lastTurn?.lastStep, after: patched.lastTurn?.lastStep }),
+  );
+  check(
+    'the reply\'s average stays behind Took, apart from the resting number',
+    patched.lastTurn.tokensPerSecond !== patched.lastTurn.lastStep.tps,
+    JSON.stringify({ average: patched.lastTurn.tokensPerSecond, last: patched.lastTurn.lastStep }),
+  );
+  fs.rmSync(path.join(PROGRESS_DIR, 'writer.json'), { force: true });
+}
 
 // --- the feed is the only thing the service dials ---------------------------
 // No borrowed client token, no scanning a parent's listening ports, no guessing
@@ -1032,4 +1162,5 @@ feedServer.closeAllConnections();
 feedServer.close();
 decoy.close();
 fs.rmSync(STATE_FILE, { force: true });
+fs.rmSync(PROGRESS_DIR, { recursive: true, force: true });
 process.exit(failures === 0 ? 0 : 1);

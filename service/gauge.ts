@@ -110,6 +110,10 @@ const MAX_ENTRIES = 16;
 const MAX_FILE_BYTES = 64 * 1024;
 const PROGRESS_EVERY_MS = 400;
 
+/** The helper's model key, as it hashes the model id OpenCode asked for. */
+export const modelKey = (modelId: string): string =>
+  createHash('sha256').update(`gauge-model-v1\0${modelId}`).digest('hex');
+
 /** The helper's session key: never the raw id on disk. */
 export const sessionKey = (sessionId: string): string =>
   createHash('sha256').update(`gauge-session-v1\0${sessionId}`).digest('hex');
@@ -210,6 +214,77 @@ export const takeReadMs = (sessionIds: string[]): number => {
     }
   }
   return sum;
+};
+
+/**
+ * The engine's own figures for one finished local reply: what llama.cpp's
+ * server, or Splash, put in the reply's closing `timings` frame. The helper
+ * keeps each for its file's lifetime (15 s) so the step that asked for it can
+ * claim it after the step has ended.
+ */
+export type EngineFigure = {
+  id: string;
+  sessionKey: string;
+  /** The hashed model id the request was made for (`modelKey`), so a figure only goes to a step of that model. */
+  modelKey: string | null;
+  /** Tokens the engine wrote. */
+  tokens: number;
+  /** The engine's own rate: tokens over first token to done. */
+  tps: number;
+  endedAt: number;
+};
+
+export const readEngineEntries = (dir: string, now: number): EngineFigure[] => {
+  const out: EngineFigure[] = [];
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir).filter((name) => !name.startsWith('.') && name.endsWith('.json')).slice(0, MAX_WRITERS);
+  } catch {
+    return out;
+  }
+  for (const name of names) {
+    let doc: unknown;
+    try {
+      const file = path.join(dir, name);
+      const info = fs.lstatSync(file);
+      if (!info.isFile() || info.size > MAX_FILE_BYTES) continue;
+      doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      continue;
+    }
+    const record = doc as { schemaVersion?: unknown; entries?: unknown };
+    if (!record || record.schemaVersion !== 1 || !Array.isArray(record.entries)) continue;
+    for (const raw of record.entries.slice(0, MAX_ENTRIES)) {
+      const e = raw as Record<string, unknown>;
+      const done = e?.done as Record<string, unknown> | undefined;
+      if (!e || typeof e.requestID !== 'string' || typeof e.sessionKey !== 'string' || !done) continue;
+      if (e.kind !== 'primary' && e.kind !== 'compaction') continue;
+      if (typeof e.expiresAtMs !== 'number' || e.expiresAtMs <= now) continue;
+      if (typeof e.endedAtMs !== 'number' || !Number.isFinite(e.endedAtMs) || e.endedAtMs > now + 1_000) continue;
+      const tokens = done.tokens;
+      const tps = done.tps;
+      if (!Number.isSafeInteger(tokens) || (tokens as number) <= 0) continue;
+      if (typeof tps !== 'number' || !Number.isFinite(tps) || tps <= 0 || tps > 5_000) continue;
+      const modelKey = typeof e.modelKey === 'string' ? e.modelKey : null;
+      out.push({ id: e.requestID, sessionKey: e.sessionKey, modelKey, tokens: tokens as number, tps, endedAt: e.endedAtMs });
+    }
+  }
+  return out;
+};
+
+let engineCache: { at: number; entries: EngineFigure[] } | null = null;
+const ENGINE_EVERY_MS = 200;
+
+/**
+ * Finished local replies the helper has written, read at most five times a
+ * second. Read whenever a step asks, page or no page: a reply's own figure is
+ * what its speed is, not a reading that only matters while someone looks.
+ */
+export const engineFigures = (now: number, fresh = false): EngineFigure[] => {
+  if (fresh || !engineCache || now - engineCache.at >= ENGINE_EVERY_MS) {
+    engineCache = { at: now, entries: readEngineEntries(PROGRESS_DIR, now) };
+  }
+  return engineCache.entries;
 };
 
 let progressCache: { at: number; entries: Array<PromptReading & { sessionKey: string }> } | null = null;

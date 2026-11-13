@@ -19,10 +19,10 @@ is Memory, when the Mac's memory is under amber or red pressure.
 
 | | |
 |---|---|
-| headline | the running turn's average speed, greyed and labelled `Last reply` when nothing is arriving. The dot is lit while the chat works and stays steady. The state sits on the right: `running tool`, `waiting for permission`, the prompt a local llama.cpp chat is reading (`reading prompt 40% · 6.0s left`), `compacting` while the chat rewrites its own history, or the ComfyUI render running now (`render 8 / 20 · 30s · 1 queued`). A watched chat with nothing to report says `no reply yet`, and the dot goes quiet when the chat has nothing to say |
-| curve | the last 30 s of generation rate, one point per 1.25 s, dimming out on the left. While there is nothing to draw the band closes up |
+| headline | the speed of the step being written (one model call), or of the last step that has one; once the reply is over, the speed it ended at, greyed and labelled `Last reply`. The dot is lit while the chat works and stays steady. The state sits on the right: `running tool`, `waiting for permission`, the prompt a local llama.cpp chat is reading (`reading prompt 40% · 6.0s left`), `compacting` while the chat rewrites its own history, or the ComfyUI render running now (`render 8 / 20 · 30s · 1 queued`). A watched chat with nothing to report says `no reply yet`, and the dot goes quiet when the chat has nothing to say |
+| curve | the last 30 s of what the headline said while words were arriving, one point per 1.25 s, dimming out on the left; it drops to the floor while nothing arrives, and never shows a speed the headline did not. While there is nothing to draw the band closes up |
 | progress bar | under the headline, only while a prompt is read or a render runs |
-| `Took` | how long the last reply took (`48s`). Behind it: the receipt, a bar cut into `reading`, `waiting`, `writing` and `tools` that add up to the whole reply; what most of the time was (`writing`); the speed (`measured` when the provider reported token counts, `estimated` otherwise); and the time to the first word |
+| `Took` | how long the last reply took (`48s`). Behind it: the receipt, a bar cut into `reading`, `waiting`, `writing` and `tools` that add up to the whole reply; what most of the time was (`writing`); the reply's average speed over its steps (`measured` when the engine or the provider reported token counts, `estimated` otherwise); and the time to the first word |
 | `Model` | the name of the model the chat is on (`MiniMax-M3.1-Flash`). Behind it: what the chat has cost, the cache hit rate of the last settled step and of the whole conversation, the model the local engine holds with its quantization (`this model · IQ3_XXS` when it is the chat's own), and the full identifier |
 | `Memory` | the Mac's memory in use (`41.2 GB`); amber at a kernel warning, red at a critical level. Behind it: the meter, the total, the swap in use and the pressure level. A machine that is not a Mac gets no Memory line at all |
 
@@ -49,12 +49,28 @@ asks for reduced motion.
 
 ## How it measures
 
-**Speed** is measured from OpenChamber's own event stream: the characters of a
-reply as they arrive, divided by the span they cover. There is no tokenizer, so
-the live number starts at `characters ÷ 4` and is corrected toward the
-provider's own token count as each step settles (`measured` once it has).
-Tool-call JSON past 200 characters and any pause longer than a second are left
-out of the average.
+**Speed** is the speed of one step: one call to the model. An agent turn can
+run for hours across many steps and more than one model, and an average over
+all of it says little about what the chat is doing now, so the headline follows
+the step.
+
+- A step on a local llama.cpp engine (Splash included) reads **the engine's own
+  figure**: the `timings` llama.cpp's server puts in the last frame of every
+  streamed reply, tokens written over the time from the first token to the
+  last. It is the same number Splash writes in its log (`Done · 49.9 tok/s`).
+  While such a step is still writing, Gauge estimates it from the characters
+  arriving (`characters ÷ 4`, corrected toward the model's real ratio), over
+  the same span.
+- Every other step, a cloud model's included, is **timed from the start of its
+  call to its end, less the tools it ran**: its reported tokens over that time.
+  Some providers send a step's text in one burst, so the span the words arrived
+  in is not a speed (a 370-token step that landed in 0.59 s of a 6.3 s call
+  would read 624 tok/s; timed this way it reads 59). A cloud step has no speed
+  until its call ends, so the headline keeps the last step's until then.
+
+Between steps the last step's speed stays, grey, beside what is happening.
+LM Studio and Ollama send no `timings`, so their steps are timed like a cloud
+model's.
 
 **The prompt reading** comes from the engine's own `return_progress` frames:
 llama.cpp's server puts the prompt's progress on the stream when a request asks
@@ -62,8 +78,10 @@ for it, with `total`, `cache`, `processed` and `time_ms`. A small plugin
 OpenChamber adds to its OpenCode adds `return_progress: true` to a streaming
 request to an engine it recognizes, watches that same response for
 `prompt_progress` frames until the reply starts, and writes the counters to
-`~/.cache/gauge/prompt-progress`. The service reads that file. No prompt, reply,
-header, key or raw session id is written: the session is a hash.
+`~/.cache/gauge/prompt-progress`. It keeps watching to the reply's last frame
+for the engine's `timings`, and writes those too, for 15 seconds. The service
+reads that folder. No prompt, reply, header, key or raw session or model id is
+written: both are hashes, and the bytes of the reply pass through unchanged.
 
 Which engines are asked is decided without guessing and without a credential. A
 provider named for one (`splash`, `llama-swap`, `llama-server`, `llama.cpp`) is
@@ -78,8 +96,8 @@ provider's requests leave exactly as OpenCode wrote them. A yes is kept for five
 minutes; a no, or a probe that never answered, is re-asked after thirty seconds.
 
 **The receipt** is the turn from its start to its end, without the time spent
-waiting on you for a permission or an answer. `writing` is the span the speed
-is measured over and `tools` is the time tools ran; `reading` is the engine's own
+waiting on you for a permission or an answer. `writing` is the time words were
+arriving and `tools` is the time tools ran; `reading` is the engine's own
 prefill time, known only for a local llama.cpp chat and only while a Work Status
 panel was open to take the reading; `waiting` is what is left, the model before
 its first word and between steps. A cloud reply has no `reading` slice: that time
