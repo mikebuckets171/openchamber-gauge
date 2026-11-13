@@ -166,7 +166,7 @@ const RATE = {
 };
 
 /** Run one built bundle in a fake frame and collect what it posts to its host. */
-const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false, model: 'page-model' }, rate = RATE, locale = 'zh', serviceDenied = false, slotWidth = 0, pushAnswer = true } = {}) => {
+const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false, model: 'page-model' }, rate = RATE, locale = 'zh', serviceDenied = false, slotWidth = 0, pushAnswer = true, device = undefined } = {}) => {
   const source = fs.readFileSync(path.join(ROOT, bundle), 'utf8');
   const posted = [];
   const listeners = [];
@@ -291,6 +291,7 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
       settings: {},
       locale,
       theme: { mode: 'dark', tokens: TOKENS },
+      ...(device ? { device } : {}),
     },
   });
 
@@ -312,6 +313,7 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
   return {
     posted,
     rootEl: root,
+    htmlEl: documentElement,
     root: () => root.textContent,
     /** What the host does when the service posts a reading to the open frames. */
     push: (topic, data) => dispatch({ channel, v: version, type: 'service-event', payload: { topic, data } }),
@@ -499,9 +501,31 @@ for (const surface of SURFACES) {
     JSON.stringify(plainLines.map((line) => line.className)),
   );
   check(
-    `${surface.name}: an idle section has an empty divider`,
-    widthOf(findByClass(findByClass(plain.rootEl, 'rule'), 'fill')) === '0%',
+    `${surface.name}: an idle section has no progress bar`,
+    String(findByClass(plain.rootEl, 'rule').hidden) === 'true'
+      && widthOf(findByClass(findByClass(plain.rootEl, 'rule'), 'fill')) === '0%',
   );
+
+  // Folded: the headline is the whole section until it is tapped, and a second
+  // tap folds the lines away again, closing whatever was open behind one.
+  {
+    const hero = findByClass(plain.rootEl, 'hero');
+    check(`${surface.name}: the section starts folded`, hero.getAttribute('aria-expanded') === 'false'
+      && plainLines.every((line) => String(line.hidden) === 'true'), JSON.stringify(plainLines.map((line) => line.hidden)));
+    const resizes = () => plain.posted.filter((message) => message && message.type === 'resize').map((message) => message.payload.height);
+    const before = resizes().at(-1);
+    hero.click();
+    check(`${surface.name}: a tap on the headline shows the three lines`, hero.getAttribute('aria-expanded') === 'true'
+      && plainLines.every((line) => String(line.hidden) === 'false'), JSON.stringify(plainLines.map((line) => line.hidden)));
+    check(`${surface.name}: the headline itself is a button`, hero.tagName === 'BUTTON' && hero.getAttribute('type') === 'button');
+    findByClass(plainLines[1], 'line').click();
+    hero.click();
+    check(`${surface.name}: a second tap folds them away, and closes the open one`,
+      hero.getAttribute('aria-expanded') === 'false' && plainLines.every((line) => String(line.hidden) === 'true' && !isOpen(line)),
+      JSON.stringify(plainLines.map((line) => line.className)));
+    check(`${surface.name}: the frame follows the fold`, resizes().at(-1) === before, JSON.stringify(resizes()));
+    hero.click();
+  }
 
   // Tapping: a line opens, a second tap on another closes the first, and a tap
   // on the open one closes it. One line is open at a time.
@@ -539,10 +563,10 @@ for (const surface of SURFACES) {
   };
   const receipt = runGuest(surface.bundle, surface.url, { locale: 'en', rate: { ...RATE, running: null, lastTurn: LAST_TURN } });
   await settle();
-  const replyLine = findLine(receipt.rootEl, 'Last reply');
+  const replyLine = findLine(receipt.rootEl, 'Took');
   check(
-    `${surface.name}: the reply line says how long and what most of it was`,
-    replyLine !== null && findByClass(replyLine, 'v').textContent === '48s · mostly writing',
+    `${surface.name}: the reply line says how long it took, and what most of it was waits behind it`,
+    replyLine !== null && findByClass(replyLine, 'v').textContent === '48s' && replyLine.textContent.includes('Mostlywriting'),
     JSON.stringify(replyLine && findByClass(replyLine, 'v').textContent),
   );
   check(
@@ -569,23 +593,23 @@ for (const surface of SURFACES) {
     rate: { ...RATE, running: null, lastTurn: { ...LAST_TURN, split: { totalMs: 48_000, readMs: 20_000, waitMs: 6_000, writeMs: 13_000, toolMs: 9_000 } } },
   });
   await settle();
-  const localReply = findLine(localReceipt.rootEl, 'Last reply');
+  const localReply = findLine(localReceipt.rootEl, 'Took');
   check(
     `${surface.name}: a local reply has a reading slice`,
-    localReply !== null && findByClass(localReply, 'v').textContent === '48s · mostly reading'
+    localReply !== null && findByClass(localReply, 'v').textContent === '48s' && localReply.textContent.includes('Mostlyreading')
       && findByClass(localReply, 'sub').textContent.startsWith('20s reading'),
     JSON.stringify(localReply && localReply.textContent),
   );
 
-  // A turn recorded by an older service has no receipt: its speed stands in,
-  // and a split that does not add up is not drawn.
+  // A turn recorded by an older service has no receipt: the line has no length
+  // to give, its speed waits behind it, and a split that does not add up is not drawn.
   for (const [name, split] of [['absent', undefined], ['broken', { ...SPLIT, waitMs: 60_000 }]]) {
     const old = runGuest(surface.bundle, surface.url, { locale: 'en', rate: { ...RATE, running: null, lastTurn: { ...LAST_TURN, split } } });
     await settle();
-    const oldLine = findLine(old.rootEl, 'Last reply');
+    const oldLine = findLine(old.rootEl, 'Took');
     check(
-      `${surface.name}: an ${name} receipt falls back to the speed`,
-      oldLine !== null && findByClass(oldLine, 'v').textContent === '38.2 tok/s'
+      `${surface.name}: an ${name} receipt gives no length and keeps the speed behind the line`,
+      oldLine !== null && findByClass(oldLine, 'v').textContent === '—' && oldLine.textContent.includes('38.2 tok/s')
         && collectByClass(oldLine, 'seg').every((seg) => widthOf(seg) === '0%'),
       JSON.stringify(oldLine && oldLine.textContent),
     );
@@ -615,10 +639,21 @@ for (const surface of SURFACES) {
     widthOf(findByClass(findByClass(busy.rootEl, 'rule'), 'fill')),
   );
   check(`${surface.name}: a job adds no line`, collectByClass(busy.rootEl, 'row').length === 3);
+  check(`${surface.name}: a running job draws its progress bar`, String(findByClass(busy.rootEl, 'rule').hidden) === 'false');
+  // Amber memory is the one line that shows itself on a folded section.
+  {
+    const lines = collectByClass(busy.rootEl, 'row');
+    check(
+      `${surface.name}: amber memory shows its line on a folded section, and only it`,
+      findByClass(busy.rootEl, 'hero').getAttribute('aria-expanded') === 'false'
+        && String(lines[0].hidden) === 'true' && String(lines[1].hidden) === 'true' && String(lines[2].hidden) === 'false',
+      JSON.stringify(lines.map((line) => line.hidden)),
+    );
+  }
   const memoryLine = findLine(busy.rootEl, 'Memory');
   check(
     `${surface.name}: the memory line shows the Mac's memory`,
-    memoryLine !== null && findByClass(memoryLine, 'v').textContent === '34.0 / 48.0 GB',
+    memoryLine !== null && findByClass(memoryLine, 'v').textContent === '34.0 GB' && memoryLine.textContent.includes('Total48.0 GB'),
     JSON.stringify(memoryLine && memoryLine.textContent),
   );
   check(
@@ -641,8 +676,8 @@ for (const surface of SURFACES) {
   }
   const modelLine = findLine(busy.rootEl, 'Model');
   check(
-    `${surface.name}: the model line names the model the engine holds`,
-    modelLine !== null && findByClass(modelLine, 'v').textContent === 'Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS · $0.42',
+    `${surface.name}: the model line names the model the engine holds, and nothing else`,
+    modelLine !== null && findByClass(modelLine, 'v').textContent === 'Qwen3.8-Flash-Next-GSQ-RCO',
     JSON.stringify(modelLine && findByClass(modelLine, 'v').textContent),
   );
   check(
@@ -671,8 +706,8 @@ for (const surface of SURFACES) {
   await settle();
   const cloudLine = findLine(cloud.rootEl, 'Model');
   check(
-    `${surface.name}: a cloud chat names the cloud model and its cost`,
-    cloudLine !== null && findByClass(cloudLine, 'v').textContent === 'MiniMax-M3.1-Flash · $0.42',
+    `${surface.name}: a cloud chat names the cloud model, its cost behind the line`,
+    cloudLine !== null && findByClass(cloudLine, 'v').textContent === 'MiniMax-M3.1-Flash',
     JSON.stringify(cloudLine && findByClass(cloudLine, 'v').textContent),
   );
   check(
@@ -711,8 +746,8 @@ for (const surface of SURFACES) {
   await settle();
   const localLine = findLine(local.rootEl, 'Model');
   check(
-    `${surface.name}: a local chat names the model with its quantization and no cost`,
-    localLine !== null && findByClass(localLine, 'v').textContent === 'Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS'
+    `${surface.name}: a local chat names the model, its quantization behind the line and no cost`,
+    localLine !== null && findByClass(localLine, 'v').textContent === 'Qwen3.8-Flash-Next-GSQ-RCO'
       && localLine.textContent.includes('Cost this chat—')
       && localLine.textContent.includes('Engine holdsthis model · IQ3_XXS'),
     JSON.stringify(localLine && localLine.textContent),
@@ -952,10 +987,10 @@ for (const surface of SURFACES) {
       },
     });
     await settle();
-    const longLine = findLine(longTurn.rootEl, 'Last reply');
+    const longLine = findLine(longTurn.rootEl, 'Took');
     check(
       `${surface.name}: a long reply reads as minutes`,
-      longLine !== null && findByClass(longLine, 'v').textContent === '2m 5s · mostly writing'
+      longLine !== null && findByClass(longLine, 'v').textContent === '2m 5s'
         && findByClass(longLine, 'sub').textContent === '5.0s waiting · 2m writing'
         && longLine.textContent.includes('First word1m 1s'),
       JSON.stringify(longLine && longLine.textContent),
@@ -1071,19 +1106,19 @@ for (const surface of SURFACES) {
       rate: { ...RATE, lastTurn: { ...turn, split: { totalMs: 20_460_000, readMs: 0, waitMs: 60_000, writeMs: 400_000, toolMs: 20_000_000 } } },
     });
     await settle();
-    check(`${surface.name}: a reply of hours reads in hours`, hours.root().includes('5h 41m · mostly tools') && !hours.root().includes('341m'), JSON.stringify(hours.root()));
+    check(`${surface.name}: a reply of hours reads in hours`, hours.root().includes('Took5h 41m') && hours.root().includes('Mostlytools') && !hours.root().includes('341m'), JSON.stringify(hours.root()));
     const asked = runGuest(surface.bundle, surface.url, {
       locale: 'en',
       rate: { ...RATE, lastTurn: { ...turn, askMs: 3_600_000, split: { totalMs: 300_000, readMs: 0, waitMs: 60_000, writeMs: 200_000, toolMs: 40_000 } } },
     });
     await settle();
-    check(`${surface.name}: a reply that mostly waited on the person says so`, asked.root().includes('1h 5m · mostly waiting on you') && asked.root().includes('1h waiting on you'), JSON.stringify(asked.root()));
+    check(`${surface.name}: a reply that mostly waited on the person says so`, asked.root().includes('Took1h 5m') && asked.root().includes('Mostlywaiting on you') && asked.root().includes('1h waiting on you'), JSON.stringify(asked.root()));
     const brief = runGuest(surface.bundle, surface.url, {
       locale: 'en',
       rate: { ...RATE, lastTurn: { ...turn, askMs: 20_000, split: { totalMs: 300_000, readMs: 0, waitMs: 60_000, writeMs: 200_000, toolMs: 40_000 } } },
     });
     await settle();
-    check(`${surface.name}: a short wait on the person stays out of the headline wording`, brief.root().includes('5m · mostly writing'), JSON.stringify(brief.root()));
+    check(`${surface.name}: a short wait on the person stays out of the headline wording`, brief.root().includes('Took5m') && brief.root().includes('Mostlywriting'), JSON.stringify(brief.root()));
   }
 
   // The service tells a page whether this host takes what it posts. Told no, the
@@ -1139,6 +1174,8 @@ for (const surface of SURFACES) {
       },
     });
     await settle();
+    check(`${surface.name}: a Mac's quiet memory line waits for the tap`, String(findLine(onMac.rootEl, 'Memory')?.hidden) === 'true', JSON.stringify(onMac.root()));
+    findByClass(onMac.rootEl, 'hero').click();
     check(`${surface.name}: a Mac keeps its memory line`, String(findLine(onMac.rootEl, 'Memory')?.hidden) === 'false', JSON.stringify(onMac.root()));
   }
 
@@ -1155,6 +1192,19 @@ for (const surface of SURFACES) {
       denied.root().includes('Allow Gauge to read your sessions'),
       JSON.stringify(denied.root()),
     );
+  }
+
+  // A finger gets 44 px lines: the page marks what the host says points at it.
+  {
+    const touch = runGuest(surface.bundle, surface.url, { locale: 'en', device: { formFactor: 'phone', pointer: 'coarse', insets: { top: 0, right: 0, bottom: 0, left: 0 } } });
+    await settle();
+    check(`${surface.name}: a phone's frame is marked for a finger`, touch.htmlEl.getAttribute('data-pointer') === 'coarse', String(touch.htmlEl.getAttribute('data-pointer')));
+    check(`${surface.name}: a host that says nothing leaves the mark off`, direct.htmlEl.getAttribute('data-pointer') === '', String(direct.htmlEl.getAttribute('data-pointer')));
+    const html = fs.readFileSync(path.join(ROOT, 'status/index.html'), 'utf8');
+    check(`${surface.name}: a finger's lines are 44 px tall`, /\[data-pointer="coarse"\] \.line \{ min-height: 2\.75rem; \}/.test(html) && /@media \(pointer: coarse\)/.test(html));
+    check(`${surface.name}: the dot does not blink`, !/@keyframes/.test(html) && !/animation:\s*pulse/.test(html));
+    const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+    check(`${surface.name}: the section starts at one line's height`, manifest.openchamber.contributes.statusSection.height <= 64, String(manifest.openchamber.contributes.statusSection.height));
   }
 
   // English is the page's own language until the host says otherwise.

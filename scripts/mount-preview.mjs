@@ -100,10 +100,12 @@ fs.writeFileSync(path.join(OUT_DIR, 'section.html'), sectionHtml);
  * sits behind a line. The shipped page is not touched: this is the harness's
  * own copy, and the tap is one a person would make.
  */
-const tappedPage = (label) => {
-  const file = `section-${label.replace(/[^a-z]/gi, '').toLowerCase()}.html`;
-  const tap = `<script>/* harness only: open "${label}" the way a tap does */
+const tappedPage = (label, { unfold = true, touch = false } = {}) => {
+  const file = `section-${String(label ?? 'none').replace(/[^a-z]/gi, '').toLowerCase()}${unfold ? '-open' : ''}${touch ? '-touch' : ''}.html`;
+  const tap = `<script>/* harness only: tap the headline, then "${label}", the way a person does */
 addEventListener('load', () => setTimeout(() => {
+  ${touch ? "document.documentElement.setAttribute('data-pointer', 'coarse');" : ''}
+  ${unfold ? "document.querySelector('.hero')?.click();" : ''}
   const button = [...document.querySelectorAll('.row .line')]
     .find((line) => line.querySelector('.k')?.textContent === ${JSON.stringify(label)});
   button?.click();
@@ -112,10 +114,14 @@ addEventListener('load', () => setTimeout(() => {
   return file;
 };
 
-/** One mounted section: `open` names a line to tap, so its detail shows. */
-const panel = (name, title, { width, open } = {}) => `
+/**
+ * One mounted section. `unfold` taps the headline so the three lines show;
+ * `open` then names a line to tap, so its detail shows too; `touch` marks the
+ * frame the way a phone host does.
+ */
+const panel = (name, title, { width, open, unfold, touch } = {}) => `
   <figure class="shot"><figcaption>${title}</figcaption>
-  <iframe style="width:${width}px" src="${open ? tappedPage(open) : 'section.html'}" data-case="${name}" loading="eager"></iframe></figure>`;
+  <iframe style="width:${width}px" src="${open || unfold || touch ? tappedPage(open ?? null, { unfold: !!(unfold || open), touch: !!touch }) : 'section.html'}" data-case="${name}" loading="eager"></iframe></figure>`;
 
 // What a host does: answer hello, answer the service's routes, and take the
 // section's height report and size the frame to it.
@@ -160,8 +166,12 @@ ${body}
 <script>${HOST_SCRIPT}</script></body></html>`;
 
 const checks = page('Gauge mounted', `
-<h2>300 px wide</h2>
-<div class="grid">${panel('idle', 'idle: the band closes, the number is named', { width: 300 })}${panel('writing', 'writing: band open', { width: 300 })}${panel('empty', 'a chat with no reply yet', { width: 300 })}</div>
+<h2>300 px wide, folded</h2>
+<div class="grid">${panel('idle', 'idle: one line', { width: 300 })}${panel('writing', 'writing: amber memory shows itself', { width: 300 })}${panel('empty', 'a chat with no reply yet', { width: 300 })}</div>
+<h2>300 px wide, opened</h2>
+<div class="grid">${panel('idle', 'idle, headline tapped', { width: 300, unfold: true })}${panel('idle', 'Took tapped', { width: 300, open: 'Took' })}${panel('idle', 'Model tapped', { width: 300, open: 'Model' })}${panel('writing', 'writing, Memory tapped', { width: 300, open: 'Memory' })}</div>
+<h2>a phone, 360 px, for a finger</h2>
+<div class="grid">${panel('idle', 'folded', { width: 360, touch: true })}${panel('idle', 'opened', { width: 360, touch: true, unfold: true })}</div>
 <h2>470 px wide</h2>
 <div class="grid">${panel('reading', 'a llama.cpp engine reading the prompt', { width: 470 })}${panel('compacting', 'a prompt being compacted', { width: 470 })}${panel('offmac', 'a machine with no memory reading', { width: 470 })}</div>
 <h2>the refusals</h2>
@@ -170,7 +180,7 @@ const checks = page('Gauge mounted', `
 
 // The README's picture: three real states, each as tall as the section says it is.
 const photo = page('Gauge', `
-<div class="grid">${panel('idle', 'Cloud chat, idle', { width: 470, open: 'Last reply' })}${panel('writing', 'Local chat, writing', { width: 470 })}${panel('reading', 'Reading the prompt', { width: 470 })}</div>
+<div class="grid">${panel('idle', 'Opened, after a cloud reply', { width: 470, unfold: true })}${panel('writing', 'Folded, writing: amber memory shows itself', { width: 470 })}${panel('reading', 'Reading the prompt', { width: 470 })}</div>
 `);
 
 const written = ['index.html', 'photo.html'].map((name) => {

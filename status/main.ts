@@ -135,9 +135,10 @@ const COPY = {
     measured: '实测',
     estimated: '估计',
     noReasoning: '无推理数据',
-    inProgress: '进行中',
     lastReply: '上轮',
+    took: '用时',
     mostly: '主要是',
+    totalMemory: '总内存',
     askYou: '等你',
     read: '读取提示',
     wait: '等待',
@@ -179,9 +180,10 @@ const COPY = {
     measured: 'measured',
     estimated: 'estimated',
     noReasoning: 'no reasoning data',
-    inProgress: 'in progress',
     lastReply: 'Last reply',
-    mostly: 'mostly',
+    took: 'Took',
+    mostly: 'Mostly',
+    totalMemory: 'Total',
     askYou: 'waiting on you',
     read: 'reading',
     wait: 'waiting',
@@ -286,14 +288,21 @@ const el = (tag: string, className: string, text?: string): HTMLElement => {
 
 // The headline: the speed, its unit, and the state on the far right. The state
 // also carries the heavy job running now, so no line appears for it.
-const hero = el('div', 'hero');
+//
+// Folded, the headline is all the section shows; a tap on it opens the three
+// lines and a second tap folds them away. The section always starts folded.
+const hero = el('button', 'hero');
+hero.setAttribute('type', 'button');
+hero.setAttribute('aria-expanded', 'false');
 const dot = el('span', 'dot');
 const valueEl = el('span', 'value', '—');
 const unitEl = el('span', 'unit');
 const captionEl = el('span', 'cap');
 captionEl.hidden = true;
 const stateEl = el('span', 'state');
-hero.append(dot, valueEl, unitEl, captionEl, stateEl);
+const heroChevron = el('span', 'chev', '›');
+heroChevron.setAttribute('aria-hidden', 'true');
+hero.append(dot, valueEl, unitEl, captionEl, stateEl, heroChevron);
 
 const sparkEl = el('div', 'sparkrow');
 const sparkParts = makeSparkSvg(SPARK_W, SPARK_H);
@@ -311,11 +320,12 @@ sparkEl.append(sparkParts.svg);
 const noticeEl = el('div', 'notice');
 noticeEl.hidden = true;
 
-// The divider under the curve doubles as the progress bar of the job in the
-// headline: it fills while a prompt is read or a render runs.
+// The progress bar of the job in the headline, right under it: drawn only
+// while a prompt is read or a render runs.
 const rule = el('div', 'rule');
 const ruleFill = el('i', 'fill');
 rule.append(ruleFill);
+rule.hidden = true;
 
 /**
  * One line: a label and the one value worth a glance. A tap opens what is
@@ -376,9 +386,7 @@ const makeLine = (key: string): Line => {
   button.setAttribute('aria-expanded', 'false');
   const label = el('span', 'k');
   const value = el('span', 'v', '—');
-  const chevron = el('span', 'chev', '›');
-  chevron.setAttribute('aria-hidden', 'true');
-  button.append(label, value, chevron);
+  button.append(label, value);
   const shell = el('div', 'det');
   const detail = el('div', 'in');
   shell.append(detail);
@@ -412,22 +420,14 @@ for (const name of SLICES) {
   segs.append(fill);
 }
 const receiptCaption = el('div', 'sub', '—');
+const itemMostly = makeItem();
 const itemSpeed = makeItem();
 const itemFirst = makeItem();
-lineReply.detail.append(segs, receiptCaption, itemSpeed.root, itemFirst.root);
+lineReply.detail.append(segs, receiptCaption, itemMostly.root, itemSpeed.root, itemFirst.root);
 
-// Model: the model in play and what the chat has cost. Behind it, the cost on
-// its own, the cache hit rates, the local engine's reading and the full name.
+// Model: the model in play. Behind it, what the chat has cost, the cache hit
+// rates, the local engine's reading with its quantization, and the full name.
 const lineModel = makeLine('model');
-// The model value is built from parts so an over-long name is what gives way:
-// the quantization and the cost at its end stay readable.
-const modelParts = [el('span', 'part'), el('span', 'part keep'), el('span', 'part keep')];
-const modelJoiners = [el('span', 'join', ' · '), el('span', 'join', ' · ')];
-// The parts are the whole value: the dash makeLine put there is cleared so a
-// stale one cannot sit in front of them.
-lineModel.value.textContent = '';
-lineModel.value.className = 'v pieces';
-lineModel.value.append(modelParts[0], modelJoiners[0], modelParts[1], modelJoiners[1], modelParts[2]);
 const itemCost = makeItem();
 const itemCache = makeItem();
 const cacheMeters = makeMeters(2);
@@ -440,11 +440,38 @@ lineModel.detail.append(itemCost.root, itemCache.root, cacheMeters.root, itemEng
 // kernel's own pressure level.
 const lineMemory = makeLine('memory');
 const memoryMeters = makeMeters(1);
+const itemTotal = makeItem();
 const itemSwap = makeItem();
 const itemPressure = makeItem();
-lineMemory.detail.append(memoryMeters.root, itemSwap.root, itemPressure.root);
+lineMemory.detail.append(memoryMeters.root, itemTotal.root, itemSwap.root, itemPressure.root);
 
 rows.append(lineReply.root, lineModel.root, lineMemory.root);
+
+/** Whether the three lines show. Nothing remembers it: every mount starts folded. */
+let unfolded = false;
+/** Whether this machine has a memory reading at all; off a Mac it has none. */
+let memoryKnown = true;
+/** Amber or red memory is the one line that shows itself on a folded section. */
+let memoryAlarm = false;
+
+const applyFold = (): void => {
+  hero.setAttribute('aria-expanded', unfolded ? 'true' : 'false');
+  lineReply.root.hidden = !unfolded;
+  lineModel.root.hidden = !unfolded;
+  lineMemory.root.hidden = !memoryKnown || !(unfolded || memoryAlarm);
+};
+
+hero.addEventListener('click', () => {
+  unfolded = !unfolded;
+  // Folding puts away what was open behind a line too.
+  if (!unfolded && openKey !== null) {
+    openKey = null;
+    applyOpen();
+  }
+  applyFold();
+  fitHeight();
+});
+applyFold();
 
 let lastHeight = 0;
 
@@ -688,9 +715,14 @@ let replyWasActive = false;
 let replySession: string | null = null;
 let replyEndedAt: number | null = null;
 
-/** The reply line: the finished turn, its receipt, its speed and its first word. */
+/**
+ * The reply line: how long the finished turn took. Behind it, the receipt,
+ * what most of the time was, its speed and its first word.
+ */
 const paintReply = (rate: RateResponse | null): void => {
-  lineReply.label.textContent = copy.lastReply;
+  // The headline already names the last reply, so the line says what it adds.
+  lineReply.label.textContent = copy.took;
+  itemMostly.label.textContent = copy.mostly;
   itemSpeed.label.textContent = copy.speed;
   itemFirst.label.textContent = copy.firstWord;
   const lt = rate?.lastTurn ?? null;
@@ -700,27 +732,23 @@ const paintReply = (rate: RateResponse | null): void => {
   if (lt && split) {
     const top = biggestSlice(split);
     // The time a permission or a question sat open is the person's, so it is
-    // outside the receipt; when it outweighs everything in it, the line says so
-    // over the whole stretch instead of blaming the largest slice of the rest.
+    // outside the receipt; when it outweighs everything in it, the line counts
+    // the whole stretch and the details say whose time most of it was.
     const ask = typeof lt.askMs === 'number' && Number.isFinite(lt.askMs) && lt.askMs >= 1000 ? lt.askMs : 0;
     const askMost = ask > 0 && (!top || ask > sliceMs(split, top));
-    lineReply.value.textContent = askMost
-      ? `${formatSecs(split.totalMs + ask)} · ${copy.mostly} ${copy.askYou}`
-      : top
-        ? `${formatSecs(split.totalMs)} · ${copy.mostly} ${copy[top]}`
-        : formatSecs(split.totalMs);
+    lineReply.value.textContent = formatSecs(askMost ? split.totalMs + ask : split.totalMs);
+    itemMostly.value.textContent = askMost ? copy.askYou : top ? copy[top] : '—';
     receiptCaption.textContent = [
       ...SLICES
         .filter((name) => sliceMs(split, name) >= 50)
         .map((name) => `${formatSecs(sliceMs(split, name))} ${copy[name]}`),
       ...(ask > 0 ? [`${formatSecs(ask)} ${copy.askYou}`] : []),
     ].join(' · ') || '—';
-  } else if (lt) {
-    // A turn an older service recorded: its speed is all there is.
-    lineReply.value.textContent = `${formatTps(lt.tokensPerSecond)} ${copy.unit}`;
-    receiptCaption.textContent = '—';
   } else {
-    lineReply.value.textContent = turnActive ? copy.inProgress : '—';
+    // No finished turn, or one an older service recorded without its timing:
+    // there is no length to give, and its speed waits behind the line.
+    lineReply.value.textContent = '—';
+    itemMostly.value.textContent = '—';
     receiptCaption.textContent = '—';
   }
 
@@ -752,11 +780,10 @@ const paintReply = (rate: RateResponse | null): void => {
 };
 
 /**
- * The model line: the model in play and what the chat has cost.
+ * The model line: the model in play, by name.
  *
- * The line never names a model the chat is not using. When the local engine
- * holds the very model the chat is on, its quantization is part of the name;
- * when it holds another one, that reading waits behind the line.
+ * The line never names a model the chat is not using. What the local engine
+ * holds, with its quantization, waits behind the line either way.
  */
 const paintModel = (gauge: GaugeWire | null | undefined, info: CacheInfo | null | undefined): void => {
   const chat = gauge?.chatModel ?? null;
@@ -798,31 +825,16 @@ const paintModel = (gauge: GaugeWire | null | undefined, info: CacheInfo | null 
     ? [copy.thisModel, loaded!.quant, ageText].filter(Boolean).join(' · ')
     : engineValue;
 
-  const writeParts = (parts: string[]): void => {
-    // A joiner is said only between two parts it has: one whose following
-    // part is not drawn takes its ` · ` with it.
-    modelJoiners.forEach((joiner, i) => {
-      joiner.textContent = parts[i + 1] === undefined ? '' : ' · ';
-    });
-    modelParts.forEach((node, i) => {
-      node.textContent = parts[i] ?? '';
-      node.hidden = parts[i] === undefined;
-    });
-  };
-
   if (!chat && !loaded) {
-    writeParts([cost]);
+    lineModel.value.textContent = '—';
     modelId.textContent = '';
     modelId.hidden = true;
     lineModel.root.removeAttribute('title');
     return;
   }
-  // The name first: on a narrow panel the ellipsis lands on the name, and the
-  // quantization or the cost that follows stays whole.
-  const parts: string[] = [chat ? chat.name : loaded!.name];
-  if ((same || !chat) && loaded!.quant) parts.push(loaded!.quant);
-  if (cost !== '—') parts.push(cost);
-  writeParts(parts);
+  // The line says the name and nothing else; the quantization sits beside the
+  // engine's reading and the cost has its own entry, both behind the line.
+  lineModel.value.textContent = chat ? chat.name : loaded!.name;
   // The full identifier is behind the line for a tap, and on the hover for a mouse.
   const id = chat ? chat.id : loaded!.id;
   modelId.textContent = id;
@@ -838,23 +850,34 @@ const paintMemory = (gauge: GaugeWire | null | undefined): void => {
   const mac = gauge?.mac ?? null;
   // Off a Mac there is no reading to wait for, so the line is not drawn at all.
   if (gauge?.macSupported === false) {
-    lineMemory.root.hidden = true;
+    memoryKnown = false;
+    memoryAlarm = false;
+    applyFold();
     return;
   }
-  lineMemory.root.hidden = false;
+  memoryKnown = true;
   lineMemory.label.textContent = copy.memory;
+  itemTotal.label.textContent = copy.totalMemory;
   itemSwap.label.textContent = copy.swap;
   itemPressure.label.textContent = copy.pressure;
   if (mac && mac.usedBytes !== null && mac.totalBytes) {
-    lineMemory.value.textContent = `${formatGb(mac.usedBytes)} / ${formatGb(mac.totalBytes)} GB`;
+    lineMemory.value.textContent = `${formatGb(mac.usedBytes)} GB`;
+    itemTotal.value.textContent = `${formatGb(mac.totalBytes)} GB`;
     memoryMeters.meters[0].fill.style.width = barWidth((mac.usedBytes / mac.totalBytes) * 100);
     itemSwap.value.textContent = mac.swapUsedBytes !== null ? `${formatGb(mac.swapUsedBytes)} GB` : '—';
     itemPressure.value.textContent = mac.pressure ? copy[mac.pressure] : '—';
-    // Amber and red are the kernel's words, so they show on the closed line too.
-    setLineTone(lineMemory, mac.pressure && mac.pressure !== 'normal' ? mac.pressure : '');
+    // Amber and red are the kernel's words: the line wears them, and on a
+    // folded section it is the one line that shows itself.
+    const alarm = mac.pressure === 'warning' || mac.pressure === 'critical';
+    setLineTone(lineMemory, alarm ? mac.pressure! : '');
+    memoryAlarm = alarm;
+    applyFold();
     return;
   }
+  memoryAlarm = false;
+  applyFold();
   lineMemory.value.textContent = '—';
+  itemTotal.value.textContent = '—';
   memoryMeters.meters[0].fill.style.width = '0%';
   itemSwap.value.textContent = '—';
   itemPressure.value.textContent = '—';
@@ -875,6 +898,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
       placeNotice(copy.connecting);
     }
     ruleFill.style.width = '0%';
+    rule.hidden = true;
     paintReply(null);
     paintModel(null, null);
     paintMemory(null);
@@ -955,6 +979,8 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   // when it does not.
   if (notice) placeNotice(notice);
   ruleFill.style.width = barWidth(job?.percent);
+  // The bar is there only while a job has a share done to show.
+  rule.hidden = !job || job.percent === null;
 
   // The curve is owned by the service: it survives iframe remounts and
   // session switches, and is a rolling rate window rather than turn history.
@@ -1106,7 +1132,7 @@ host.onServiceEvent(({ topic, data }) => {
 });
 
 const mount = (): void => {
-  root.append(hero, sparkEl, noticeEl, rule, rows);
+  root.append(hero, rule, sparkEl, noticeEl, rows);
   unitEl.textContent = copy.unit;
   // Nothing has been polled yet, so the band starts closed and opens with the
   // first curve, instead of a blank gap filling the section's first frame.
@@ -1137,6 +1163,9 @@ const mount = (): void => {
 host.onReady((next) => {
   copy = next.locale.toLowerCase().startsWith('zh') ? COPY.zh : COPY.en;
   applyHostReady(next, document.documentElement);
+  // A finger gets 44 px lines. The host says what points at the frame; a host
+  // too old to say leaves it to the stylesheet's own pointer query.
+  document.documentElement.setAttribute('data-pointer', next.device?.pointer ?? '');
   // The markup says English; the host knows what the reader actually reads.
   document.documentElement.lang = copy === COPY.zh ? 'zh' : 'en';
   const previousSession = session?.id ?? null;

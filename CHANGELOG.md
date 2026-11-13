@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.0
+
+A calmer section.
+
+- At rest Gauge is one line: the speed and its state. A tap on it opens three
+  lines, a second tap folds them away, and the section always starts folded.
+  Nothing else moves it.
+- The one line that shows itself on a folded section is Memory, under amber or
+  red pressure.
+- Each opened line says one thing: `Took 48s`, the model's name, `41.2 GB`. What
+  most of the reply was, the cost, the quantization and the total memory moved
+  behind their lines. `Took` replaces a second `Last reply` under the headline.
+- The divider and the arrows on each line are gone. The progress bar for a
+  prompt being read or a render shows under the headline only while one runs.
+- The dot is steady while a reply is written; the curve and the number already
+  move.
+- The section starts at one line's height instead of reserving 200 px and then
+  shrinking.
+- On a phone, where OpenChamber 2.7.1 shows the section in its Status tab, the
+  lines are 44 px tall for a finger. The Mac look is unchanged.
+- Built on the 2.7.1 SDK.
+
 ## 1.0.1
 
 - A reply of an hour or more reads in hours: `5h 41m`, not `341m`.

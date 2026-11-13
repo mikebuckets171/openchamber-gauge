@@ -8,25 +8,30 @@ Gauge reads; it never sends inference, starts a render or changes a setting.
 
 ## What it shows
 
-![Three Gauge sections: a cloud chat idle with its last reply opened, a local chat while it writes, and a local chat reading its prompt](docs/gauge.jpg)
+![Three Gauge sections: one opened after a cloud reply, one folded while a local chat writes with amber memory showing itself, and one reading its prompt](docs/gauge.jpg)
 
-A headline, the last 30 seconds of speed, and three lines. Each line shows the
-one value worth a glance; a tap opens what is behind it, one line at a time.
+At rest Gauge is one line: the speed, and the state beside it. While a reply is
+written the last 30 seconds of speed draw under it. A tap on that line opens
+three more, each with one value; a tap on one of those opens what is behind it,
+one at a time. A second tap on the top line folds everything away, and the
+section always starts folded. The one line that shows itself on a folded section
+is Memory, when the Mac's memory is under amber or red pressure.
 
 | | |
 |---|---|
-| headline | the running turn's average speed, greyed and labelled `Last reply` when nothing is arriving. The state sits on the right: `running tool`, `waiting for permission`, the prompt a local llama.cpp chat is reading (`reading prompt 40% · 6.0s left`), `compacting` while the chat rewrites its own history, or the ComfyUI render running now (`render 8 / 20 · 30s · 1 queued`). A watched chat with nothing to report says `no reply yet`, and the dot goes quiet when the chat has nothing to say |
+| headline | the running turn's average speed, greyed and labelled `Last reply` when nothing is arriving. The dot is lit while the chat works and stays steady. The state sits on the right: `running tool`, `waiting for permission`, the prompt a local llama.cpp chat is reading (`reading prompt 40% · 6.0s left`), `compacting` while the chat rewrites its own history, or the ComfyUI render running now (`render 8 / 20 · 30s · 1 queued`). A watched chat with nothing to report says `no reply yet`, and the dot goes quiet when the chat has nothing to say |
 | curve | the last 30 s of generation rate, one point per 1.25 s, dimming out on the left. While there is nothing to draw the band closes up |
-| divider | the line under the curve fills while a prompt is read or a render runs |
-| `Last reply` | how long the reply took and what most of that was (`48s · mostly writing`). Behind it: the receipt, a bar cut into `reading`, `waiting`, `writing` and `tools` that add up to the whole reply; the speed (`measured` when the provider reported token counts, `estimated` otherwise); and the time to the first word |
-| `Model` | the model the chat is on and what the chat has cost (`MiniMax-M3.1-Flash · $0.42`), or `Qwen3.8-Flash-Next-GSQ-RCO · IQ3_XXS` when the local engine holds it. Behind it: the cost, the cache hit rate of the last settled step and of the whole conversation, the model the local engine holds, and the full identifier |
-| `Memory` | the Mac's memory in use and the total; amber at a kernel warning, red at a critical level. Behind it: the meter, the swap in use and the pressure level. A machine that is not a Mac gets no Memory line at all |
+| progress bar | under the headline, only while a prompt is read or a render runs |
+| `Took` | how long the last reply took (`48s`). Behind it: the receipt, a bar cut into `reading`, `waiting`, `writing` and `tools` that add up to the whole reply; what most of the time was (`writing`); the speed (`measured` when the provider reported token counts, `estimated` otherwise); and the time to the first word |
+| `Model` | the name of the model the chat is on (`MiniMax-M3.1-Flash`). Behind it: what the chat has cost, the cache hit rate of the last settled step and of the whole conversation, the model the local engine holds with its quantization (`this model · IQ3_XXS` when it is the chat's own), and the full identifier |
+| `Memory` | the Mac's memory in use (`41.2 GB`); amber at a kernel warning, red at a critical level. Behind it: the meter, the total, the swap in use and the pressure level. A machine that is not a Mac gets no Memory line at all |
 
 A reading that is missing is a dash. A job never adds a line: it is said in the
 headline. A wording too long for the headline — a notice, or a state that does
 not fit beside the number — is read in full in the curve's spot. A turn longer
 than a minute is read as minutes (`2m 5s`). Nothing needs a mouse; the hover
-text is a duplicate of what a tap shows. Motion (the number gliding, a line
+text is a duplicate of what a tap shows. On a phone, where OpenChamber 2.7.1
+shows the section in its Status tab, the lines are 44 px tall for a finger. Motion (the number gliding, a line
 sliding open, the reply bar filling in once) is switched off when the system
 asks for reduced motion.
 
@@ -82,7 +87,8 @@ is inside `waiting`.
 
 The time a permission or a question sat open is yours, so it is outside the
 receipt and listed after it as `waiting on you`. When it outweighs every slice,
-the line says so over the whole stretch: `1h 5m · mostly waiting on you`. A
+the line counts the whole stretch (`1h 5m`) and, behind it, `Mostly`
+reads `waiting on you`. A
 question's own tool call is not counted as a tool running while the form is
 open.
 
