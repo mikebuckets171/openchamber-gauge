@@ -5,7 +5,7 @@
     "": {
       "name": "openchamber-gauge",
       "dependencies": {
-        "@openchamber/sdk": "2.7.0",
+        "@openchamber/sdk": "2.7.1",
       },
       "devDependencies": {
         "@types/bun": "1.3.4",
@@ -15,7 +15,7 @@
     },
   },
   "packages": {
-    "@openchamber/sdk": ["@openchamber/sdk@2.7.0", "", { "dependencies": { "zod": "^4.3.6" }, "bin": { "openchamber-guest-check": "scripts/check-guest.ts", "openchamber-guest-bundle": "scripts/bundle-guest.ts" } }, "sha512-dYrQad76cm1YMOs9GEgX7f9pxzqozPQUmtsmqGUNdKADqhaWRg9vIHJiM5JptZgpmim0uwD8C/+Sz+5tRpZv/g=="],
+    "@openchamber/sdk": ["@openchamber/sdk@2.7.1", "", { "dependencies": { "zod": "^4.3.6" }, "bin": { "openchamber-guest-check": "scripts/check-guest.ts", "openchamber-guest-bundle": "scripts/bundle-guest.ts" } }, "sha512-TpIHXj1pwlU0Efhzpi218gtKV04MEc6LSaoXeynz+KnFb/zbEuUHJ5NU6lvAH74oSywiHxVqewJwLB5ZTSZiOQ=="],
 
     "@types/bun": ["@types/bun@1.3.4", "", { "dependencies": { "bun-types": "1.3.4" } }, "sha512-EEPTKXHP+zKGPkhRLv+HI0UEX8/o+65hqARxLy8Ov5rIxMBPNTjeZww00CIihrIQGEQBYg+0roO5qOnS/7boGA=="],
 

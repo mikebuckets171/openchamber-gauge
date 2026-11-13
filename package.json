@@ -75,7 +75,7 @@
     "test:bridge": "node --test bridge/opencode/*.test.js"
   },
   "dependencies": {
-    "@openchamber/sdk": "2.7.0"
+    "@openchamber/sdk": "2.7.1"
   },
   "devDependencies": {
     "@types/bun": "1.3.4",

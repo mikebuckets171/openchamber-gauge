@@ -63,6 +63,7 @@ function installGuestScrollbarActivity(doc) {
 }
 var GUEST_SCROLLBAR_SCRIPT = `(${installGuestScrollbarActivity.toString()})(document);`;
 // node_modules/@openchamber/sdk/dist/manifest.js
+var GUEST_PROVIDER_LOGO_BYTES_MAX = 1024 * 1024;
 var TRACKER_URL_TOKENS = ["{id}", "{segment}", "{segments+}"];
 var TRACKER_URL_TOKEN_SET = new Set(TRACKER_URL_TOKENS);
 // node_modules/@openchamber/sdk/dist/session-events.js
@@ -130,7 +131,8 @@ var createServiceHost = ({ env }) => {
     setInstructions: (directory, text) => call("instructions.set", { directory, text }),
     emit: (topic, data) => call("panels.emit", { topic, data }),
     readSettings: () => call("settings.read", {}).then(({ settings }) => settings),
-    needsConfiguration: (message) => call("status.set", { needsConfiguration: message })
+    needsConfiguration: (message) => call("status.set", { needsConfiguration: message }),
+    setMark: (target, mark) => call("marks.set", { target, mark })
   };
 };
 // node_modules/@openchamber/sdk/dist/file-editor.js
